@@ -1,0 +1,17 @@
+# 构建产物
+build/
+dist/
+*.spec
+
+# 运行数据(录制的轨迹 / 地图缓存 / 日志)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 编辑器
+.vscode/
+.idea/
