@@ -13,6 +13,13 @@
   `layout_names` 存用户给版本起的名字(如“小地图”), 默认自动叫“区域 2 / 点位 3”。
 
 数据文件: <data_dir>/routes.json
+**文件名叫 .json, 内容其实是 gzip 压缩的 JSON**(2026-10-22 起):
+实测 3.49MB 的明文压到 0.47MB(7.4 倍), 而加载反而**更快**(80ms → 63ms)——
+磁盘少读 7.4 倍, 省下的 IO 时间多于解压开销。
+**不兼容旧格式**(自用软件, 数据可随时重录): 读不回来就当没有数据。
+想看内容: `python -m gzip -dc data/routes.json`, 或直接用 `tools/probe_turn_radius.py`
+(那个工具同时支持 gzip 和明文 —— `backups/` 里的备份是明文)。
+
 结构:
 {
   "version": 1,
@@ -32,6 +39,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import logging
 import os
@@ -48,8 +56,27 @@ from .zones import layout_spread
 from .zones import mode_name as zone_mode_name
 from .zones import signature as zones_signature
 from .zones import spawns_to_json, zones_from_signature, zones_to_json
+from . import kill_timeline
 
 log = logging.getLogger("route_store")
+
+
+def _read_payload(path: str) -> dict | None:
+    """读数据文件: **gzip 压缩的 JSON**。
+
+    不做旧格式兼容(用户 2026-10-22 明确要求): 本软件自用、未发布, 数据随时
+    可以重录, 没必要为早期的明文/BOM 文件留分支。读取失败就当没有数据
+    (宁可从零开始, 也不要把半个文件当成完整数据用)。
+    """
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, EOFError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        log.warning("读取线路数据失败: %s", exc)
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def map_fingerprint(image_bytes: bytes | None) -> str:
@@ -185,6 +212,19 @@ class UnitLife:
     # 一次只能开一台载具, 想换固定翼必先阵亡; 退局后载具停在原地、
     # 8111 过一会儿不再上报, 也算击毁。实现上只看“线断那一刻场上还有没有别人”。
     dead: bool = False
+    # **已修正的死亡时刻**(录制时间轴的秒数; 0 = 未修正)。
+    # 只对“摄像机挂着的那位玩家”有意义: 他阵亡后 8111 依旧上报残骸, 线尾其实是
+    # 录制结束, 所以由用户指定观战昵称、用 hudmsg 的击毁时刻反推真实死亡时刻。
+    # 修正时会把 `points` 截断到这个时刻(末尾补一个合成点), 原始点存在 `trimmed` 里。
+    death_t: float = 0.0
+    # 修正前的**原始点序列**(便于改主意时重新指定观战玩家); 未修正时为空。
+    trimmed: list[TrackPoint] = field(default_factory=list)
+    # 这条线**曾经是摄像机挂着的那辆车**(至少有1帧 icon == Player 或颜色是自己黄)。
+    # 为什么要记这个布尔值而不是直接看 `color`: `color` 每帧都被覆盖, 摄像机离开后
+    # 就变回普通蓝色了; 而“观战对象”这个事实必须留下来(2026-10-22 实测: 他第三辆
+    # 车的线 8111 给的是 `icon=SAM`、只有颜色是自己黄, 而 B 队整队一条 `icon=Player`
+    # 都没有 —— 只按 icon 认会全漏)。
+    watched: bool = False
 
     @property
     def route_id(self) -> str:
@@ -225,7 +265,7 @@ class UnitLife:
     def to_json(self) -> dict:
         # 点写成 [t, x, y, speed] 的紧凑数组: 整局几十辆车 → 几十万个点,
         # 用 {"x":..,"y":..,"t":..} 的字典形式会让 routes.json 膨胀 3 倍以上
-        return {
+        out = {
             "id": self.life_id,
             "icon": self.icon,
             "type": self.obj_type,
@@ -236,6 +276,15 @@ class UnitLife:
             "pts": [[round(p.t, 2), round(p.x, 5), round(p.y, 5), round(p.speed, 1)]
                     for p in self.points],
         }
+        if self.death_t:
+            out["death_t"] = round(self.death_t, 2)
+        if self.watched:
+            out["w"] = 1
+        if self.trimmed:
+            # 只存被截掉的尾巴 —— 未修正的线没有这个字段, 旧数据也不需要兼容
+            out["trim"] = [[round(p.t, 2), round(p.x, 5), round(p.y, 5),
+                            round(p.speed, 1)] for p in self.trimmed]
+        return out
 
     @classmethod
     def from_json(cls, data: dict) -> UnitLife | None:
@@ -243,28 +292,39 @@ class UnitLife:
             life_id = str(data["id"])
         except (KeyError, TypeError):
             return None
-        pts: list[TrackPoint] = []
-        for row in data.get("pts") or []:
-            try:
-                t, x, y = float(row[0]), float(row[1]), float(row[2])
-            except (IndexError, TypeError, ValueError):
-                continue
-            speed = 0.0
-            if len(row) > 3:
+
+        def read_points(rows) -> list[TrackPoint]:
+            pts: list[TrackPoint] = []
+            for row in rows or []:
                 try:
-                    speed = float(row[3])
-                except (TypeError, ValueError):
-                    speed = 0.0
-            pts.append(TrackPoint(x=x, y=y, t=t, speed=speed))
+                    t, x, y = float(row[0]), float(row[1]), float(row[2])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                speed = 0.0
+                if len(row) > 3:
+                    try:
+                        speed = float(row[3])
+                    except (TypeError, ValueError):
+                        speed = 0.0
+                pts.append(TrackPoint(x=x, y=y, t=t, speed=speed))
+            return pts
+
+        try:
+            death_t = float(data.get("death_t") or 0.0)
+        except (TypeError, ValueError):
+            death_t = 0.0
         return cls(
             life_id=life_id,
             icon=str(data.get("icon") or ""),
             obj_type=str(data.get("type") or ""),
             color=str(data.get("color") or ""),
             map_key=str(data.get("map_key") or ""),
-            points=pts,
+            points=read_points(data.get("pts")),
             side=str(data.get("side") or ""),
             dead=bool(data.get("dead")),
+            death_t=death_t,
+            trimmed=read_points(data.get("trim")),
+            watched=bool(data.get("w")),
         )
 
 
@@ -287,6 +347,46 @@ class GlobalRecord:
     duration: float = 0.0
     marks: list[str] = field(default_factory=list)
     sides: dict[str, list[UnitLife]] = field(default_factory=lambda: {"A": [], "B": []})
+    # 战区状态**时间轴**: [{"t": 秒, "zones": [{label,x,y,side,color,blink}]}]
+    # 只在“归属变了或开始/结束被占领”时记一条(见 `RouteRecorder._record_zone_state`),
+    # 回放时按时间取最近一条 → 战区能重现当时的蓝/红/占领中, 而不是一张静态快照。
+    # 旧数据没有这个字段 → 回放退回静态布局(取 `layout_for`)。
+    zone_states: list[dict] = field(default_factory=list)
+    # 本局 `/hudmsg` 的**击毁消息**(录制前后各抓一次取差集, 按 id 去重):
+    # [{"id": 1234, "t": 457.0, "msg": "A (豹 2A4) 击毁了 B (T-64A)"}]
+    # 用途: `t` 是**比赛秒数**(从服务器端开始录像计时, 与我们 t=0 差一个未知偏移),
+    # 所以只能拿“击毁事件之间的**时间差模式**”去和线路结束时刻对齐 ——
+    # 摄像机挂着的那个玩家 icon 不会消失(实测), 他的死亡时刻只能靠这个反推。
+    kills: list[dict] = field(default_factory=list)
+    # **录制时镜头挂在谁身上**: `{"A": "killflik", "B": "jjh67"}`(昵称)。
+    # 8111 不告诉我们这件事, 而它正是“反推那位玩家死亡时刻”的唯一钥匙 ——
+    # 由用户在修正界面里从本局击毁名单中点选(见 `RouteStore.set_watchers`)。
+    watchers: dict[str, str] = field(default_factory=dict)
+    # 死亡时刻是否已经确认过。`False` 时侧栏条目上会显示一个黄色感叹号
+    # (点它就打开修正界面); 重录任何一队都会重置成 `False`。
+    fixed: bool = False
+
+    def zone_state_at(self, t: float) -> list[dict] | None:
+        """取回放时刻 `t` 的战区快照(没有时间轴返回 None)。
+
+        用时间轴里 `<= t` 的最后一条 —— 战区状态是“阶毯式”变化(只在不连续时刻变),
+        用“最近的前一条”才是当时真实的样子; 取最近的一条(不管是前是后)会在
+        占领发生**之前**就先把颜色改了。
+        """
+        states = self.zone_states
+        if not states:
+            return None
+        lo, hi, best = 0, len(states) - 1, -1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if float(states[mid].get("t") or 0.0) <= t:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        if best < 0:
+            best = 0                     # 早于第一条 → 用第一条(录制开始那一刻)
+        zones = states[best].get("zones")
+        return list(zones) if isinstance(zones, list) else None
 
     @property
     def label(self) -> str:
@@ -352,6 +452,10 @@ class GlobalRecord:
             "mode_name": self.mode_name,
             "duration": self.duration,
             "marks": list(self.marks),
+            "zone_states": self.zone_states,
+            "kills": self.kills,
+            "watchers": dict(self.watchers),
+            "fixed": 1 if self.fixed else 0,
             "sides": {side: [life.to_json() for life in self.lives(side)]
                       for side in GLOBAL_SIDES},
         }
@@ -370,10 +474,35 @@ class GlobalRecord:
                 duration=float(data.get("duration") or 0.0),
                 marks=[str(m) for m in (data.get("marks") or [])
                        if str(m) in GLOBAL_SIDES],
+                watchers={str(k): str(v) for k, v in
+                          (data.get("watchers") or {}).items()
+                          if str(k) in GLOBAL_SIDES and str(v or "").strip()},
+                fixed=bool(data.get("fixed")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("跳过损坏的全局录制记录: %s", exc)
             return None
+        for row in data.get("zone_states") or []:
+            if not isinstance(row, dict):
+                continue
+            zones = row.get("zones")
+            if not isinstance(zones, list) or not zones:
+                continue
+            try:
+                t = float(row.get("t") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            rec.zone_states.append({"t": t, "zones": [z for z in zones
+                                                       if isinstance(z, dict)]})
+        for row in data.get("kills") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                rec.kills.append({"id": int(row.get("id") or 0),
+                                  "t": float(row.get("t") or 0.0),
+                                  "msg": str(row.get("msg") or "")})
+            except (TypeError, ValueError):
+                continue
         for side, rows in (data.get("sides") or {}).items():
             if side not in GLOBAL_SIDES or not isinstance(rows, list):
                 continue
@@ -562,15 +691,10 @@ class RouteStore:
 
     # ------------------------------------------------------------------
     def _load(self) -> None:
+        data = _read_payload(self.path)
+        if not isinstance(data, dict):
+            return
         try:
-            if not os.path.exists(self.path):
-                return
-            # utf-8-sig: 容忍带 BOM 的文件(用记事本/部分编辑器改过就会带 BOM)。
-            # 若按 utf-8 读会直接抛异常 → 记录全丢, 下一次 save() 还会把文件覆盖掉。
-            with open(self.path, encoding="utf-8-sig") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return
             names = data.get("map_names")
             if isinstance(names, dict):
                 self.map_names = {str(k): str(v) for k, v in names.items()}
@@ -650,7 +774,12 @@ class RouteStore:
         return changed
 
     def save(self) -> None:
-        """原子写盘(tmp + os.replace), 强杀不残留半截文件。"""
+        """原子写盘(tmp + os.replace), 强杀不残留半截文件。
+
+        写的是**紧凑 JSON + gzip**(不带缩进): 缩进本身占文件体积的 ~40%, 而
+        gzip 又能再压到 14% —— 合起来 3.49MB → 0.47MB。压缩后加载反而更快:
+        磁盘少读 7.4 倍, 省下的时间多于解压(实测 80ms → 63ms)。
+        """
         with self._lock:
             payload = {
                 "version": 1,
@@ -672,10 +801,12 @@ class RouteStore:
             tmp = self.path + ".tmp"
             try:
                 os.makedirs(os.path.dirname(self.path), exist_ok=True)
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(payload, f, ensure_ascii=False, indent=1)
+                text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                blob = gzip.compress(text.encode("utf-8"), compresslevel=6)
+                with open(tmp, "wb") as f:
+                    f.write(blob)
                 os.replace(tmp, self.path)
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 log.error("保存线路数据失败: %s", exc)
 
     # ------------------------------------------------------------------
@@ -794,6 +925,79 @@ class RouteStore:
             if target is not None:
                 target.marks.clear()
         self.save()
+
+    def set_fixed(self, gid: str, value: bool) -> None:
+        """改“死亡时刻是否已确认” —— `False` 时侧栏条目上会挂一个黄色感叹号。"""
+        with self._lock:
+            target = self.get_global(gid)
+            if target is not None:
+                target.fixed = bool(value)
+        self.save()
+
+    @staticmethod
+    def _apply_death(life: UnitLife, death_t: float) -> None:
+        """把一条线截断到 `death_t` 并补一个合成点, 记下原始点以便回退。
+
+        为什么要补合成点: 停止时程序是"每 15 秒一个心跳点", 死亡时刻往往落在两个
+        心跳点之间(实测有一位停稳 9.8 秒才被打死)。不补的话线尾会落在停住那一刻,
+        地图上的阵亡叉与"用时"都会少算这 9.8 秒。
+        """
+        if not life.trimmed:
+            life.trimmed = list(life.points)
+        pts = [p for p in life.trimmed if p.t < float(death_t)]
+        if not pts:                       # 死亡时刻早于第一个点(不应该发生) → 不动
+            life.points = list(life.trimmed)
+            return
+        last = pts[-1]
+        pts.append(TrackPoint(x=last.x, y=last.y, t=round(float(death_t), 2),
+                              speed=0.0))
+        life.points = pts
+        life.death_t = round(float(death_t), 2)
+        life.dead = True
+
+    @staticmethod
+    def _reset_death(life: UnitLife) -> None:
+        """撤销修正: 把原始点还回去。"""
+        if life.trimmed:
+            life.points = list(life.trimmed)
+        life.trimmed = []
+        life.death_t = 0.0
+
+    def set_watchers(self, gid: str, watchers: dict[str, str]) -> dict[str, dict]:
+        """指定“录制时镜头挂在谁身上”, 并按 hudmsg 的击毁时刻修正死亡时刻。
+
+        `watchers` 形如 `{"A": "killflik", "B": "jjh67"}`; 某一队留空表示“这一队
+        不用修正”(他活到录制结束)。返回 `kill_timeline.resolve_deaths` 的结果。
+
+        **逐条 Player 线处理**: 他每死一次重生就会开一条新线, 所以同一队可能有好几条
+        (例如先阵亡再出第二辆车), 每条都要按它自己时间段内那次阵亡单独截断。
+        """
+        rec = self.get_global(gid)
+        if rec is None:
+            return {}
+        clean = {side: str((watchers or {}).get(side) or "").strip()
+                 for side in GLOBAL_SIDES}
+        resolved = kill_timeline.resolve_deaths(rec, clean)
+        with self._lock:
+            rec.watchers = {side: name for side, name in clean.items() if name}
+            # `fixed` = “这条录制已经没有待修正的死亡时刻” → 侧栏的黄色感叹号。
+            # **只有真的修过才置 True**: 选的名字一条线都没对上(或干脆没选),
+            # 说明那个叉还在错误的位置上, 感叹号应该留着提醒(用户 2026-10-22)。
+            rec.fixed = any((row or {}).get("ok") for row in resolved.values())
+            for side in GLOBAL_SIDES:
+                row = resolved.get(side) or {}
+                want = {fix["life_id"]: fix["death"]
+                        for fix in row.get("fixes") or [] if fix.get("ok")}
+                for life in kill_timeline.player_lines(rec, side):
+                    death = want.get(life.life_id)
+                    if death:
+                        self._apply_death(life, death)
+                    else:
+                        self._reset_death(life)
+        self.save()
+        log.info("全局录制 %s 观战玩家: %s", gid,
+                 kill_timeline.summarize(resolved))
+        return resolved
 
     def globals_by_group(self) -> dict[tuple[str, str], list[GlobalRecord]]:
         """{(地图键, 战区指纹): [全局录制条目...]} —— 新的在前(按录制时间倒序)。"""
@@ -1039,13 +1243,22 @@ class RouteStore:
         return list(self.map_zones.get(map_key) or [])
 
     def layout_for(self, map_key: str, signature: str = "") -> dict | None:
-        """取某地图的战区布局: 优先精确匹配指纹, 否则用最新见过的那张。"""
+        """取某地图的战区布局: 优先精确匹配指纹, 否则用**最近见过**的那张。
+
+        2026-10-22 修正: 回退原先取 `layouts[0]`, 但那只是“最后**新出现**的布局” ——
+        `remember_zones` 只在新布局插入队首, 老布局被再次看到时仅刷新 `seen_at`,
+        于是用户先录一张单路的“区域 1”再录 AB 队的“区域 2”(区域 2 历史上见过),
+        回放 AB 队时却拿到“区域 1”的战区位置。改为按 `seen_at` 取最新的。
+        """
         layouts = self.map_zones.get(map_key) or []
         if signature:
             for item in layouts:
                 if item.get("sig") == signature:
                     return item
-        return layouts[0] if layouts else None
+        if not layouts:
+            return None
+        # seen_at 是 `%Y-%m-%dT%H:%M:%S` 字串, 字典序即时间序
+        return max(layouts, key=lambda it: str(it.get("seen_at") or ""))
 
     def grouped_by_mode(self) -> dict[str, list[tuple[str, list[RouteRecord]]]]:
         """{地图键: [(模式名, [轨迹...]), ...]} —— 侧栏三层树用。

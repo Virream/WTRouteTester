@@ -1,16 +1,17 @@
-"""跑图线路测试器(WTRouteTester) —— 启动入口。
+"""跑图线路测试器 —— 独立启动入口。
 
-记录“重生后多久到达某位置”: 在战争雷霆里录一条从重生点出发的路线, 观察到达各个点用了多久。
-
+与黑名单助手(WTBlackList 主程序)相互独立, 可单独运行:
     python route_tester.py           开发环境
     WTRouteTester.exe                打包版(见 build_route_tester.ps1)
 
-依赖: PyQt6 + requests(见 requirements.txt)。
-游戏需运行并开启 8111 本地接口(战争雷霆默认开启) —— 本程序只读取该接口, 不注入、不读写游戏文件。
+依赖: PyQt6(项目既有依赖), 无需任何额外第三方库。
+游戏需运行并开启 8111 本地接口(战争雷霆默认开启)。
 
-**单实例**: 已经有窗口在跑时, 再启动只会把那一份调到前面并退出(见 route_instance.py)。
+**单实例**: 已经有窗口在跑时, 再启动只会把那一份调到前面并退出(见 route_instance.py);
+与黑名单主程序的单实例互不影响, 两个程序可以同时开。
 
-日志: <data>/route_tester.log —— 打包版是 --windowed(无控制台), 出错时靠该日志排查。
+日志: <data>/route_tester.log —— 打包版是 --windowed(无控制台),
+      出错时靠该日志排查。
 """
 import logging
 import os

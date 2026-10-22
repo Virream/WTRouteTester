@@ -22,7 +22,9 @@ import os
 import time
 
 from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QFont, QIcon
+from PyQt6.QtGui import (
+    QAction, QActionGroup, QBrush, QCloseEvent, QColor, QFont, QIcon, QPalette,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame,
     QGridLayout, QHeaderView, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu,
@@ -36,11 +38,15 @@ from .global_hotkey import (
 )
 from .help_text import about_html
 from .hotkey_dialog import HotkeyDialog
-from .icons import ICON_SIZE, circle_icon, eye_icon, pin_icon
+from .icons import ICON_SIZE, circle_icon, eye_icon, pin_icon, warn_icon
 from .map_cache import MapCache
 from .map_manager import MapManagerDialog
 from .route_map_view import RouteMapView
 from .route_playback import PLAYBACK_SPEEDS, RoutePlayer
+from .record_overlay import (
+    ANCHORS, COLOR_TEXT, COLOR_TITLE, RecordOverlay, RecordOverlaySettings,
+)
+from .record_overlay_dialog import RecordOverlayDialog
 from .route_recorder import DEFAULT_INTERVAL_MS, RouteRecorder
 from .route_store import (
     GLOBAL_SIDES, GLOBAL_SIDE_LABELS, PLACEHOLDER_MAP_KEY, GlobalRecord, RouteRecord,
@@ -51,10 +57,27 @@ from .sound import play_error as play_error_sound
 from .sound import settings as sound_settings
 from .sound_dialog import SoundSettingsDialog
 from .tree_view import RouteTreeWidget
+from .watcher_dialog import WatcherDialog
 from .zones import ground_spawns, layout_spread, ownership_text, spawns_from_json
 from .zones import spawns_to_json, zones_to_json
 
 log = logging.getLogger("route_window")
+
+
+def _create_map_view(parent) -> RouteMapView:
+    """建地图控件: 优先 GPU(pygfx), 不行就软件渲染。
+
+    这里**必须惰性导入** `route_map_gl`: 它一 import 就会加载 `wgpu-native` 的 DLL,
+    而无头/offscreen 平台下这会和 Qt 冲突(实测整个进程 0xC000041D 崩掉, 连测试都跑不了),
+    而且普通用户也省掉几百毫秒启动时间。`create_map_view` 内部还会判平台与异常回退。
+    """
+    try:
+        from .route_map_gl import create_map_view
+    except Exception:  # noqa: BLE001
+        log.exception("GPU 画布模块导入失败, 使用软件渲染")
+        return RouteMapView(parent)
+    return create_map_view(parent)
+
 
 # 采样间隔选项(毫秒):
 # 40ms(≈25Hz)与 8111 陆战数据更新率匹配; 20ms(≈50Hz)接近 8111 请求上限
@@ -73,7 +96,8 @@ GROUP_ITEM_FLAGS = Qt.ItemFlag.ItemIsEnabled
 # 侧栏列: 0=展开/收起(眼睛图标) 1=地图/模式/版本/线路 2=信息(条数或用时)
 _COL_EYE = 0
 _COL_NAME = 1
-_COL_TIME = 2
+_COL_INFO = 2          # “信息”列: 条数/用时; 未指定观战玩家的全局条目在这里挂感叹号
+_COL_TIME = _COL_INFO
 
 # 眼睛列宽度(px): 最深的一条是全局录制里的线路(地图 → 模式 → 版本 → 全局 → 队伍 → 线路,
 # 缩进 12×5), 图标 18px, 再加一点间距 —— 取小了图标会被列边界裁掉/压到名称列的文字上
@@ -110,6 +134,7 @@ class RouteTesterWindow(QMainWindow):
         self._last_global: GlobalRecord | None = None
         # 选中集合(决定回放播哪几条; 用于判断“本次新加进来的是哪张地图”)
         self._sel_ids: set[str] = set()
+        self._sel_groups: set[tuple[str, str]] = set()
         # “基准版本”: 双击某条轨迹后, 它的(地图键, 战区指纹)被锁为基准 ——
         # 之后多选/回放只能在同一版本内进行(见 _group_of / _on_tree_selection_changed)
         self._anchor: tuple[str, str] | None = None
@@ -150,6 +175,8 @@ class RouteTesterWindow(QMainWindow):
             self._show_spawns = int(self._settings.value("show_spawns", 1)) != 0
         except (TypeError, ValueError):
             self._show_spawns = True
+        # 录制叠加层(独立透明置顶窗, 显示录制进度/实际采集率; 默认关闭)
+        self._overlay_settings = self._load_overlay_settings()
 
         # 快捷键设置必须先读(菜单里的「同时使用按键轮询」勾选状态要用), 监控对象在后面再建
         self._hotkey_bindings = load_bindings(self._settings)
@@ -161,6 +188,9 @@ class RouteTesterWindow(QMainWindow):
 
         self._build_ui()
         self._build_menu()
+        # 叠加层对象必须在 _build_menu 之后建(菜单要读 _overlay_settings),
+        # 且必须在 recorder 之前 —— _on_tick 每帧都会用到它
+        self.overlay = RecordOverlay(self._overlay_settings, parent=None)
         self.map_view.set_show_zones(self._show_zones)
         self.map_view.set_show_spawns(self._show_spawns)
         self.map_view.set_dead_style(dim=self._saved_dead_dim, mark=self._saved_dead_mark)
@@ -263,6 +293,40 @@ class RouteTesterWindow(QMainWindow):
         self.act_spawns.toggled.connect(self._on_show_spawns)
         setting.addAction(self.act_spawns)
 
+        # ---- 叠加层(录制时浮在屏幕角落的小窗)
+        setting.addSeparator()
+        ov_menu = setting.addMenu("叠加层(&O)")
+        self.act_overlay = QAction("启用录制叠加层", self)
+        self.act_overlay.setCheckable(True)
+        self.act_overlay.setChecked(self._overlay_settings.enabled)
+        self.act_overlay.setToolTip(
+            "勾选后, 开始录制(单条 / A·B 队)时在屏幕角落浮出小块信息:\n"
+            "状态与用时、**实际采集率**(每秒写入多少个轨迹点)、8111 轮询频率、\n"
+            "轨迹点数、标记数、当前速度与载具; 结束录制自动隐藏。\n"
+            "它是独立的外部置顶窗(点击穿透), 不注入游戏 —— "
+            "要浮在游戏上请用「全屏窗口(无边框)」模式。")
+        self.act_overlay.toggled.connect(self._on_overlay_enabled)
+        ov_menu.addAction(self.act_overlay)
+        ov_menu.addSeparator()
+
+        # 位置: 四角之一(动作组互斥)
+        pos_menu = ov_menu.addMenu("位置")
+        self._overlay_pos_group = QActionGroup(self)
+        self._overlay_pos_group.setExclusive(True)
+        self._overlay_pos_actions: dict[str, QAction] = {}
+        for key, name in ANCHORS.items():
+            act = QAction(name, self)
+            act.setCheckable(True)
+            act.setChecked(key == self._overlay_settings.anchor)
+            act.triggered.connect(lambda _c=False, k=key: self._on_overlay_anchor(k))
+            self._overlay_pos_group.addAction(act)
+            self._overlay_pos_actions[key] = act
+            pos_menu.addAction(act)
+
+        act_ov_set = QAction("叠加层设置(边距 / 背景不透明度 / 圆角 / 字号)…", self)
+        act_ov_set.triggered.connect(self._open_overlay_settings)
+        ov_menu.addAction(act_ov_set)
+
         hk_menu = self.menuBar().addMenu("快捷键(&K)")
         act_hk_set = QAction("快捷键设置(按键 / 修饰键)…", self)
         act_hk_set.setToolTip("给“开始录制 / 结束录制 / 标记位置”分别指定按键, 改动立即生效。")
@@ -320,6 +384,131 @@ class RouteTesterWindow(QMainWindow):
         buttons.accepted.connect(dlg.accept)
         layout.addWidget(buttons)
         dlg.exec()
+
+    # ------------------------------------------------------------ 录制叠加层
+    def _load_overlay_settings(self) -> RecordOverlaySettings:
+        """从 QSettings 读叠加层外观(读不到/值损坏就退回默认)。"""
+        s = self._settings
+
+        def _int(key: str, default: int) -> int:
+            try:
+                return int(s.value(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        return RecordOverlaySettings(
+            enabled=_int("overlay_enabled", 0) != 0,
+            anchor=str(s.value("overlay_anchor", "") or ""),
+            margin=_int("overlay_margin", 24),
+            opacity=_int("overlay_opacity", 62),
+            corner=_int("overlay_corner", 10),
+            font_size=_int("overlay_font_size", 10),
+        ).normalized()
+
+    def _save_overlay_settings(self) -> None:
+        o = self._overlay_settings
+        s = self._settings
+        s.setValue("overlay_enabled", 1 if o.enabled else 0)
+        s.setValue("overlay_anchor", o.anchor)
+        s.setValue("overlay_margin", int(o.margin))
+        s.setValue("overlay_opacity", int(o.opacity))
+        s.setValue("overlay_corner", int(o.corner))
+        s.setValue("overlay_font_size", int(o.font_size))
+
+    def _on_overlay_enabled(self, on: bool) -> None:
+        self._overlay_settings.enabled = bool(on)
+        self.overlay.apply_settings(self._overlay_settings)
+        self._save_overlay_settings()
+        self._set_status(
+            "录制叠加层已启用: 开始录制时会在屏幕%s显示"
+            % ANCHORS.get(self._overlay_settings.anchor, "角落")
+            if on else "录制叠加层已关闭", sticky=3.0)
+
+    def _on_overlay_anchor(self, key: str) -> None:
+        self._overlay_settings.anchor = key
+        self.overlay.apply_settings(self._overlay_settings)
+        self._save_overlay_settings()
+        act = self._overlay_pos_actions.get(key)
+        if act is not None and not act.isChecked():
+            act.setChecked(True)
+
+    def _open_overlay_settings(self) -> None:
+        """「设置 → 叠加层 → 叠加层设置…」: 改动实时预览, 取消则回滚。"""
+        before = RecordOverlaySettings(**vars(self._overlay_settings))
+        dlg = RecordOverlayDialog(self._overlay_settings, self)
+
+        def on_changed() -> None:
+            self._overlay_settings = dlg.settings
+            self.overlay.apply_settings(self._overlay_settings)
+
+        dlg.settings_changed.connect(on_changed)
+        ok = dlg.exec() == QDialog.DialogCode.Accepted
+        if not ok:
+            self._overlay_settings = before          # 取消 → 回到打开前的样子
+            self.overlay.apply_settings(self._overlay_settings)
+            return
+        self._overlay_settings = dlg.settings
+        self.overlay.apply_settings(self._overlay_settings)
+        self._save_overlay_settings()
+        if self.act_overlay.isChecked() != self._overlay_settings.enabled:
+            self.act_overlay.setChecked(self._overlay_settings.enabled)
+        act = self._overlay_pos_actions.get(self._overlay_settings.anchor)
+        if act is not None:
+            act.setChecked(True)
+        self._set_status("叠加层设置已保存", sticky=3.0)
+
+    def _update_overlay(self, info: dict) -> None:
+        """把当前录制状态推给叠加层(由 `_on_tick` 的 ~12Hz 文本节流块驱动)。
+
+        显示的内容:
+
+        * 第一行: 状态 + 用时(准备录制 / 录制中 / A·B 队);
+        * **采集 x 点/秒**: 最近 2 秒真正写进轨迹的点数率 —— 这才是"实际采样率",
+          它低于轮询频率是正常的(采样还要过“采样间隔 + 最小位移”两道闸,
+          车不动时一个点也不写); 两个数并排显示就能一眼看出是哪一边的问题;
+        * 点数 / 标记数 / 当前速度 / 载具。
+
+        注意: 判断"要不要显示"必须看**单条录制与全局录制两个状态** ——
+        `info["recording"]` 只表示单条录制(`recorder._rec is not None`),
+        全局录制时它一直是 False(以前就因此 A/B 队录制时叠加层根本不出现)。
+        """
+        if not self._overlay_settings.enabled:
+            return
+        g = info.get("global")
+        if not info.get("recording") and not g:
+            self.overlay.set_active(False)
+            return
+        rate = float(info.get("rate") or 0.0)
+        if g:
+            # 全局录制: 0 点由"第一名玩家重生"定下, 所以等待阶段的用时没有意义
+            side = str(g.get("side") or "?")
+            lives = int(g.get("lives") or 0)
+            active = int(g.get("active") or 0)
+            if g.get("waiting"):
+                head = f"● {side} 队: 等待第一名玩家重生…"
+                elapsed = 0.0
+            else:
+                head = f"● {side} 队录制中"
+                elapsed = float(g.get("elapsed") or 0.0)
+            lines = [
+                (f"{head}  {fmt_time(elapsed)}", COLOR_TITLE),
+                (f"已录线路 {lives} 条 · 进行中 {active} 辆", COLOR_TEXT),
+                (f"8111 轮询 {rate:.1f} Hz", COLOR_TEXT),
+            ]
+        else:
+            elapsed = float(info.get("elapsed") or 0.0)
+            head = "● 准备录制 等待载具移动…" if info.get("armed") else "● 录制中"
+            lines = [
+                (f"{head}  {fmt_time(elapsed)}", COLOR_TITLE),
+                (f"采集 {float(info.get('point_rate') or 0.0):.1f} 点/秒 · "
+                 f"轮询 {rate:.1f} Hz", COLOR_TEXT),
+                (f"点数 {int(info.get('points') or 0)} · "
+                 f"标记 {int(info.get('marks') or 0)} 个", COLOR_TEXT),
+                (f"{fmt_speed(float(info.get('speed') or 0.0))} km/h · "
+                 f"{info.get('vehicle') or '未知载具'}", COLOR_TEXT),
+            ]
+        self.overlay.set_lines(lines)
+        self.overlay.set_active(True)
 
     def _on_show_zones(self, checked: bool) -> None:
         """菜单开关: 是否在地图上画战区。"""
@@ -383,7 +572,7 @@ class RouteTesterWindow(QMainWindow):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
 
-        self.map_view = RouteMapView(right)
+        self.map_view = _create_map_view(right)
         rl.addWidget(self.map_view, 1)
         rl.addWidget(self._build_info_panel(right), 0)
         splitter.addWidget(right)
@@ -424,6 +613,16 @@ class RouteTesterWindow(QMainWindow):
         header.setSectionResizeMode(_COL_TIME, QHeaderView.ResizeMode.ResizeToContents)
         header.setMinimumSectionSize(24)
         self.tree.setColumnWidth(_COL_EYE, EYE_COLUMN_WIDTH)
+        # 选中行不够显眼 → 把选中底色调**深**(系统默认的浅蓝高亮在两种主题下都偏淡)。
+        # 用 palette 而不是 QSS: QSS 的 `::item` 会接管单元格绘制, 容易连带改掉
+        # 交替行/图标/文字顏色; 只换 Highlight 两个颜色, 其余绘制保持系统原生。
+        pal = self.tree.palette()
+        # Active / Inactive 两组都要设: 窗口失焦时 Qt 用的是 Inactive.Highlight,
+        # 只设 Active 的话切出去再回来会看到浅灰高亮(实测取样仍是 #f3f3f3)。
+        for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+            pal.setColor(group, QPalette.ColorRole.Highlight, QColor("#1d4ed8"))
+            pal.setColor(group, QPalette.ColorRole.HighlightedText, QColor("#f8fafc"))
+        self.tree.setPalette(pal)
         # 选中的条目决定「回放」播哪几条(可 Shift/Ctrl 多选);
         # 而「地图上有没有显示」完全由眼睛图标控制 —— 两者职责分开。
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -721,16 +920,30 @@ class RouteTesterWindow(QMainWindow):
                                             for side in GLOBAL_SIDES
                                             for life in g.lives(side))))
         item.setToolTip(_COL_EYE, "点击显示 / 隐藏整局的全部线路")
-        item.setToolTip(_COL_NAME,
-                        f"全局录制 · {g.map_name} · {g.mode_label}\n"
-                        f"录制时间 {g.created_at.replace('T', ' ')}\n"
-                        f"用时 {fmt_time(g.duration)} · "
-                        f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条\n"
-                        f"标记: {g.mark_label or '(无 — 点「A/B 队录制」会新建一个条目)'}\n"
-                        f"右键可标记为 A/B 队录制目标、清除标记或删除")
-        f = QFont()
-        f.setItalic(True)
-        item.setFont(_COL_NAME, f)
+        # 还没指定“录制时镜头挂在谁身上” → 信息列挂一个黄色感叹号(点它打开修正界面)。
+        # 那位玩家阵亡后 8111 仍会继续上报残骸, 不修正的话他的死亡时刻会落在整局结束。
+        if not g.fixed and g.count():
+            item.setIcon(_COL_INFO, warn_icon())
+            item.setToolTip(_COL_INFO,
+                            "这局还没指定“录制时镜头挂在谁身上”\n"
+                            "——点这个感叹号来指定, 程序会据此修正那两位玩家的死亡时刻\n"
+                            "(右键条目也能打开同一个界面)")
+            item.setForeground(_COL_INFO, QBrush(QColor("#b45309")))
+        tooltip = [
+            f"全局录制 · {g.map_name} · {g.mode_label}",
+            f"录制时间 {g.created_at.replace('T', ' ')}",
+            f"用时 {fmt_time(g.duration)} · "
+            f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条",
+            f"标记: {g.mark_label or '(无 — 点「A/B 队录制」会新建一个条目)'}",
+        ]
+        if not g.fixed:
+            tooltip.append("未指定观战玩家 —— 点右侧黄色感叹号(或右键条目)")
+        elif g.watchers:
+            tooltip.append("观战玩家: " + " / ".join(
+                f"{side} 队 {name}" for side, name in
+                ((s, g.watchers.get(s)) for s in GLOBAL_SIDES) if name))
+        tooltip.append("右键可标记为 A/B 队录制目标、指定观战玩家或删除")
+        item.setToolTip(_COL_NAME, "\n".join(tooltip))
         parent.addChild(item)
         for side in GLOBAL_SIDES:
             lives = g.lives(side)
@@ -946,7 +1159,15 @@ class RouteTesterWindow(QMainWindow):
         self._expand_item(route_id)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, col: int) -> None:
-        """点击第一列的**眼睛图标** → 切换该条目在地图上的显示/隐藏。"""
+        """点击第一列的**眼睛图标** → 切换该条目在地图上的显示/隐藏。
+
+        全局条目信息列上的**黄色感叹号** → 打开“指定观战玩家”修正界面。
+        """
+        if col == _COL_INFO and item.data(0, _ROLE_KIND) == "global":
+            g = self.store.get_global(item.data(0, _ROLE_ID))
+            if g is not None and not g.fixed:
+                self._open_watcher_dialog(g.route_id)
+            return
         if col != _COL_EYE:
             return
         kind = item.data(0, _ROLE_KIND)
@@ -1078,22 +1299,57 @@ class RouteTesterWindow(QMainWindow):
         return out
 
 
+    def _life_owner(self, life) -> GlobalRecord | None:
+        """全局线路(`UnitLife`)所属的全局条目(找不到返回 None)。"""
+        lid = getattr(life, "life_id", "")
+        if not lid:
+            return None
+        for g in self.store.globals:
+            for side in GLOBAL_SIDES:
+                if any(lf.life_id == lid for lf in g.lives(side)):
+                    return g
+        return None
+
     def _zone_signature_for_view(self) -> str:
         """当前视图(回放中的 / 眼睛点亮的轨迹)对应的模式指纹(取不到就空串)。
 
         多条轨迹时只在它们指纹一致时才返回 —— 否则无法决定画哪套战区。
-        全局线路(UnitLife)**没有** `zone_signature`, 直接跳过(它们不影响战区选择)。
+
+        2026-10-22 修: 全局线路(`UnitLife`)**自己没有** `zone_signature`,
+        以前这里直接把它当空串跳过 → `layout_for(key, "")` 退化成 `layouts[0]`,
+        于是回放 AB 队录制的线路时画的是**单条路线录制时**那套战区位置。
+        现在对全局线路反查它所属的 `GlobalRecord.zone_signature`。
         """
         recs = self.map_view.playback_records or self.map_view.visible_tracks
         sigs = {s for r in recs if (s := getattr(r, "zone_signature", ""))}
-        return sigs.pop() if len(sigs) == 1 else ""
+        if len(sigs) == 1:
+            return sigs.pop()
+        if sigs:
+            return ""                    # 多条轨迹模式不一致 → 无法决定
+        gsigs: set[str] = set()          # 全是全局线路 → 问它们所属的条目
+        for r in recs:
+            owner = self._life_owner(r)
+            if owner is not None and owner.zone_signature:
+                gsigs.add(owner.zone_signature)
+        return gsigs.pop() if len(gsigs) == 1 else ""
+
+    def _playback_global(self) -> GlobalRecord | None:
+        """回放中若含全局线路, 返回它们所属的全局条目(用于取战区时间轴)。"""
+        for r in self.map_view.playback_records:
+            owner = self._life_owner(r)
+            if owner is not None:
+                return owner
+        return None
 
     def _apply_zones(self, info: dict | None = None) -> None:
         """决定地图上画哪套战区(小菱形 + A/B/C)。
 
-        战局内且 8111 正在给同一张图 → 用**实时**战区;
-        其它情况(游戏关了/在看缓存底图) → 用该地图存过的布局:
-        优先匹配“正在看的轨迹的模式指纹”, 没有就取最近一次见过的。
+        优先级:
+        1. **回放全局录制** → 用录像里记的战区状态时间轴(归属变化、占领中都能重现);
+           这是 2026-10-22 用户要求的: 回放 AB 队线路时不该显示当前战局/别的录像的战区;
+        2. 战局内且 8111 正在给同一张图 → 用**实时**战区;
+        3. 其它(游戏关了/在看缓存底图) → 用该地图存过的布局:
+           优先匹配“正在看的轨迹的模式指纹”, 没有就取最近一次见过的。
         """
         key = self.map_view.map_key
         if not key:
@@ -1101,15 +1357,26 @@ class RouteTesterWindow(QMainWindow):
         recorder = getattr(self, "recorder", None)
         live = list((info or {}).get("zones") or [])
         live_spawns = list((info or {}).get("spawns") or [])
+        layout = self.store.layout_for(key, self._zone_signature_for_view())
+        # 1) 回放全局录制: 按 playhead 取当时的战区快照
+        if self._in_playback():
+            g = self._playback_global()
+            snap = g.zone_state_at(self.player.time) if g is not None else None
+            if snap:
+                self.map_view.set_zones(snap)
+                self.map_view.set_spawns(spawns_to_json(ground_spawns(
+                    spawns_from_json((layout or {}).get("spawns")))))
+                return
         if live and recorder is not None and recorder.map_key == key:
             self.map_view.set_zones(zones_to_json(live))
             # 只画**地面**重生位置(空军的 fighter/bomber/ucav 也记了, 但地图上不画)
             self.map_view.set_spawns(spawns_to_json(ground_spawns(live_spawns)))
             return
-        # 旧布局: 只画字母 + 中立色 —— 当时谁占着哪个战区早已过期, 不拿来误导
-        layout = self.store.layout_for(key, self._zone_signature_for_view())
+        # 旧布局: 位置 + 当时存下的归属色(用户 2026-10-22 要求把归属显示回来;
+        # `blink` 不存也不画 —— 那只是那一刻"正在被占领"的瞬时状态)
         self.map_view.set_zones([
-            {"label": z.get("label"), "x": z.get("x"), "y": z.get("y")}
+            {"label": z.get("label"), "x": z.get("x"), "y": z.get("y"),
+             "color": z.get("color"), "side": z.get("side")}
             for z in (layout or {}).get("zones") or []
         ])
         # 重生位置: 存过就画(同一张图不同版本存的是各自的那份)
@@ -1119,8 +1386,8 @@ class RouteTesterWindow(QMainWindow):
     def _selection_tracks(self) -> list[RouteRecord]:
         """侧栏中当前选中的线路(可 Shift/Ctrl 多选), 按侧栏顺序。"""
         out: list[RouteRecord] = []
-        for it in self.tree.selectedItems():
-            if it.data(0, _ROLE_KIND) != "route":
+        for it in self._iter_route_items():
+            if not self._is_item_selected(it):
                 continue
             rec = self.store.get(it.data(0, _ROLE_ID))
             if rec is not None:
@@ -1148,12 +1415,16 @@ class RouteTesterWindow(QMainWindow):
         选中整个全局条目 / A·B 队行时, 把它们下面的全部线路都算进来;
         只选中几条线路时就只算那几条 —— 与用户要的“选了就播选中的”一致。
         按**树的顺序**取(不能用 `selectedItems()` 的顺序, 那是选择模型的顺序)。
+
+        选中与否以 `selectionModel` 为准(见 `_is_item_selected` 的说明): 只看
+        `QTreeWidgetItem.isSelected()` 会把“父项折叠时只有内部标志”的条目也算进来,
+        于是明明取消掉的其它地图的线路还在选中集合里。
         """
         def hit(item: QTreeWidgetItem) -> bool:
             node: QTreeWidgetItem | None = item
             while node is not None:
-                if node.isSelected() and node.data(0, _ROLE_KIND) in (
-                        "glife", "gside", "global"):
+                if (self._is_item_selected(node)
+                        and node.data(0, _ROLE_KIND) in ("glife", "gside", "global")):
                     return True
                 node = node.parent()
             return False
@@ -1167,9 +1438,62 @@ class RouteTesterWindow(QMainWindow):
                 out.append(life)
         return out
 
+    def _iter_all_items(self):
+        """递归遍历侧栏里的**全部**条目(不限可见性)。"""
+        def walk(item):
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                yield ch
+                yield from walk(ch)
+
+        yield from walk(self.tree.invisibleRootItem())
+
+    def _is_item_selected(self, item: QTreeWidgetItem) -> bool:
+        """该条目此刻是否真的处于选中状态(index 级判断)。
+
+        不能用 `QTreeWidgetItem.isSelected()`: 父项折叠时它可能只是 item 自身的
+        标志位, 并不在 selectionModel 里(实测同一行 isSelected()=True 但
+        `selectedIndexes()` 里没有它) —— 那样子项会被误认为“选中”。
+        也不能用 `_ROLE_KEY` 建集合: 同一个全局条目下的所有线路条目共用同一个 KEY。
+        """
+        model = self.tree.selectionModel()
+        if model is None:
+            return False
+        idx = self.tree.indexFromItem(item, 0)
+        return idx.isValid() and model.isSelected(idx)
+
     def _selection_playables(self) -> list:
         """回放/高亮用: 选中的单条轨迹 + 选中的全局线路(侧栏顺序)。"""
         return self._selection_tracks() + self._selection_lives()
+
+    def _playable_group(self, r) -> tuple[str, str]:
+        """一条**可播放线路**属于哪个分组 (地图, 战区指纹)。
+
+        单条轨迹自带 `zone_signature`; 全局线路(`UnitLife`)只有 map_key,
+        它的版本信息在**所属全局录制**上 —— 不这样取的话, 同一张地图不同版本的
+        全局条目会被当成同一组。
+        """
+        if isinstance(r, RouteRecord):
+            return self._group_of(r)
+        lid = getattr(r, "life_id", "")
+        if lid:
+            for g in self.store.globals:
+                if any(l.life_id == lid for side in GLOBAL_SIDES for l in g.lives(side)):
+                    return (g.map_key or "", g.zone_signature or "")
+        return (getattr(r, "map_key", "") or "", "")
+
+    def _item_groups(self, item: QTreeWidgetItem) -> set[tuple[str, str]]:
+        """某个侧栏条目(任意层级)涉及哪些分组 —— 取消越界选中时按它判定。"""
+        groups: set[tuple[str, str]] = set()
+        for lid in self._life_ids_of(item):
+            life = self._life_by_id(lid)
+            if life is not None:
+                groups.add(self._playable_group(life))
+        if not groups:
+            rec = self.store.get(item.data(0, _ROLE_ID))
+            if rec is not None:
+                groups.add(self._playable_group(rec))
+        return groups
 
     def _on_tree_selection_changed(self) -> None:
         """选中项变化 → 回放将播放这几条; 同时**限制为同一张地图的同一版本**。
@@ -1182,38 +1506,59 @@ class RouteTesterWindow(QMainWindow):
 
         基准(图钉)还会**跟随当前选中所在的版本** —— 刚开始没选中任何条目时,
         第一个点到的路线就把它的“地图·模式·版本”定为基准。
+
+        判定用 `_selection_playables()`(单条轨迹 + 全局线路)而不是只看单条轨迹:
+        以前用 `_selection_tracks()`, 而它只认 `kind == "route"` 的条目 —— 选中
+        全局条目 / A·B 队行 / 全局线路时列表是空的, 跨地图限制完全不生效
+        (用户 2026-10-22: 选中 AB 队所有路线后还能 Ctrl 点别的地图的路线)。
         """
         if self._reselecting or self._in_playback():
             return
-        recs = self._selection_tracks()
-        if not recs:
+        playables = self._selection_playables()
+        if not playables:
             self._sel_ids = set()
+            self._sel_groups = set()
             self._update_play_label()
             self._refresh_map_tracks()   # 选中全局线路时也要把高亮刷出来
             return                       # 清空选中时保留基准(图钉不消失)
-        groups = {self._group_of(r) for r in recs}
+        groups = {self._playable_group(r) for r in playables}
         if len(groups) > 1:
             keep: tuple[str, str] | None = None
             if self._anchor is not None and self._anchor in groups:
                 keep = self._anchor
             else:
-                new_ids = {r.route_id for r in recs} - self._sel_ids
-                keep = next((self._group_of(r) for r in recs if r.route_id in new_ids), None)
-                if keep is None:
-                    keep = self._group_of(recs[-1])
-            recs = [r for r in recs if self._group_of(r) == keep]
+                new_groups = groups - self._sel_groups
+                keep = next(iter(new_groups), None) or self._playable_group(playables[-1])
             self._reselecting = True
             try:
                 self.tree.blockSignals(True)
-                self._select_route_ids([r.route_id for r in recs])
+                # 按**条目**取消选中(它可能是全局条目/队伍行, 没法用 route_id 选回去)。
+                # 两套都清: selectionModel(真正生效的选中) + item 自身标志位 ——
+                # 折叠组里的条目可能只改了自身标志, 不在 selectionModel 里
+                # (`selectedItems()` 还会过滤隐藏项, 所以也不能用它)。
+                model = self.tree.selectionModel()
+                seen: set[int] = set()
+                for idx in list(model.selectedIndexes()):
+                    it = self.tree.itemFromIndex(idx)
+                    if it is None or id(it) in seen:
+                        continue
+                    seen.add(id(it))
+                    if self._item_groups(it) - {keep}:
+                        it.setSelected(False)
+                for it in self._iter_all_items():
+                    if it.isSelected() and self._item_groups(it) - {keep}:
+                        it.setSelected(False)
                 self.tree.blockSignals(False)
             finally:
                 self._reselecting = False
+            playables = [r for r in playables if self._playable_group(r) == keep]
+            groups = {keep}
             self._set_status(
                 "同一张地图的同一版本才能一起回放/显示, 已只保留一个版本内的选中条目",
                 sticky=3.0)
-        self._sel_ids = {r.route_id for r in recs}
-        grp = self._group_of(recs[0])
+        self._sel_groups = groups
+        self._sel_ids = {getattr(r, "route_id", "") for r in playables}
+        grp = self._playable_group(playables[0])
         if grp != self._anchor:
             self._anchor = grp          # 基准跟着当前选中走
             self._refresh_anchor_icon()
@@ -1260,7 +1605,8 @@ class RouteTesterWindow(QMainWindow):
     @staticmethod
     def _group_of(rec: RouteRecord) -> tuple[str, str]:
         """一条轨迹属于哪个分组: (地图键, 战区坐标指纹) —— 版本 = 战区位置。"""
-        return (rec.map_key or "", rec.zone_signature or "")
+        return (getattr(rec, "map_key", "") or "",
+                getattr(rec, "zone_signature", "") or "")
 
     def _group_name(self, map_key: str, signature: str) -> str:
         """分组的可读名字(地图 · 模式 · 版本)。"""
@@ -1416,10 +1762,59 @@ class RouteTesterWindow(QMainWindow):
         menu.addAction(act_expand)
         if kind == "global":
             menu.addSeparator()
+            gid = item.data(0, _ROLE_ID)
+            g = self.store.get_global(gid)
+            act_fix = QAction("指定观战玩家(修正死亡时刻)…", self)
+            act_fix.setToolTip(
+                "8111 不告诉我们录制时镜头挂在谁身上 —— 而那位玩家阵亡后 8111\n"
+                "仍会继续上报残骸, 他的线路要到“他重生那一刻”或整局结束才断,\n"
+                "所以死亡时刻偏晚。在这里从本局击毁名单里点选他, 程序就会\n"
+                "用 hudmsg 的击毁时刻逐段把死亡时刻补上。")
+            act_fix.setEnabled(g is not None and bool(g.count()))
+            act_fix.triggered.connect(lambda: self._open_watcher_dialog(gid))
+            menu.addAction(act_fix)
+            menu.addSeparator()
             act_del = QAction("删除该全局录制…", self)
             act_del.triggered.connect(
                 lambda: self._delete_global(item.data(0, _ROLE_ID)))
             menu.addAction(act_del)
+
+    def _open_watcher_dialog(self, gid: str) -> None:
+        """打开“指定观战玩家”弹框 → 应用后按 hudmsg 修正两位的死亡时刻。"""
+        g = self.store.get_global(gid)
+        if g is None:
+            return
+        if not g.count():
+            self._set_status("这条全局录制还没有线路, 无法指定观战玩家", sticky=3.0)
+            return
+        dlg = WatcherDialog(g, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        resolved = self.store.set_watchers(gid, dlg.watchers())
+        self._reload_tree()
+        self._refresh_map_tracks()
+        parts = []
+        fixed_any = False
+        for side in GLOBAL_SIDES:
+            row = resolved.get(side) or {}
+            if not row.get("watcher"):
+                continue
+            fixed = [f for f in row.get("fixes") or [] if f.get("ok")]
+            fixed_any = fixed_any or bool(fixed)
+            if fixed:
+                parts.append(f"{side} 队 {row['watcher']} → 阵亡 "
+                             + "、".join(fmt_time(f["death"]) for f in fixed))
+            else:
+                parts.append(f"{side} 队 {row['watcher']} → 没对上任何线路"
+                             f"({row.get('note')})")
+        if not parts:
+            msg = "已保存(这一局不需要修正死亡时刻)"
+        elif fixed_any:
+            msg = "已按观战玩家修正死亡时刻: " + " | ".join(parts)
+        else:
+            msg = ("已保存, 但没有任何线路被修正 —— 黄色感叹号保留: "
+                   + " | ".join(parts))
+        self._set_status(msg, sticky=8.0)
 
     def _toggle_mark(self, gid: str, side: str, on: bool) -> None:
         """打/清“下次录到这一条”的标记。"""
@@ -1706,17 +2101,24 @@ class RouteTesterWindow(QMainWindow):
     def _on_global_finished(self, rec: GlobalRecord, side: str) -> None:
         self._last_global = rec
         self._last_duration = rec.duration
+        self.overlay.set_active(False)      # 录完就收掉叠加层
         self._update_buttons()
         # 刚录完的这一队自动点亮, 否则侧栏看起来“什么都没发生”
         self._visible_lives = {life.life_id for life in rec.lives(side)}
+        # 录了新的一队 → 之前指定的观战玩家可能已经不对了, 重新置为“待修正”
+        if rec.fixed:
+            self.store.set_fixed(rec.route_id, False)
         self._reload_tree()
         self._expand_item(rec.route_id)
         self._ensure_map_for([rec])
         self._set_status(
             f"全局录制完成: {rec.label} · {side} 队 {len(rec.lives(side))} 条线路"
-            f" | 用时 {fmt_time(rec.duration)}", sticky=8.0)
+            f" | 用时 {fmt_time(rec.duration)}"
+            f"\n点条目右侧的黄色感叹号指定“镜头挂在谁身上”, 程序会据此修正"
+            f"那两位玩家的死亡时刻", sticky=10.0)
 
     def _on_global_cancelled(self) -> None:
+        self.overlay.set_active(False)
         self._update_buttons()
         self._reload_tree()
         self._set_status("已取消全局录制(没有录到任何线路, 条目已丢弃)", sticky=4.0)
@@ -1899,6 +2301,9 @@ class RouteTesterWindow(QMainWindow):
         """
         self._ensure_map_for(list(recs) if isinstance(recs, (list, tuple)) else [recs])
         self.player.load(recs)
+        # 战区要跟着这次回放的**对象**换: 全局线路用条目自己的布局/时间轴,
+        # 单条轨迹用它录的那套(见 `_apply_zones`) —— 否则会留着上一批线路的战区
+        self._apply_zones()
         self._update_buttons()
         self._set_status(
             f"回放模式({len(self.player.records)} 条): 其余功能已暂停使用, "
@@ -1952,9 +2357,25 @@ class RouteTesterWindow(QMainWindow):
         """兼容旧调用点: 实质上重新计算全部控件状态。"""
         self._update_buttons()
 
+    def _sync_playback_zones(self, t: float) -> None:
+        """回放全局录制时, 把战区状态跟着时间轴一起推进。
+
+        用户 2026-10-22 要求: 回放 AB 队线路时要能看到当时战区被谁占着、
+        哪个正在被占领 —— 而不是一张与录像无关的静态布局(甚至是**另一个区域**
+        的布局: 全局录像和单条路线可能根本不在同一片交战区)。
+        `set_zones` 自己会去重, 所以每帧调用只是几次列表比较。
+        """
+        g = self._playback_global()
+        if g is None:
+            return
+        snap = g.zone_state_at(t)
+        if snap:
+            self.map_view.set_zones(snap)
+
     def _on_playback_progress(self, t: float) -> None:
         recs = self.player.records
         self.map_view.set_playback(recs, t)
+        self._sync_playback_zones(t)
         if recs:
             n = f"  ({len(recs)} 条)" if len(recs) > 1 else ""
             self.lbl_play.setText(
@@ -2031,6 +2452,8 @@ class RouteTesterWindow(QMainWindow):
             if self.map_view.map_key is None and now - self._last_map_try >= 1.0:
                 self._last_map_try = now
                 self._restore_map_for_current_view()
+            # 录制叠加层(与上面那批文本同一个 ~12Hz 节流)
+            self._update_overlay(info)
 
         self.map_view.set_player(info.get("player"), info.get("dir"))
         # 全局录制: 边录边画(新点一多就重画一次模型层, 见 _tracks_key)
@@ -2210,6 +2633,7 @@ class RouteTesterWindow(QMainWindow):
     def _on_recording_cancelled(self) -> None:
         """等待移动期间被结束 → 本次录制被丢弃(全程速度为 0)。"""
         self.map_view.set_live(None)
+        self.overlay.set_active(False)
         self._update_buttons(False)
         self._set_status("已取消录制: 未检测到载具移动(速度全程为 0)", sticky=3.0)
 
@@ -2219,6 +2643,7 @@ class RouteTesterWindow(QMainWindow):
     def _on_recording_finished(self, rec: RouteRecord) -> None:
         self._last_duration = rec.duration
         self._last_record = rec
+        self.overlay.set_active(False)      # 录完就收掉叠加层
         # 刚录完的这条仍然显示在地图上 → 眼睛必须同步点亮(显示状态统一由 _visible_ids 决定)
         self._visible_ids.add(rec.route_id)
         self._update_buttons(False)
@@ -2238,6 +2663,7 @@ class RouteTesterWindow(QMainWindow):
             self.sys_hotkeys.stop()
             self.player.pause()
             self.recorder.stop()
+            self.overlay.close()          # 叠加层是独立顶层窗, 不关会留在屏幕上
             self.store.save()
         except Exception as exc:  # noqa: BLE001 - 退出时尽力清理
             log.warning("退出清理异常: %s", exc)

@@ -85,7 +85,23 @@ def test_filters():
     units, skipped = extract_units(objects)
     assert len(units) == 1 and units[0].x == 0.5, [u.x for u in units]
     assert ("Airdefence", "Airdefence") in skipped
-    results.append("全局录制: 单位过滤(地面/空中全跳过/静态/超界坐标) OK")
+
+    # 敌方色 → 一律不录(死亡回放摄像机把镜头移到敌方车上时会带进来)
+    # 实测两次 B 队录制都混进一条 #fa0C00 的 A 队轻坦, 与本条目 A 队同名线路
+    # 逐点吻合(平均差 0.8m) —— 8111 自己标了敌方色, 按 color 过滤即可。
+    red = tank(0.6, 0.6, color="#fa0C00", icon="LightTank")
+    units, skipped = extract_units([
+        tank(0.3, 0.3, color=BLUE),                     # 我方蓝 → 录
+        tank(0.4, 0.4, color="#faC81E", icon="Player"),  # 自己黄(摄像机所在) → 录
+        tank(0.5, 0.5, color="#67D756"),                 # 队友绿 → 录
+        red,                                            # 敌方红 → 跳过
+        {"type": "ground_model", "icon": "LightTank",    # color[] 数组形式的红
+         "x": 0.7, "y": 0.7, "color[]": [250, 12, 0]},
+    ])
+    assert len(units) == 3, [(u.x, u.color) for u in units]
+    assert units[-1].color != "#fa0C00"
+    assert skipped.get(("敌方色", "LightTank")) == 2, skipped
+    results.append("全局录制: 单位过滤(地面/空中全跳过/静态/超界坐标/敌方色) OK")
 
 
 # ---------------------------------------------------------------- 跟踪
@@ -655,7 +671,51 @@ def test_map_paint():
     assert count(img, want) > 20, "全局录制时没有边录边画"
     view.set_live_multi(None)
     assert not count(canvas_of(), want), "清空后不该还留着全局线路"
+
+    # 已经不在画面上的轨迹, 它的几何缓存要被丢掉(否则删了很多录制后会一直攒着)
+    view.set_visible_tracks([life])
+    canvas_of()
+    assert view._seg_cache or view._line_cache or view._bbox_cache, "画过之后应有缓存"
+    view.set_visible_tracks([])
+    assert not (view._seg_cache or view._line_cache or view._bbox_cache
+                or view._vmax_cache or view._times_cache), "不在画面上的缓存应被剪掉"
     results.append("地图: 全局线路按速度配色绘制 + 录制中实时预览 OK")
+
+
+def test_spawn_side_color():
+    """阵亡叉/回放白点的颜色跟着“该队重生点在画面上是什么颜色”。
+
+    A/B 是两次独立观战, 每次都是“摄像机那一方 = 我方(蓝)” —— 所以同一个条目里两队
+    的 `side` 是反的, 写死 A=蓝/B=红 会跟画出来的重生点对不上(用户 2026-10-22)。
+    """
+    from PyQt6.QtGui import QColor
+    from wt81111g.route_map_view import COLOR_DEAD_MARK_A, RouteMapView
+
+    view = RouteMapView()
+    view.resize(400, 400)
+    view.set_map_bytes(png_bytes(), key="M")
+    # 这次录制里 A 队是“敌方”(红)、B 队才是“我方”(蓝) —— 故意与默认相反
+    view.set_spawns([{"kind": "tank", "x": 0.2, "y": 0.2, "side": "enemy"},
+                     {"kind": "tank", "x": 0.8, "y": 0.8, "side": "ours"}])
+
+    def life(lid, side, x, y):
+        return UnitLife(life_id=lid, icon="MediumTank", obj_type="ground_model",
+                        map_key="M", side=side,
+                        points=[TrackPoint(x, y, 0.0, 10.0),
+                                TrackPoint(x + 0.05, y, 5.0, 10.0)])
+
+    a = life("A1", "A", 0.21, 0.20)
+    b = life("B1", "B", 0.79, 0.81)
+    view.set_playback([a, b])
+    assert view._side_spawn_color("A") == QColor("#fa0C00"), view._side_spawn_color("A")
+    assert view._side_spawn_color("B") == QColor("#174DFF"), view._side_spawn_color("B")
+    assert view._dead_mark_color(a).name() == "#fa0c00"
+    assert view._dead_mark_color(b).name() == "#174dff"
+    # 认不出重生点(没画重生点)时退回旧口径: A 队蓝
+    view.set_spawns([])
+    view.set_playback([a])
+    assert view._dead_mark_color(a).name() == COLOR_DEAD_MARK_A.name()
+    results.append("地图: 阵亡叉/回放白点颜色跟随该队重生点颜色 OK")
 
 
 def test_only_global(tmpdir: str):
@@ -801,6 +861,489 @@ def test_playback_timeline():
     results.append("全局录制回放: 时间轴按绝对时刻(02:00 开始的线路也会动) OK")
 
 
+def test_spawn_start_check():
+    """新建线路时校验起点像不像"刚重生"（用户 2026-10-22 报的 bug 的诊断）。
+
+    场景: B 队录制里有一条线起点离最近重生点 183m、开局速度就 39km/h —— 一辆
+    **已经在路上跑**的车被当成了新单位。根因是 `_new_life()` 的起点取当帧位置,
+    所以任何"中途才被 8111 上报"的单位都会在路中间开一条线。
+    这里验证诊断能把它抓出来(只记日志, 不改变任何行为)。
+    """
+    from types import SimpleNamespace
+
+    spawns = [SimpleNamespace(x=0.30, y=0.61), SimpleNamespace(x=0.33, y=0.62)]
+    rec = GlobalRecord(route_id="g9", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "B", map_size=(4000.0, 4000.0), spawns=spawns)
+
+    t = 0.0
+    for i in range(10):                      # ① 正常重生: 从重生点出发
+        tr.feed(t, [tank(0.300 + 0.001 * i, 0.610)])
+        t += 0.05
+    # ② 一辆"凭空出现在路中间"的车(离最近重生点 ≈183m 那种)
+    for i in range(60):
+        tr.feed(t, [tank(0.300 + 0.001 * 10, 0.610),      # 原来那辆停着
+                    tank(0.4081 + 0.0004 * i, 0.6155, icon="LightTank")])
+        t += 0.05
+    lives = tr.finish()
+    assert len(lives) == 2, len(lives)
+    assert len(tr.suspicious) == 1, tr.suspicious
+    lid, at, dist_m, icon = tr.suspicious[0]
+    assert lid.endswith("B2"), lid
+    assert icon == "LightTank"
+    assert dist_m > 150.0, dist_m               # 实测就是 180m 量级
+    assert at > 0.4, at
+
+    # 没有重生点数据时不检查(不能凭空报警)
+    tr2 = GlobalTracker(GlobalRecord(route_id="g10", map_key="M", map_name="地", created_at=""),
+                        "B")
+    for i in range(10):
+        tr2.feed(i * 0.05, [tank(0.5 + 0.001 * i, 0.5)])
+    tr2.finish()
+    assert not tr2.suspicious
+    results.append("全局录制: 起点不在重生点附近的线路能被抓出来(只记日志) OK")
+
+
+def test_kill_timeline():
+    """用 hudmsg 的击毁时刻 + “每条 Player 线的时间段”反推摄像机那位的死亡时刻。
+
+    背景(用户 2026-10-22 修正口径): 录制全局路线时视角挂在我方一位玩家身上, 他阵亡后
+    8111 不会让 icon 立刻消失 —— 那条线继续上报残骸, 直到**他重生那一刻**才断;
+    他就此退出对局的话残骸会一直上报到录制结束。其余玩家 icon 正常消失, 判死有效。
+
+    思路: 全局线路的结束时刻 ≈ hudmsg 击毁时刻 + 一个**未知固定偏移**(绝对偏移不可
+    用: 录像从服务器端就开始、准备阶段的 15 秒还是假数字), 先用其他玩家扫出偏移,
+    再把那位的阵亡按“落在哪条 Player 线的时间段”逐段认领。
+    """
+    from wt81111g import kill_timeline as kt
+
+    # ---- 1) 只认"击毁了", 排除"引燃了 / 获得嘉奖", 并去掉零宽空格
+    class FakeClient:
+        def __init__(self, rows):
+            self.rows = rows
+            self.calls = []
+
+        def hudmsg(self, a, b):
+            self.calls.append((a, b))
+            return {"events": [], "damage": self.rows}
+
+    rows = [
+        {"id": 10, "time": 5, "msg": "A (豹 2A4) 击毁了 B (T-64A)"},
+        {"id": 11, "time": 6, "msg": "C (护卫坦克 57) 的\u200b攻击引燃了 D (黄蜂)"},
+        {"id": 12, "time": 7, "msg": "E (豹 2A4) 获得嘉奖“装甲克星”"},
+        {"id": 13, "time": 8, "msg": "F (T-80) 击\u200b毁\u200b了 G (M1)"},
+    ]
+    client = FakeClient(rows)
+    assert kt.read_cursor(client) == 13
+    new = kt.read_new_deaths(client, 10)
+    assert [r["id"] for r in new] == [13], new          # 11/12 不是击杀, 10 等于游标
+    assert "\u200b" not in new[0]["msg"], new[0]["msg"]
+
+    # ---- 2) 两队各自抓到的消息要按 id 去重
+    rec = GlobalRecord(route_id="g20", map_key="M", map_name="地图", created_at="",
+                       duration=100.0)
+    rec.kills = [{"id": 1, "t": 5.0, "msg": "x"}, {"id": 2, "t": 6.0, "msg": "y"},
+                 {"id": 1, "t": 5.0, "msg": "x"}]       # 模拟两队都抓到了 id=1
+    assert [k["id"] for k in kt.merge_kills(rec)] == [1, 2]
+
+    # ---- 3) 从击毁文本里认出玩家昵称(载具名自己还带括号; 武器/AI 没有括号)
+    assert kt.split_actor("[Mc185] Renamed#763 (◍M1A1 HC)") == (
+        "[Mc185] Renamed#763", "◍M1A1 HC")
+    assert kt.split_actor("weapons/su_r_77_1/short") == (
+        "weapons/su_r_77_1/short", "")
+    st = kt.player_stats([
+        {"t": 10.0, "msg": "甲 (T-80) 击毁了 乙 (M1)"},
+        {"t": 20.0, "msg": "乙 (M1) 击毁了 甲 (T-80)"},
+        {"t": 30.0, "msg": "丙 (红旗-11) 击毁了 weapons/su_r_77_1/short"},
+    ])
+    assert st["乙"]["deaths"] == [10.0], st["乙"]       # 只记“他死了”的时刻
+    assert st["乙"]["kills"] == 1 and st["甲"]["kills"] == 1
+    assert "weapons/su_r_77_1/short" not in st, st     # 武器/AI 不是玩家
+    # 弃车 / 被淹死 / 坠毁: `他 (载具) 已被摧毁` —— 受害者在动词前面, 没有击杀者
+    st3 = kt.player_stats([
+        {"t": 10.0, "msg": "=AZUR2= 目击而道存矣 (豹 2A4 (第 123 装甲营)) 已被摧毁"},
+        {"t": 20.0, "msg": "甲 (T-80) 击毁了 乙 (M1)"},
+    ])
+    assert st3["=AZUR2= 目击而道存矣"]["deaths"] == [10.0], st3
+    assert st3["=AZUR2= 目击而道存矣"]["kills"] == 0, st3
+    assert st3["=AZUR2= 目击而道存矣"]["vehicle"].startswith("豹 2A4"), st3
+
+    # ---- 4) 阵亡按“每条 Player 线的时间段”认领 —— 不再有任何静止/停车判定
+    def pts(*rows):
+        """(x, y, t, speed) —— 归一化坐标"""
+        return [TrackPoint(x, y, t, v) for x, y, t, v in rows]
+
+    # 一段只收自己的那次阵亡: 比赛 184.4(偏移 +5 → 179.4)在段内, 300 → 295 在段外
+    assert kt.deaths_in([184.4, 300.0], 5.0, 152.0, 224.0) == [179.4]
+    assert kt.deaths_in([], 5.0, 0.0, 100.0) == []
+
+    # ---- 5) 按昵称定位死亡时刻(结构仿诺曼底那局: 比赛 = 录制 + 5 秒)
+    #  `icon` 不可靠: 8111 对同一辆观战车有时给 Player、有时给真实类别(实测给过 SAM),
+    #  所以“摄像机那辆”也认 `color == #faC81E`(自己黄)。
+    YELLOW = "#faC81E"
+
+    def life(lid, side, icon, rows, dead=True, color=""):
+        return UnitLife(life_id=lid, icon=icon, obj_type="ground_model",
+                        map_key="M", points=pts(*rows), side=side, dead=dead,
+                        color=color)
+
+    rec2 = GlobalRecord(route_id="g21", map_key="M", map_name="地图", created_at="",
+                        duration=100.0)
+    rec2.sides["A"] = [
+        life("A1", "A", "MediumTank", ((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 10.0, 20.0))),
+        life("A2", "A", "MediumTank", ((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 30.0, 20.0))),
+        # 跑出 8111 上报范围 → 结束时刻是个噪声断点(没有对应的击杀)
+        life("A9", "A", "LightTank", ((0.6, 0.6, 12.0, 20.0), (0.7, 0.6, 20.0, 20.0))),
+        life("A3", "A", "Player", (
+            (0.5000, 0.5000, 152.0, 0.0), (0.5000, 0.5000, 167.0, 0.0),
+            (0.5020, 0.5000, 176.0, 8.0), (0.5040, 0.5000, 179.4, 13.0),
+            (0.5039, 0.5000, 194.4, 0.0), (0.5039, 0.5000, 209.4, 0.0),
+            (0.5039, 0.5000, 224.4, 0.0))),
+        # 第一辆车的残骸 icon 在"他重生那一刻"消失 → 线断; 第二辆车是另一条 Player 线
+        # (8111 这次给它的是 `icon=SAM`、只有颜色是自己黄 —— 所以不能只认 icon)
+        life("A4", "A", "SAM", (
+            (0.1000, 0.1000, 236.0, 0.0), (0.3000, 0.3000, 260.0, 40.0),
+            (0.3600, 0.3600, 300.0, 0.0)), color=YELLOW),
+    ]
+    rec2.sides["B"] = [
+        life("B1", "B", "MediumTank", ((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 50.0, 20.0))),
+        life("B2", "B", "Player", (
+            (0.4000, 0.4000, 300.0, 30.0), (0.4005, 0.4000, 351.0, 2.0),
+            (0.4009, 0.4000, 364.6, 0.5), (0.4009, 0.4000, 379.6, 0.0))),
+        # 这一段他没阵亡 → 活到录制结束, 不该被截断
+        life("B3", "B", "LightTank", (
+            (0.1000, 0.1000, 400.0, 0.0), (0.2000, 0.2000, 440.0, 30.0),
+            (0.3000, 0.2000, 480.0, 0.0)), dead=False, color=YELLOW),
+    ]
+    rec2.kills = [
+        {"id": 1, "t": 15.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ A1 结束 10
+        {"id": 2, "t": 35.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ A2 结束 30
+        {"id": 3, "t": 55.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ B1 结束 50
+        # 摄像机挂着的那两位: A 队死两次(两段各一次), B 队死一次
+        {"id": 4, "t": 184.4, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
+        {"id": 5, "t": 374.6, "msg": "w (ZTZ96) 击毁了 jjh67 (RDF/LT)"},
+        {"id": 6, "t": 250.0, "msg": "killflik (FK-2000) 已被摧毁"},
+        # 对空击杀(我们不录空中单位), 不该影响判定
+        {"id": 7, "t": 33.0, "msg": "x (Bf 109) 击毁了 y (伊尔-2)"},
+    ]
+    shift = kt.pooled_shift(rec2)
+    assert abs(shift - 5.0) <= 0.6, shift
+    report = kt.analyze(rec2)
+    assert abs(report["shift"] - 5.0) <= 0.6, report["shift"]
+    assert [p[0] for p in report["pairs"]].count(15.0) == 1, report["pairs"]
+    assert "待指定的观战玩家线路" in kt.describe(report), kt.describe(report)
+
+    got = kt.resolve_deaths(rec2, {"A": "killflik", "B": "jjh67"})
+    assert got["A"]["ok"] and got["B"]["ok"], got
+    # A 队两段(死了两次): 每段各认领自己那次阵亡
+    assert got["A"]["segments"] == 2, got["A"]
+    fix_a = [(f["life_id"], f["death"], f["tail"])
+             for f in got["A"]["fixes"] if f["ok"]]
+    assert [f[0] for f in fix_a] == ["A3", "A4"], fix_a
+    assert abs(fix_a[0][1] - 179.4) < 1.2, fix_a       # 184.4 - 5
+    assert abs(fix_a[1][1] - 245.0) < 1.2, fix_a       # 250.0 - 5
+    assert fix_a[1][2] > 40.0, fix_a                    # 线尾 300 - 245 → 残骸尾巴 55 秒
+    # B 队两段: 第一段有阵亡, 第二段没有 → 那段活到结束, 不修正
+    assert got["B"]["segments"] == 2, got["B"]
+    fix_b = {f["life_id"]: f["death"] for f in got["B"]["fixes"] if f["ok"]}
+    assert list(fix_b) == ["B2"], fix_b
+    assert abs(fix_b["B2"] - 369.6) < 1.2, fix_b   # 374.6 - 5
+    text = kt.summarize(got)
+    assert "A 队 killflik" in text and "修正 2/2 段" in text, text
+    # “像不像观战对象”: A 队两段都有他的阵亡 → strong; B 队只有一段命中有死
+    assert got["A"]["strong"], got["A"]
+    assert got["B"]["ok"] and not got["B"]["strong"], got["B"]
+    # 候选名单: 真正的观战对象排第一
+    ranked_a = kt.rank_watchers(rec2, "A")
+    assert ranked_a[0]["watcher"] == "killflik", ranked_a[:3]
+    assert ranked_a[0]["strong"], ranked_a[0]
+    # 名字不在本局击毁里 / 他没阵亡 → 都要明确说“不修正”, 而不是乱猜一个
+    assert not kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["ok"]
+    assert "阵亡记录" in kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["note"]
+    assert not kt.resolve_deaths(rec2, {"A": ""})["A"]["ok"]
+    # 两种固定格式都要认(docs/8111自定义对局实测分析.md §2)
+    assert kt.is_death_msg("[VsEG] Tacovac (BMPT) 击毁了 killflik (ZTZ96B)")
+    assert kt.is_death_msg("=AZUR2= 目击而道存矣 (豹 2A4 (第 123 装甲营)) 已\u200b被\u200b摧\u200b毁")
+    assert not kt.is_death_msg("甲 (T-80) 的攻击引燃了 乙 (M1)")
+    assert not kt.is_death_msg("甲 (T-80) 获得嘉奖“装甲克星”")
+    results.append("全局录制: 按观战玩家昵称精确定位死亡时刻 OK")
+
+
+def test_watcher_apply(tmpdir: str):
+    """指定观战玩家 → 把每条 Player 线各截断到自己的死亡时刻; 能完整还原。
+
+    为什么要截断而不是只改标记: 摄像机那位阵亡后 8111 还在上报残骸 —— 下一次重生
+    前拖到“重生那一刻”, 若他退出对局则拖到整局结束(实测 201 秒)。不截断的话
+    地图上的阵亡叉与“用时”都会偏晚, 看不出他到底什么时候死的。
+
+    一局里他可能死两次(换了第二辆车), 那就是两条 Player 线, **两条都要单独截断**。
+    """
+    from wt81111g import kill_timeline as kt
+
+    def pts(*rows):
+        return [TrackPoint(x, y, t, v) for x, y, t, v in rows]
+
+    path = os.path.join(tmpdir, "watch.json")
+    store = RouteStore(path)
+    g = store.new_global("MAP1", "地图 1")
+    g.sides["A"] = [
+        UnitLife(life_id=f"{g.route_id}:A1", icon="MediumTank",
+                 obj_type="ground_model", map_key="MAP1", side="A", dead=True,
+                 points=pts((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 10.0, 20.0))),
+        # 第一辆车: 阵亡后残骸一直上报到“他重生那一刻”(260s)
+        UnitLife(life_id=f"{g.route_id}:A2", icon="Player",
+                 obj_type="ground_model", map_key="MAP1", side="A", dead=True,
+                 points=pts((0.50, 0.50, 152.0, 0.0), (0.5020, 0.50, 176.0, 8.0),
+                            (0.5040, 0.50, 179.4, 13.0), (0.5039, 0.50, 194.4, 0.0),
+                            (0.5039, 0.50, 224.4, 0.0), (0.5039, 0.50, 260.0, 0.0))),
+        # 第二辆车: 又一条观战线(8111 给的是 `icon=SAM`, 靠录制时记下的 watched 认)
+        UnitLife(life_id=f"{g.route_id}:A3", icon="SAM",
+                 obj_type="ground_model", map_key="MAP1", side="A", dead=False,
+                 watched=True,
+                 points=pts((0.10, 0.10, 300.0, 0.0), (0.1500, 0.15, 360.0, 30.0),
+                            (0.1600, 0.16, 380.0, 2.0), (0.1600, 0.16, 420.0, 0.0))),
+    ]
+    g.sides["B"] = [
+        UnitLife(life_id=f"{g.route_id}:B1", icon="MediumTank",
+                 obj_type="ground_model", map_key="MAP1", side="B", dead=True,
+                 points=pts((0.4, 0.4, 0.0, 20.0), (0.5, 0.4, 50.0, 20.0))),
+    ]
+    g.kills = [
+        {"id": 1, "t": 15.0, "msg": "x (T-80) 击毁了 y (M1)"},
+        {"id": 2, "t": 55.0, "msg": "x (T-80) 击毁了 y (M1)"},
+        {"id": 3, "t": 184.4, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
+        {"id": 4, "t": 385.0, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
+    ]
+    store.add_global(g)
+    assert not g.fixed, "新条目默认是“待修正”(侧栏会挂感叹号)"
+
+    player = g.lives("A")[1]
+    player2 = g.lives("A")[2]
+    original = [p.t for p in player.points]
+    original2 = [p.t for p in player2.points]
+    resolved = store.set_watchers(g.route_id, {"A": "killflik"})
+    assert resolved["A"]["ok"] and not resolved["B"]["ok"], resolved
+    assert resolved["A"]["segments"] == 2, resolved["A"]
+    fix = {f["life_id"]: f["death"] for f in resolved["A"]["fixes"] if f["ok"]}
+    assert list(fix) == [f"{g.route_id}:A2", f"{g.route_id}:A3"], fix
+    assert g.fixed and g.watchers == {"A": "killflik"}, (g.fixed, g.watchers)
+    # 两条线各自截断到自己的死亡时刻(比赛时刻 - 偏移 5), 尾巴收进 trimmed
+    assert player.dead and abs(player.death_t - 179.4) < 1.2, player.death_t
+    assert abs(player.points[-1].t - player.death_t) < 1e-6, player.points[-1]
+    assert len(player.points) < len(original), (len(player.points), len(original))
+    assert len(player.trimmed) == len(original), "原始点要留一份以便改主意"
+    assert player.points[-1].t < 200.0, "残骸尾巴应被截掉"
+    assert player2.dead and abs(player2.death_t - 380.0) < 1.2, player2.death_t
+    assert player2.points[-1].t < 400.0, "退出后到录制结束的残骸尾巴应被截掉"
+    assert len(player2.trimmed) == len(original2)
+
+    # 落盘/读回: 修正结果、原始点、watchers/fixed 都要在
+    again = RouteStore(path)
+    got = again.get_global(g.route_id)
+    assert got is not None and got.fixed and got.watchers == {"A": "killflik"}
+    l2, l2b = got.lives("A")[1], got.lives("A")[2]
+    assert abs(l2.death_t - player.death_t) < 0.01
+    assert abs(l2.points[-1].t - player.points[-1].t) < 0.01
+    assert len(l2.trimmed) == len(original)
+    assert abs(l2b.death_t - player2.death_t) < 0.01
+    assert len(l2b.trimmed) == len(original2)
+    assert l2b.watched, "“摄像机那辆”这个事实要落盘(下次打开还能认出来)"
+    # 还原后必须和录下来的原始数据一模一样
+    again.set_watchers(g.route_id, {"A": "", "B": ""})
+    l3 = got.lives("A")[1]
+    l3b = got.lives("A")[2]
+    assert l3.death_t == 0.0 and l3.trimmed == [], (l3.death_t, l3.trimmed)
+    assert [round(p.t, 2) for p in l3.points] == [round(t, 2) for t in original]
+    assert l3b.death_t == 0.0 and l3b.trimmed == [], (l3b.death_t, l3b.trimmed)
+    assert [round(p.t, 2) for p in l3b.points] == [round(t, 2) for t in original2]
+    # 感叹号只在“真的修过”时才消失: 清空后应重新挂上(用户 2026-10-22)
+    assert not got.fixed and got.watchers == {}
+    # 选错名字(一条线都对不上) → 不做任何修改, 感叹号保留
+    again.set_watchers(g.route_id, {"A": "查无此人"})
+    assert not got.fixed, "没匹配到任何线路时不该去掉感叹号"
+    assert got.watchers == {"A": "查无此人"}
+    results.append("全局录制: 指定观战玩家→逐段截断死亡时刻/可还原/落盘 OK")
+
+
+def test_watcher_ui(tmpdir: str):
+    """侧栏: 未指定观战玩家的条目挂黄色感叹号; 点它 → 修正界面 → 感叹号消失。
+
+    弹框本身是模态的, 这里有把手把它换成桩 —— 只验证“点感叹号会走修正流程、
+    应用后数据被改、提醒图标消失”, 界面细节靠手动看。
+    """
+    from PyQt6.QtWidgets import QDialog
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "watch_win.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.sys_hotkeys.stop()
+    win.show()
+    app.processEvents()
+    win.store.rename_map("MAPW", "待修正")
+    g = win.store.new_global("MAPW", "待修正")
+    g.sides["A"].append(UnitLife(life_id=f"{g.route_id}:A1", icon="IFV",
+                                 obj_type="ground_model", side="A", dead=True,
+                                 points=[TrackPoint(0.2, 0.2, 0.0, 20.0),
+                                         TrackPoint(0.3, 0.25, 10.0, 20.0)]))
+    g.sides["A"].append(UnitLife(life_id=f"{g.route_id}:A2", icon="Player",
+                                 obj_type="ground_model", side="A", dead=True,
+                                 points=[TrackPoint(0.5000, 0.50, 152.0, 0.0),
+                                         TrackPoint(0.5020, 0.50, 176.0, 8.0),
+                                         TrackPoint(0.5040, 0.50, 179.4, 13.0),
+                                         TrackPoint(0.5039, 0.50, 224.4, 0.0)]))
+    g.kills = [{"id": 1, "t": 15.0, "msg": "x (T-80) 击毁了 y (M1)"},
+               {"id": 2, "t": 184.4, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"}]
+    win.store.add_global(g)
+    win._reload_tree()
+    app.processEvents()
+
+    item = _global_items(win)[0]
+    assert not item.icon(rw._COL_INFO).isNull(), "待修正的条目要挂黄色感叹号"
+    assert "感叹号" in item.toolTip(rw._COL_INFO), item.toolTip(rw._COL_INFO)
+
+    class FakeDialog:
+        def __init__(self, record, parent=None):
+            self.record = record
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def watchers(self):
+            return {"A": "killflik", "B": ""}
+
+    real = rw.WatcherDialog
+    rw.WatcherDialog = FakeDialog
+    try:
+        win._on_tree_item_clicked(item, rw._COL_INFO)
+    finally:
+        rw.WatcherDialog = real
+    app.processEvents()
+    assert g.fixed and g.watchers == {"A": "killflik"}, (g.fixed, g.watchers)
+    player = [lf for lf in g.lives("A") if lf.icon == "Player"][0]
+    assert abs(player.death_t - 179.4) < 1.2, player.death_t     # 184.4 - 偏移 5
+    assert abs(player.points[-1].t - player.death_t) < 1e-6
+    assert player.points[-1].t < 200.0, "残骸尾巴应被截掉"
+    assert _global_items(win)[0].icon(rw._COL_INFO).isNull(), "修正完感叹号要消失"
+    results.append("全局录制侧栏: 待修正挂感叹号 + 点它修正死亡时刻 OK")
+
+
+def test_zone_layout_pick(tmpdir: str):
+    """回放 AB 队线路时必须用**全局条目自己**的战区布局(可能是另一个交战区)。
+
+    用户 2026-10-22 实测: 同一张图先录了 3 条单路(交战区 #新), 之后录 AB 队全局
+    (#旧, **另一个区域**)。回放 AB 队时地图上画的是单路那套战区位置 —— 因为
+    `_zone_signature_for_view()` 把 `UnitLife` 当“没有指纹”跳过, 于是
+    `layout_for(key, "")` 回退到 `layouts[0]`(最后**新出现**的那套 = 单路的)。
+    顺带验证: 战区归属要跟着回放时间轴推进, 而不是一张静态快照。
+    """
+    from wt81111g.zones import Zone
+    from wt81111g.zones import signature as zone_sig
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "zones_win.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.sys_hotkeys.stop()
+
+    def zones(points):
+        return [Zone(label=label, x=x, y=y) for label, x, y in points]
+
+    old_pts = [("A", 0.30, 0.30), ("B", 0.40, 0.40), ("C", 0.50, 0.50)]  # AB 队区域
+    new_pts = [("A", 0.70, 0.70), ("B", 0.80, 0.80), ("C", 0.90, 0.90)]  # 单路区域
+    old_sig, new_sig = zone_sig(zones(old_pts)), zone_sig(zones(new_pts))
+    assert old_sig != new_sig, "构造失败: 两套布局指纹居然一样"
+
+    win.store.remember_zones("MAPZ", zones(old_pts))     # 先看到的老布局
+    win.store.remember_zones("MAPZ", zones(new_pts))     # 后看到的新布局 → 队首
+    assert win.store.map_zones["MAPZ"][0]["sig"] == new_sig, "构造失败: 新布局应在队首"
+
+    g = win.store.new_global("MAPZ", "地图 Z", zone_count=3,
+                             zone_signature=old_sig, mode_name="战区控制")
+    # 战区状态时间轴: 0s 中立 → 5s 我方占领
+    g.zone_states = [
+        {"t": 0.0, "zones": [{"label": "A", "x": 0.30, "y": 0.30,
+                              "side": "neutral", "color": "#ffFFFA", "blink": 0}]},
+        {"t": 5.0, "zones": [{"label": "A", "x": 0.30, "y": 0.30,
+                              "side": "ours", "color": "#174DFF", "blink": 0}]},
+    ]
+    for k in range(2):
+        g.sides["A"].append(UnitLife(
+            life_id=f"{g.route_id}:A{k}", icon="MediumTank", obj_type="ground_model",
+            map_key="MAPZ",
+            points=[TrackPoint(0.3, 0.3, 0.0), TrackPoint(0.4, 0.4, 8.0)]))
+    win.store.add_global(g)
+    win._reload_tree()
+    app.processEvents()
+
+    win._load_playback(list(g.lives("A")))
+    app.processEvents()
+    assert win._in_playback()
+
+    # 指纹必须是 AB 队那个区域, 而不是“最后新出现”的单路那套
+    assert win._zone_signature_for_view() == old_sig, win._zone_signature_for_view()
+
+    win.map_view.set_map_bytes(png_bytes(), key="MAPZ")
+    win.player.seek(0.0)
+    app.processEvents()
+    got = win.map_view.zones
+    assert got and abs(got[0]["x"] - 0.30) < 1e-6, f"战区位置应取自 AB 队布局: {got}"
+    assert got[0]["side"] == "neutral", got
+
+    win.player.seek(6.0)                    # 越过 5s 那条 → 归属变成我方
+    app.processEvents()
+    assert win.map_view.zones[0]["side"] == "ours", "回放应跟着时间轴推进战区归属"
+
+    win._end_playback()
+    app.processEvents()
+    results.append("全局录制回放: 战区用条目自己的布局(不是最新那套) + 归属随时间轴变化 OK")
+
+
+def test_hud_poll(tmpdir: str):
+    """录制期间定期读 /hudmsg —— 只在结束时读一次会漏掉被挤出缓冲区的击杀。
+
+    背景(用户 2026-10-22): 一局阵亡 3 次的玩家, 修正界面里只显示 2 次。
+    实测 `/hudmsg` 的 `damage` 只保留最近约 50 条, 而程序原先**只在录制结束时读
+    一次** —— 前几分钟的击杀那时已经被挤掉了。改成录制期间每 5 秒取增量后, 只要
+    两次读取的间隔内滚动不超过 50 条(一局里绝不可能)就不会丢。
+
+    这里用假 client 模拟"缓冲区往前滚", 并验证按 `(时间, 文本)` 去重
+    (两次回放的 `id` 各自重新编号, 不能按 id 去重)。
+    """
+    from wt81111g.route_recorder import RouteRecorder
+
+    class FakeClient:
+        def __init__(self):
+            self.window: list[dict] = []
+
+        def hudmsg(self, _a, cursor):
+            return {"events": [],
+                    "damage": [r for r in self.window if int(r["id"]) > int(cursor)]}
+
+    path = os.path.join(tmpdir, "hud.json")
+    store = RouteStore(path)
+    rec = store.new_global("MAPH", "地图 H")
+    store.add_global(rec)
+    run = RouteRecorder(store)
+    fake = FakeClient()
+    run.client = fake
+
+    # 第一次: 两条击杀(比赛 10s / 20s) + 一条“引燃了”(不是阵亡, 只统计动词)
+    fake.window = [{"id": 1, "time": 10, "msg": "a (T-80) 击毁了 b (M1)"},
+                   {"id": 2, "time": 12, "msg": "e (T-80) 引燃了 f (M1)"},
+                   {"id": 3, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"}]
+    assert run._poll_kills(rec) == 2, rec.kills
+    # 缓冲区往前滚: id=1/2 被挤出去, 又来一条
+    fake.window = [{"id": 3, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"},
+                   {"id": 4, "time": 30, "msg": "g (T-80) 击毁了 h (M1)"}]
+    assert run._poll_kills(rec) == 1
+    assert [k["t"] for k in rec.kills] == [10.0, 20.0, 30.0], rec.kills
+    # 模拟"另一队回放时 id 重新编号": 同一条事件换了 id → 不能重复入库
+    fake.window = [{"id": 900, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"}]
+    run._poll_kills(rec)
+    assert [k["t"] for k in rec.kills] == [10.0, 20.0, 30.0], rec.kills
+    results.append("全局录制: hudmsg 录制期间定期取增量 + 按(时间,文本)去重 OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -814,8 +1357,15 @@ def main() -> int:
     test_frame_align()
     test_store(tmpdir)
     test_map_paint()
+    test_spawn_side_color()
     test_live_layer_no_rebuild()
     test_playback_timeline()
+    test_spawn_start_check()
+    test_kill_timeline()
+    test_hud_poll(tmpdir)
+    test_watcher_apply(tmpdir)
+    test_watcher_ui(tmpdir)
+    test_zone_layout_pick(tmpdir)
     test_window(tmpdir)
     test_only_global(tmpdir)
     test_buttons_and_map_lock(tmpdir)

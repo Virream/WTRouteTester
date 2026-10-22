@@ -35,6 +35,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from .api8111 import WT8111
 from .config import WT_BASE_URL
 from .global_record import DEFAULT_MAP_SIZE, GlobalTracker, extract_units
+from . import kill_timeline
 from .map_cache import MapCache
 from .route_store import (
     GLOBAL_SIDES, PLACEHOLDER_MAP_KEY, PLACEHOLDER_MAP_SHA1, GlobalRecord, RouteMark,
@@ -42,9 +43,20 @@ from .route_store import (
 )
 from .zones import Zone, mode_name as zone_mode_name, signature as zones_signature
 from .zones import (Spawn, spawn_state, spawn_summary, spawns_from_objects, zone_state,
-                    zones_from_objects)
+                    zones_from_objects, zones_to_json)
 
 log = logging.getLogger("route_recorder")
+
+# 全局录制里战区状态时间轴的条数上限(正常一局只有几十条; 异常时也不写爆数据)
+MAX_ZONE_STATES = 4000
+
+# 全局录制期间多久抓一次 /hudmsg 的增量(秒)。
+# 依据(用户 2026-10-22): 8111 的 damage 缓冲区装得下上百条, 而里面大部分并不是
+# 击杀(引燃/嘉奖等)。16v16 的一局里, 第一轮交火往往在 40 秒之后, 就算双方同时
+# 全死也还要再等 40 秒才会再死一批 —— 15 秒内死亡超过 50 人的战局基本不存在。
+# 另: **停止录制时一定会再补取一次**(见 `_collect_kills`), 不会因为刚好卡在
+# 两次轮询之间而丢掉尾部几条。
+HUD_POLL_INTERVAL = 15.0
 
 # 轮询/采样间隔: 默认 40ms(≈25Hz)。
 # 实测 8111 陆战数据本身約每 40ms 更新一次(rpm 变化间隔 p50=40ms),
@@ -183,6 +195,18 @@ class RouteRecorder(QObject):
         self._spawns: list[Spawn] = []  # 重生位置(respawn_base_*)
         self._spawns_state: tuple = ()
         self._spawns_saved: tuple = ()  # 已落盘的那份重生点状态
+        # 全局录制: 已记进时间轴的战区状态(字母/坐标/归属/是否被占)
+        self._zone_state_key: tuple | None = None
+        # 全局录制开始时抓到的 /hudmsg 游标(录制期间据它取增量击毁消息)
+        self._hud_cursor = 0
+        # 下次读 /hudmsg 的时刻(monotonic)。为什么要**录制期间定期读**:
+        # `/hudmsg` 的 damage 是**有上限的环形缓冲区**(装上上百条), 只在结束时读一次
+        # 的话, 前几分钟的击杀已经被挤掉了(用户 2026-10-22 实测: 一位阵亡 3 次的
+        # 玩家只看到 2 条)。
+        self._hud_read_at = 0.0
+        # 最近 2 秒内的**实际采样时刻**: 叠加层要显示“每秒真的写入了几个轨迹点”
+        # (它和 8111 轮询频率不是一回事 —— 采样还要过“采样间隔 + 最小位移”两道闸)
+        self._pt_times: deque[float] = deque()
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -404,6 +428,10 @@ class RouteRecorder(QObject):
                 self._map_info_at = now
                 self._update_map_size()
             global_elapsed = self._global_feed(now, objects)
+            # 定期把 /hudmsg 的增量存进条目 —— 不能等到结束时才读(损坏窗口只有 ~50 条)
+            if now >= self._hud_read_at:
+                self._hud_read_at = now + HUD_POLL_INTERVAL
+                self._poll_kills(self._global)
 
         self.tick.emit({
             "connected": connected,
@@ -418,6 +446,8 @@ class RouteRecorder(QObject):
             "elapsed": elapsed,
             "marks": len(self._rec.marks) - 1 if self._rec is not None else 0,
             "rate": self._current_rate(),
+            "points": len(self._rec.points) if self._rec is not None else 0,
+            "point_rate": self.point_rate(),
             "zones": self._zones,
             "spawns": self._spawns,
             "mode": self.mode_name,
@@ -631,9 +661,29 @@ class RouteRecorder(QObject):
         self._global_side = side
         self._global_created = created
         self._global_prev_lives = list(rec.lives(side))
-        self._tracker = GlobalTracker(rec, side, map_size=self._map_size)
+        # 重生点传进去: 只用于**校验新建线路的起点像不像刚重生**(见 GlobalTracker.suspicious)
+        self._tracker = GlobalTracker(rec, side, map_size=self._map_size,
+                                      spawns=list(self._spawns))
         self._global_waiting = True
         self._global_t0 = 0.0
+        self._zone_state_key = None      # 新录制 → 时间轴从头记(重录时清空旧时间轴)
+        # 抓一次 /hudmsg 的游标: 录制期间每 HUD_POLL_INTERVAL 秒据它取一次增量,
+        # 用来反推“摄像机挂着那位玩家”到底什么时候死的(见 `kill_timeline` 模块说明)。
+        self._hud_cursor = kill_timeline.read_cursor(self.client)
+        self._hud_read_at = 0.0          # 下一个 tick 立刻开始轮询
+        log.info("全局录制: hudmsg 游标 = %d", self._hud_cursor)
+        if created:
+            rec.zone_states = []
+        elif rec.lives(side):
+            # **重录某一队** → 这次的 hudmsg 要重新采一遍(用户 2026-10-22:
+            # “对已经录制过的全局路线重新录制, 那就再收集一遍击杀信息然后覆盖”)。
+            # 不覆盖的话旧击毁会和新一局的击毁混在一起, 阵亡次数/时间轴对齐都会错。
+            # 同时把“观战玩家”清零: 换了录像, 之前点的名字不一定还成立。
+            log.info("全局录制: %s 队是重录 → 清空旧的击杀记录(%d 条)与观战玩家设置",
+                     side, len(rec.kills))
+            rec.kills = []
+            rec.watchers = {}
+            rec.fixed = False
         # 锁定地面底图: 录制期间玩家可能上飞机, 8111 会改发空战地图
         self._map_lock = True
         self._map_info_at = 0.0          # 下一次 tick 立刻取一次地图边长
@@ -670,6 +720,7 @@ class RouteRecorder(QObject):
             self._do_global_stop()
             return max(0.0, elapsed)
         rec.duration = elapsed
+        self._record_zone_state(rec, elapsed)
         # 点录制时可能还没拿到战区(进图瞬间) → 一旦知道就把模式/布局补进条目,
         # 否则它会被归到“未知位置”那个版本组里
         if not rec.zone_signature and self._zones_sig:
@@ -677,6 +728,38 @@ class RouteRecorder(QObject):
             rec.zone_count = len(self._zones)
             rec.mode_name = self.mode_name
         return elapsed
+
+    def _record_zone_state(self, rec, elapsed: float) -> None:
+        """把战区状态的**变化**记进 `rec.zone_states` 时间轴(回放用)。
+
+        用户 2026-10-22 要求: 回放 AB 队录像时战区要能重现当时的归属(蓝/红)
+        与“正在被占领”, 而不是一张与录像无关的静态布局。8111 每帧都会给归属色,
+        但直接每帧存一条会让 routes.json 膨胀得没法看, 所以只在**下面三件事之一
+        变了**才记一条:
+
+        * 归属变了(我方 ↔ 敌方 ↔ 中立);
+        * 开始/结束被占领(`blink > 0` 的布尔位变了);
+        * 战区集合本身变了(换布局、数量变)。
+
+        `blink` 在 1 / 2 之间跳变属于“同一个占领过程”, 不当成变化 —— 否则一个
+        占领会造成每秒好几条记录。回放时取 `<= playhead` 的最后一条, 于是整段
+        占领期间都保持脉冲动画, 与实际观感一致。
+        """
+        zones = self._zones
+        if not zones:
+            return
+        key = tuple((z.label, round(z.x, 5), round(z.y, 5), z.side,
+                     1 if z.blink else 0) for z in zones)
+        if key == self._zone_state_key:
+            return
+        self._zone_state_key = key
+        # 兜底上限: 正常一局只有几十条; 真遇到异常(比如坐标系抖动)也不要写爆
+        if len(rec.zone_states) >= MAX_ZONE_STATES:
+            return
+        rec.zone_states.append({
+            "t": round(elapsed, 2),
+            "zones": zones_to_json(zones),
+        })
 
     def _do_global_stop(self) -> None:
         """结束全局录制并落盘。一条线都没录到 → 撤销(新建的删掉/重录的恢复原状)。"""
@@ -687,10 +770,12 @@ class RouteRecorder(QObject):
         side = self._global_side
         lives = self._tracker.finish() if self._tracker is not None else []
         skipped = dict(self._tracker.seen_skipped) if self._tracker is not None else {}
+        suspicious = list(self._tracker.suspicious) if self._tracker is not None else []
         duration = max(0.0, rec.duration or 0.0)
         self._global = None
         self._tracker = None
         self._global_waiting = False
+        self._zone_state_key = None
         self._map_lock = False
         self._map_digest = None          # 解锁后重新判断一次当前地图(可能已回到车库)
         if skipped:
@@ -698,6 +783,14 @@ class RouteRecorder(QObject):
             log.info("全局录制: 未录制(%s) 共 %d 种, 数量前 8: %s",
                      "非地面单位/静态对象", len(skipped),
                      ", ".join(f"{t}/{i or '-'}×{n}" for (t, i), n in top))
+        if suspicious:
+            # 起点不像重生的线 —— 不代表软件错, 但要让人一眼看到并知道是哪几条。
+            # 常见成因: 该单位直到那一刻才被 8111 上报(漏报/掉帧 > end_gap),
+            # 或者它本就不从重生点出生(如 AI 地面单位)。
+            log.warning("全局录制: %d 条线路的起点不在重生点附近(可能中途才开始被上报): %s",
+                        len(suspicious),
+                        ", ".join(f"{lid}@{t:.0f}s/{d:.0f}m/{icon}"
+                                  for lid, t, d, icon in suspicious[:12]))
         if not lives:
             if self._global_created:
                 self.store.remove_global(rec.route_id)
@@ -711,6 +804,7 @@ class RouteRecorder(QObject):
             return
         rec.sides[side] = lives          # 重录 = 整队替换
         rec.duration = duration
+        self._collect_kills(rec)
         self.store.save()
         self._global_prev_lives = []
         log.info("全局录制完成: %s %s 队 %d 条线路, 用时 %.1fs",
@@ -719,6 +813,61 @@ class RouteRecorder(QObject):
         log.info("全局录制 时间轴: %s", rec.timeline_note())
         self.global_finished.emit(rec, side)
 
+    def _poll_kills(self, rec) -> int:
+        """把 `/hudmsg` 里比游标新的**阵亡**消息存进条目, 返回这次取到几条。
+
+        **录制期间每 `HUD_POLL_INTERVAL` 秒调一次** —— `/hudmsg` 的 damage 是环形
+        缓冲区, 只在结束时读一次会把前几分钟的击杀挤掉(用户 2026-10-22 实测:
+        一位阵亡 3 次的玩家只能看到 2 条)。取到后把游标推到最大 id, 下次只取增量。
+        停止录制时(`_collect_kills`)还会**再补取一次**, 不会只剩尾部几条没拿。
+
+        “阵亡”包括两种文本(见 `kill_timeline.DEATH_MARKS`): 被别人`击毁了`,
+        以及弃车/被淹死/坠毁时的`已被摧毁`。
+
+        去重按 `(时间, 文本)`: 两次回放的 id 各自重新编号, 不能按 id 去重
+        (见 `kill_timeline.merge_kills`)。
+        """
+        try:
+            rows = kill_timeline.read_damage(self.client, self._hud_cursor)
+        except Exception as exc:  # noqa: BLE001 - 抓不到也不能影响录制/落盘
+            log.warning("全局录制: 读取 hudmsg 增量失败: %s", exc)
+            return 0
+        if not rows:
+            return 0
+        new = [r for r in rows if kill_timeline.is_death_msg(r["msg"])]
+        rec.kills.extend(new)
+        rec.kills = kill_timeline.merge_kills(rec)
+        try:
+            self._hud_cursor = max(self._hud_cursor,
+                                   max(int(k.get("id") or 0) for k in rows))
+        except ValueError:
+            pass
+        return len(new)
+
+    def _collect_kills(self, rec) -> None:
+        """录制结束: 补取最后一次增量, 并做一次“时间差对齐”诊断。
+
+        **只写日志, 不改任何 `dead` 判定** —— 真正的死亡时刻修正要等用户在界面上
+        指定“镜头挂在谁身上”(见 `RouteStore.set_watchers`)。这里只顺带报一下
+        对齐质量, 便于事后从日志里判断数据是否可信。
+        """
+        new = self._poll_kills(rec)
+        if new:
+            log.info("全局录制: hudmsg 最后一段新增阵亡 %d 条(累计 %d 条)",
+                     new, len(rec.kills))
+        else:
+            log.info("全局录制: hudmsg 没有新阵亡消息(累计 %d 条)", len(rec.kills))
+        sides_done = [s for s in GLOBAL_SIDES if rec.lives(s)]
+        if len(sides_done) < 2:
+            log.info("全局录制: 只录了 %s 队, 等另一队也录完后再做死亡时刻对齐",
+                     "/".join(sides_done) or "?")
+            return
+        report = kill_timeline.analyze(rec)
+        log.info("全局录制 击毁对齐: %s", kill_timeline.describe(report))
+        if kill_timeline.player_lines(rec, "A") or kill_timeline.player_lines(rec, "B"):
+            log.info("全局录制: 请在侧栏点条目右侧的黄色感叹号指定观战玩家, "
+                     "程序才会按 hudmsg 修正那两位的死亡时刻")
+ 
     def _do_start(self, now: float, player: tuple[float, float] | None, vehicle: str,
                   start_on_move: bool = False) -> None:
         if self._global is not None:
@@ -771,6 +920,7 @@ class RouteRecorder(QObject):
                 break
         self._last_pt_t = 0.0
         self._last_xy = (sx, sy)
+        self._pt_times.clear()          # 新一次录制 → 点数率窗口从头算
         for pt in extra or []:   # 起点之后已有的位移点(最多回溯窗口内的几帧)
             rec.points.append(pt)
             self._last_pt_t = pt.t
@@ -877,6 +1027,25 @@ class RouteRecorder(QObject):
                                      dx=dx, dy=dy))
         self._last_pt_t = elapsed
         self._last_xy = player
+        # 维护“实际采样时刻”窗口(只留最近 2 秒), 供 `point_rate()` 算真实点数率
+        self._pt_times.append(elapsed)
+        cutoff = elapsed - 2.0
+        while self._pt_times and self._pt_times[0] < cutoff:
+            self._pt_times.popleft()
+
+    def point_rate(self) -> float:
+        """最近 2 秒**真的写入了多少个轨迹点**(点/秒)。
+
+        与 `_current_rate()`(8111 轮询频率)不同: 采样还要过“采样间隔 + 最小位移”
+        两道闸, 所以实际点数率会**低于**轮询频率 —— 低速或停着不动时尤其明显
+        (车不动 → 位移不够 → 一个点也不写)。叠加层把它和轮询 Hz 并排显示,
+        就是为了让人一眼看出“8111 在给数据, 但轨迹没在长”。
+        """
+        q = self._pt_times
+        if len(q) < 2:
+            return 0.0
+        span = q[-1] - q[0]
+        return (len(q) - 1) / span if span > 0 else 0.0
 
     def _dir_xy(self) -> tuple[float, float]:
         """当前车头朝向的 (dx, dy); 没拿到时为 (0, 0)(= 不画朝向箭头)。"""

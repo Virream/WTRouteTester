@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """跑图线路测试器 验证脚本(离屏): 存储 / 录制状态机 / 窗口与侧栏。
 
 用法: python tests/route_tester_test.py
@@ -484,14 +484,26 @@ def test_player_heading():
     view.set_player(pos, (0.0, 0.0))           # 全零向量 = 无有效朝向
     assert bright(0.0) == 0 and bright(90.0) == 0, "零向量不该画出方向"
 
-    # --- 回放光标: 用**录制时存下的**朝向画白线(游戏没开也能看) ---
-    def cursor_bright(rec, head: float, angle_deg: float) -> int:
-        """在回放光标处沿那根白线取样(中段, 免得碰到光标的白圈/白点)。"""
+    # --- 回放光标: 朝向是**圆点内部的一条黑色短线**(2026-10-22 用户要求) ---
+    def cursor_dark(rec, head: float, angle_deg: float) -> int:
+        """沿那根黑色短线取样数**暗**像素。
+
+        判据用“既不是白点(≈750)也不是底图(≈204)”—— 短线只有 1~2px 宽, 加上亚像素
+        位置, 实际像素大多是抗锯齿半透明黑(实测 247~351); 只数纯黑会全是 0。
+        """
         cur = point_at(rec.points, head)
         c = view.map_pos(cur.x, cur.y)
         img = render_now()
         start, tip = cursor_dir_points(c, math.radians(angle_deg))
-        return count_bright(img, start, tip, 0.2, 0.6)
+        n = 0
+        for i in range(16):
+            t = 0.2 + 0.6 * (i + 0.5) / 16
+            x = int(round(start.x() + (tip.x() - start.x()) * t))
+            y = int(round(start.y() + (tip.y() - start.y()) * t))
+            col = img.pixelColor(x, y)
+            if 100 < col.red() + col.green() + col.blue() < 600:
+                n += 1
+        return n
 
     def playback_rec(dx: float, dy: float) -> RouteRecord:
         r = RouteRecord(route_id="head", map_key="k", map_name="m", vehicle="v",
@@ -503,13 +515,14 @@ def test_player_heading():
     view.set_player(None)
     rec_dir = playback_rec(0.0, -1.0)          # 录制时朝上
     view.set_playback(rec_dir, 2.0)
-    assert cursor_bright(rec_dir, 2.0, -90.0) > 8, "回放光标也要画朝向线"
-    assert cursor_bright(rec_dir, 2.0, 90.0) == 0, "反方向不该有朝向线"
+    assert cursor_dark(rec_dir, 2.0, -90.0) > 8, \
+        "回放光标圆点内部应有一条指向车头的黑线"
+    assert cursor_dark(rec_dir, 2.0, 90.0) == 0, "反方向不该有黑线(那里是白点)"
     view.set_playback(None)
 
     rec_old = playback_rec(0.0, 0.0)           # 旧轨迹: 点里没有朝向
     view.set_playback(rec_old, 2.0)
-    assert cursor_bright(rec_old, 2.0, -90.0) == 0, "旧轨迹没有朝向 → 只画点"
+    assert cursor_dark(rec_old, 2.0, -90.0) == 0, "旧轨迹没有朝向 → 只画白点"
 
     # 光标**只留实心圆**(2026-10-21 用户要求): 外圈半径 9 那一圈不该有白像素
     img = render_now()
@@ -691,10 +704,30 @@ def test_map_draw_cache():
         assert len(lay_calls) == n_lay, "拖动不该重建缓存层(余量内只贴图)"
         assert len(seg_calls) == n_seg, "拖动更不该重算分桶几何"
 
-        # 拖出余量 → 必须重建(否则边缘会出现空白/旧内容)
-        view._pan_x += view.width()
+        # 拖出余量 → **不重建**, 改成“把旧内容搬一格 + 只补新露出来的窄边”
+        # (2026-10-21: 64 条线整层重建实测 79 ms, 用户感觉是“拖一下卡一下”)
+        view._pan_x += 300.0                 # 余量 = 0.35×800 = 280, 300 刚好越界
         view.render(canvas)
-        assert len(lay_calls) > n_lay, "拖出余量后必须重建缓存层"
+        assert len(lay_calls) == n_lay, "拖出余量应搬图层, 不该整层重建"
+        r = view._map_rect()
+        mx, _my = view._margin()
+        assert abs(r.left() - view._track_anchor[0]) <= mx + 1e-6, \
+            "搬完图层后锚点必须重新贴近当前地图矩形(否则内容会错位)"
+        px_drag = view.map_pos(recs[0].points[150].x, recs[0].points[150].y)
+        img_drag = QImage(800, 600, QImage.Format.Format_ARGB32)
+        view.render(img_drag)
+        assert img_drag.pixelColor(int(px_drag.x()), int(px_drag.y())) != \
+            QColor("#334455"), "搬图层后轨迹仍应画在正确位置"
+
+        # 搬不动(露出来的面积太大) → 退回整层重建(把阈值调成 0 模拟)
+        real_ratio = mv.SHIFT_MAX_EXPOSED
+        mv.SHIFT_MAX_EXPOSED = 0.0
+        try:
+            view._pan_x = -168.0             # 向左拖出余量, 且被 _clamp_pan 允许
+            view.render(canvas)
+        finally:
+            mv.SHIFT_MAX_EXPOSED = real_ratio
+        assert len(lay_calls) > n_lay, "搬图层不划算时应退回整层重建"
         view.reset_view()
         view.render(canvas)
         n_lay = len(lay_calls)
@@ -776,7 +809,7 @@ def test_playback_draw_cache():
             view.render(canvas)
         assert len(lay_calls) == n, "回放推进不该重建累加层(只补新段)"
 
-        # ② 播放到的部分要真的画上去(颜色与未播放的半透明底衬不同)
+        # ② 播放到的部分要真的画上去(playhead=0 时该位置是空的/底图色)
         pt = rec.points[-1]
         px = view.map_pos(pt.x, pt.y)
         img_end = QImage(800, 600, QImage.Format.Format_ARGB32)
@@ -785,12 +818,29 @@ def test_playback_draw_cache():
         img_start = QImage(800, 600, QImage.Format.Format_ARGB32)
         view.render(img_start)
         assert img_end.pixelColor(int(px.x()), int(px.y())) != \
-            img_start.pixelColor(int(px.x()), int(px.y())), "已播放段应覆盖未播放底衬"
+            img_start.pixelColor(int(px.x()), int(px.y())), \
+            "已播放段应该可见, 而未播放时不该画出整条灰线"
 
         # ③ 往回拖拽 → 必须重建(否则已播放的段留在图上擦不掉)
         view.set_playback([rec], rec.duration * 0.2)
         view.render(canvas)
         assert len(lay_calls) > n, "往回拖拽必须重建累加层"
+        n2 = len(lay_calls)
+
+        # ③b 拖动出余量 → **不重建**(搬图层), 已播放的画面仍跟着地图走
+        view.set_playback([rec], rec.duration * 0.6)
+        view.render(canvas)
+        n_shift = len(lay_calls)
+        view._pan_x += 300.0                 # 余量 = 0.35×800 = 280
+        img_drag = QImage(800, 600, QImage.Format.Format_ARGB32)
+        view.render(img_drag)
+        assert len(lay_calls) == n_shift, "拖动出余量应搬累加层, 不该整层重建"
+        # 取**已播放**范围内的点(60% 进度 ≈ 前 120 点; 未播放段现在不画)
+        px_drag = view.map_pos(rec.points[50].x, rec.points[50].y)
+        assert img_drag.pixelColor(int(px_drag.x()), int(px_drag.y())) != \
+            QColor("#334455"), "搬图层后回放画面仍应画在正确位置"
+        view._pan_x = 0.0
+        view.render(canvas)
         n2 = len(lay_calls)
 
         # ④ 缩放 → 播放中也不重建(先按比例贴旧层), 停手后才重建一次
@@ -1417,10 +1467,13 @@ def test_start_on_move(tmpdir: str):
 
 
 def test_eye_visibility_opacity(tmpdir: str):
-    """侧栏眼睛图标控制轨迹显示/隐藏; **轨迹一律不透明, 半透明只用于回放未播放段**。
+    """侧栏眼睛图标控制轨迹显示/隐藏; **轨迹一律不透明**。
 
     透明度用像素级验证: 同一条轨迹分别画在深/浅两种底图上取色 ——
     不透明 → 两次取色完全相同(颜色不随底图变); 半透明 → 取色随底图变。
+
+    2026-10-22: 回放不再画“未播放的全长底衬”(否则一按播放就能看到整条灰影),
+    所以 playhead=0 时该位置应该就是底图色。
     """
     def png(color: str) -> bytes:
         img = QImage(64, 64, QImage.Format.Format_RGB32)
@@ -1449,7 +1502,7 @@ def test_eye_visibility_opacity(tmpdir: str):
         if mode == "visible":
             view.set_visible_tracks([rec])
         elif mode == "playback":
-            view.set_playback(rec, 0.0)      # playhead=0 → 整条都是“未播放”
+            view.set_playback(rec, 0.0)      # playhead=0 → 还没播放任何段
         else:
             view.set_live(rec)
         canvas = QImage(view.width(), view.height(), QImage.Format.Format_ARGB32)
@@ -1464,8 +1517,10 @@ def test_eye_visibility_opacity(tmpdir: str):
         "眼睛点亮的轨迹必须不透明(颜色不应随底图变化)"
     assert track_color("live", dark) == track_color("live", light), \
         "录制中的轨迹必须不透明"
-    assert track_color("playback", dark) != track_color("playback", light), \
-        "回放未播放段应是半透明(颜色随底图变化)"
+    # 回放未播放段不画 → 取到的就是底图色(两种底图各自不同)
+    assert track_color("playback", dark) == (0x28, 0x28, 0x28), \
+        "回放不该提前把未播放的轨迹画出来(会看到整条灰影)"
+    assert track_color("playback", light) == (0xC8, 0xC8, 0xC8)
     # 不透明 ≠ 半透明: 同底图下两种画法颜色必须不同
     assert track_color("visible", dark) != track_color("playback", dark)
 
@@ -1607,20 +1662,33 @@ def test_eye_visibility_opacity(tmpdir: str):
 
 
 def test_store_bom(tmpdir: str):
-    """带 BOM 的 routes.json 也要能读(否则会被当成损坏 → 记录全丢, 下次 save 还会覆盖掉)。"""
-    path = os.path.join(tmpdir, "bom_routes.json")
+    """存储格式: `data/routes.json` 是 **gzip 压缩的 JSON**(2026-10-22 起)。
+
+    动机是体积与加载速度: 实测 3.49MB → 0.47MB(7.4 倍), 加载 80ms → 63ms
+    (磁盘少读 7.4 倍, 省下的 IO 多于解压)。
+    **不做旧格式兼容**(自用软件, 数据可随时重录) —— 所以这里只验证 gzip 往返:
+    写出来的必须是 gzip 魔数, 存进去的东西一字不差地读回来。
+    """
+    path = os.path.join(tmpdir, "fmt_routes.json")
     store = RouteStore(path)
     rec = store.new_route("AAA", "地图 A", "T", 0.2, 0.2)
     rec.duration = 5.0
     rec.points = [RoutePoint(0.2, 0.2, 0.0, 0.0), RoutePoint(0.3, 0.3, 5.0, 30.0)]
     store.add(rec)
+
     raw = open(path, "rb").read()
-    open(path, "wb").write(b"\xef\xbb\xbf" + raw)      # 手工加 UTF-8 BOM
+    assert raw[:2] == b"\x1f\x8b", "save() 应该写 gzip"
     again = RouteStore(path)
     assert len(again.routes) == 1, again.routes
     assert again.routes[0].route_id == rec.route_id
     assert again.routes[0].points[-1].speed == 30.0
-    results.append("带 BOM 的 routes.json 可正常读取 OK")
+    assert abs(again.routes[0].points[-1].x - 0.3) < 1e-9
+
+    # 写坏了(不是 gzip) → 当没有数据, 不抛异常、不拿半截数据当完整数据
+    open(path, "wb").write(b"not a gzip file")
+    broken = RouteStore(path)
+    assert not broken.routes and not broken.globals, broken.routes
+    results.append("存储: routes.json 为 gzip(往返一致 / 损坏文件当空数据) OK")
 
 
 def test_playback_lock(tmpdir: str):
@@ -2971,11 +3039,12 @@ def test_dead_style(tmpdir: str):
               after.pixelColor(x, y))]
     assert xs and max(xs) - min(xs) + 1 <= 9, f"红叉太大了: {max(xs) - min(xs) + 1}px"
 
-    # ③ 关掉“变暗”: 线路重新按速度着色, 红叉仍在
+    # ③ 关掉“变暗”: 整条线路清除(既不画灰也不画彩), 红叉仍在
     #    (速度配色本身就可能是红的, 所以红叉一律用“开关前后的差值”来断言)
     view.set_dead_style(dim=False)
     after2 = shot(12.0)
-    assert sat(at(after2, 0.20, 0.5)) > 60, "关掉变暗后应恢复速度配色"
+    assert sat(at(after2, 0.20, 0.5)) < 30, \
+        f"关掉变暗后阵亡线路应被清除(取到底图色), 实际 {at(after2, 0.20, 0.5)}"
     view.set_dead_style(dim=False, mark=False)
     after2b = shot(12.0)
     assert red_pixels(after2, 0.55, 0.5) > red_pixels(after2b, 0.55, 0.5) + 3, \
@@ -3056,6 +3125,142 @@ def test_dead_style(tmpdir: str):
     results.append("回放阵亡样式(变灰/红叉/两个开关/无阵亡信息不变灰) OK")
 
 
+def test_record_overlay(tmpdir: str):
+    """录制叠加层: 默认不显示, 启用后录制时才出现; 位置/圆角/不透明度都生效。
+
+    这是用户 2026-10-22 要的功能: 录制时在屏幕角落看“实际采集情况”。
+    已确认它是**独立外部置顶窗**(与黑名单程序的 `overlay.py` 同一套做法),
+    不注入游戏、不读写游戏内存、只读 8111。
+    """
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtGui import QPainter
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "overlay.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.sys_hotkeys.stop()
+    # 隔离 QSettings, 否则会改到用户真实设置(也可能让“默认关闭”断言失败)
+    win._settings = QSettings(os.path.join(tmpdir, "overlay.ini"),
+                              QSettings.Format.IniFormat)
+    win._overlay_settings = win._load_overlay_settings()
+    win.overlay.apply_settings(win._overlay_settings)
+    # 菜单勾选状态是构造时按真实设置设的 → 换成隔离设置后要同步一次
+    win.act_overlay.setChecked(win._overlay_settings.enabled)
+    app.processEvents()
+    ov = win.overlay
+
+    info = {"recording": True, "elapsed": 83.4, "rate": 24.5, "points": 1042,
+            "point_rate": 12.6, "marks": 3, "speed": 42.0,
+            "vehicle": "Leopard 2PL", "global": None}
+
+    # 1) 默认关闭 → 录制中也不出现
+    assert not win._overlay_settings.enabled, "叠加层应默认关闭"
+    assert not win.act_overlay.isChecked()
+    win._update_overlay(info)
+    app.processEvents()
+    assert not ov.isVisible(), "没启用时不该出现叠加层"
+
+    # 2) 启用 + 录制中 → 出现, 内容含“实际采集率”与轮询频率
+    win.act_overlay.setChecked(True)
+    app.processEvents()
+    win._update_overlay(info)
+    app.processEvents()
+    assert ov.isVisible(), "启用后录制中应该显示叠加层"
+    text = "\n".join(t for t, _c in ov._panel._lines)
+    assert "采集 12.6 点/秒" in text and "轮询 24.5 Hz" in text, text
+    assert "点数 1042" in text and "标记 3 个" in text, text
+    assert "42 km/h" in text and "Leopard 2PL" in text, text
+    assert ov._panel.width() > 60 and ov._panel.height() > 30
+
+    # 3) 录制结束 → 立即隐藏
+    win._update_overlay({"recording": False, "global": None})
+    app.processEvents()
+    assert not ov.isVisible(), "录制结束应自动隐藏叠加层"
+
+    # 4) 位置: 四个锚点各自落到对应角(按可用区域 + 边距)
+    win._update_overlay(info)
+    app.processEvents()
+    geo = ov.geometry()
+    for key, want in (("tl", (False, False)), ("tr", (True, False)),
+                     ("bl", (False, True)), ("br", (True, True))):
+        win._on_overlay_anchor(key)
+        px, py = ov._panel.x(), ov._panel.y()
+        assert (px > geo.width() // 2) == want[0], (key, px, geo.width())
+        assert (py > geo.height() // 2) == want[1], (key, py, geo.height())
+        assert px >= 0 and py >= 0, (key, px, py)
+
+    # 5) 圆角/不透明度: 画到透明底图上验证(与实机同一条 draw() 路径)
+    def snap():
+        w, h = ov._panel.width(), ov._panel.height()
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(QColor(0, 0, 0, 0))
+        p = QPainter(img)
+        ov._panel.draw(p)
+        p.end()
+        return img
+
+    win._overlay_settings.opacity = 100
+    win._overlay_settings.corner = 18
+    ov.apply_settings(win._overlay_settings)
+    win._update_overlay(info)
+    app.processEvents()
+    img = snap()
+    w, h = ov._panel.width(), ov._panel.height()
+    bg_x, bg_y = w - 5, h // 2            # 右侧内边距: 只有背景
+    assert img.pixelColor(0, 0).alpha() == 0, "圆角处应该是透明的"
+    assert img.pixelColor(bg_x, bg_y).alpha() == 255, "100% 不透明度应是实底"
+    win._overlay_settings.opacity = 40
+    ov.apply_settings(win._overlay_settings)
+    win._update_overlay(info)
+    app.processEvents()
+    assert 80 <= snap().pixelColor(bg_x, bg_y).alpha() <= 120, "40% 不透明度应≈102"
+
+    # 6) 全局录制(A/B 队) → 必须显示! 这是用户报的 bug: `info["recording"]` 只表示
+    #    单条录制, 全局录制时它一直是 False, 以前因此 A/B 队录制时叠加层根本不出现。
+    win._update_overlay({"recording": False, "rate": 5.0, "global": {
+        "side": "A", "waiting": False, "elapsed": 12.0,
+        "lives": 7, "active": 3}})
+    app.processEvents()
+    assert ov.isVisible(), "全局录制期间叠加层必须显示(单条 recording=False 不代表没在录)"
+    text = "\n".join(t for t, _c in ov._panel._lines)
+    assert "A 队录制中" in text and "已录线路 7 条" in text, text
+    assert "进行中 3 辆" in text and "5.0 Hz" in text, text
+
+    # 6.1) 换成 B 队 → 队伍名跟着变
+    win._update_overlay({"recording": False, "rate": 6.0, "global": {
+        "side": "B", "waiting": False, "elapsed": 30.0,
+        "lives": 2, "active": 1}})
+    app.processEvents()
+    text = "\n".join(t for t, _c in ov._panel._lines)
+    assert "B 队录制中" in text and "已录线路 2 条" in text, text
+
+    # 6.2) 等待第一名玩家重生的阶段也要显示(此时还没有计时)
+    win._update_overlay({"recording": False, "rate": 4.0, "global": {
+        "side": "A", "waiting": True, "elapsed": 0.0, "lives": 0, "active": 0}})
+    app.processEvents()
+    assert ov.isVisible()
+    text = "\n".join(t for t, _c in ov._panel._lines)
+    assert "等待第一名玩家重生" in text, text
+
+    # 6.3) 全局录制结束(global=None 且 recording=False) → 隐藏
+    win._update_overlay({"recording": False, "global": None})
+    app.processEvents()
+    assert not ov.isVisible(), "全局录制结束后应隐藏"
+
+    # 7) 设置落盘
+    win._save_overlay_settings()
+    again = QSettings(os.path.join(tmpdir, "overlay.ini"), QSettings.Format.IniFormat)
+    assert int(again.value("overlay_enabled")) == 1
+    assert again.value("overlay_anchor") == "br"
+    assert int(again.value("overlay_opacity")) == 40
+
+    ov.close()
+    win.close()
+    app.processEvents()
+    results.append("录制叠加层: 默认关闭/随录制显示、采集率与轮询、四角位置、圆角与不透明度 OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -3086,6 +3291,7 @@ def main() -> int:
     test_eye_visibility_opacity(tmpdir)
     test_playback_lock(tmpdir)
     test_recording_end_eye(tmpdir)
+    test_record_overlay(tmpdir)
     test_playback_source_selection(tmpdir)
     test_map_cache(tmpdir)
     test_map_resolution_alias(tmpdir)
