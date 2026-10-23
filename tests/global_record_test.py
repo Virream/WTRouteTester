@@ -1708,16 +1708,19 @@ def test_hud_poll(tmpdir: str):
     实测 `/hudmsg` 的 `damage` 是**滚动窗口**, 而程序原先**只在录制结束时读一次**
     —— 前几分钟的击杀那时已经被挤掉了。
 
-    **间隔必须以 8111 自己的网页为准**: 它的首页内联脚本里是
-    `setInterval(updateSlow, 500)`, `/hudmsg` 就在 updateSlow 里, 并且每次把
-    `lastEvt` 与 `lastDmg` 一起发上去。所以这里断言: 间隔 ≤ 1 秒、两个游标都在发。
+    **间隔是用户可调的第三档轮询率**(菜单「设置 → 轮询间隔」→ hudmsg,
+    默认 2000 ms); 8111 自己的网页用的是 `setInterval(updateSlow, 500)`,
+    `/hudmsg` 就在 updateSlow 里, 并且每次把 `lastEvt` 与 `lastDmg` 一起发上去。
+    所以这里断言: 默认值落在选项表里、两个游标都在发。
 
     这里用假 client 模拟"缓冲区往前滚", 并验证按 `(时间, 文本)` 去重
     (两次回放的 `id` 各自重新编号, 不能按 id 去重)。
     """
-    from wt81111g.route_recorder import HUD_POLL_INTERVAL, RouteRecorder
+    from wt81111g.route_recorder import DEFAULT_HUD_INTERVAL_MS, RouteRecorder
 
-    assert 0.0 < HUD_POLL_INTERVAL <= 1.0, HUD_POLL_INTERVAL
+    assert DEFAULT_HUD_INTERVAL_MS in (200.0, 300.0, 500.0, 800.0,
+                                       1000.0, 2000.0), DEFAULT_HUD_INTERVAL_MS
+    assert DEFAULT_HUD_INTERVAL_MS <= 2000.0, "再大就会在交火期把击毁记录滚掉"
 
     class FakeClient:
         def __init__(self):

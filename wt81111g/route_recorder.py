@@ -57,14 +57,11 @@ MAX_ZONE_STATES = 4000
 #   12 → 每通道 21 档 ≈ 一次占领 20 条左右(实际只更少, 因为往往是渐变)。
 ZONE_COLOR_STEP = 12
 
-# 全局录制期间多久抓一次 /hudmsg 的增量(秒)。
-# **这个值直接抄 8111 自己的网页**: 首页内联脚本里是 `setInterval(updateSlow, 500)`,
-# `/hudmsg` 就在 updateSlow 里, 即官方页面自己就是 **每 500 ms 取一次**。
-# 以前按“缓冲区很大”拍了 15 秒 —— 实测(2026-10-23 西奈半岛那局)一局只采到 11 条、
-# 全挤在最后 75 秒, 前 5 分钟的阵亡全被滚动窗口挤掉了: damage 缓冲区在交火期
-# (击毁 + 引燃 + 嘉奖 + 坠毁/弃车)每秒就是好几条, 装不下 15 秒的量。
-# 另: **停止录制时一定会再补取一次**(见 `_collect_kills`)。
-HUD_POLL_INTERVAL = 0.5
+# 全局录制期间多久抓一次 /hudmsg 的增量 —— 现在由用户可调的第三档轮询率控制
+# (`DEFAULT_HUD_INTERVAL_MS`)。参考值: **8111 自己的网页是 500 ms**
+# (`setInterval(updateSlow, 500)`)。以前按“缓冲区很大”拍了 15 秒 —— 实测
+# (2026-10-23 西奈半岛那局)一局只采到 11 条、全挤在最后 75 秒, 前 5 分钟的阵亡
+# 全被滚动窗口挤掉了。另: **停止录制时一定会再补取一次**(见 `_collect_kills`)。
 
 # ---- “已回车库”的判据(用户 2026-10-23 定, 只认这三条)
 # ① **8111 断开连接** —— 最可靠的信号: 实测“回到车库时 8111 会重启, 断一下”;
@@ -818,7 +815,7 @@ class RouteRecorder(QObject):
         self._global_waiting = True
         self._global_t0 = 0.0
         self._zone_state_key = None      # 新录制 → 时间轴从头记(重录时清空旧时间轴)
-        # 抓一次 /hudmsg 的游标: 录制期间每 HUD_POLL_INTERVAL 秒据它取一次增量,
+        # 抓一次 /hudmsg 的游标: 录制期间每 `self.hud_interval` 秒据它取一次增量,
         # 用来反推“摄像机挂着那位玩家”到底什么时候死的(见 `kill_timeline` 模块说明)。
         self._hud_cursor = kill_timeline.read_cursor(self.client)
         self._hud_evt_cursor = 0         # events 我们不用, 但与网页一致地一起推进
@@ -989,8 +986,8 @@ class RouteRecorder(QObject):
     def _poll_kills(self, rec) -> int:
         """把 `/hudmsg` 里比游标新的**阵亡**消息存进条目, 返回这次取到几条。
 
-        **录制期间每 `HUD_POLL_INTERVAL`(0.5 秒)调一次, 请求方式与 8111 网页
-        完全一致**: 网页是 `setInterval(updateSlow, 500)` 里发
+        **录制期间每 `self.hud_interval` 秒调一次(用户可调, 默认 2 秒),
+        请求方式与 8111 网页完全一致**: 网页是 `setInterval(updateSlow, 500)` 里发
         `/hudmsg?lastEvt=<lastEvtMsgId>&lastDmg=<lastDmgMsgId>`, 回来之后
         `lastDmgMsgId = 最后一条的 id`。我们照抄 —— 以前 15 秒一次, 交火期
         damage 滚动窗口撑不住, 前几分钟的阵亡会整段丢失。
