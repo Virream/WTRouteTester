@@ -521,6 +521,9 @@ class GlobalTracker:
             if getattr(s, "x", None) is not None and getattr(s, "y", None) is not None]
         # 起点不像重生的线: [(life_id, 时刻, 离最近重生点米数, icon)]
         self.suspicious: list[tuple[str, float, float, str]] = []
+        # “坐标换算后被丢掉多少个单位”的统计(只写日志, 便于区分“8111 没报”与“被我们丢了”)
+        self.dropped = 0
+        self._drop_log_at: float = -1e9
         # 坐标系对齐(陆战图 ↔ 空战图): 参考坐标系 = 录制开始时那一帧的静态锚点
         self.aligner = FrameAligner()
         self._view_changed_at: float | None = None      # 上一次“坐标系变了”的时刻
@@ -567,10 +570,16 @@ class GlobalTracker:
         units, skipped = extract_units(objects)
         for key, n in skipped.items():
             self.seen_skipped[key] = self.seen_skipped.get(key, 0) + n
+        # ⚠ “场上还有别人”必须用**坐标换算/过滤之前**的数量。
+        # `_align` 会把换算后落到图外的单位全删掉(典型: 机场 AI 防空，空中坐标系下
+        # y=0.368 → 换算成 -3.2)，于是“只剩最后一辆玩家车”时会变成 units 空
+        # → 下面 `_expire(alive=False)` 就把这次击毁漏标成“全场一起消失”。
+        # 2026-10-23 实测: A27 被打死的正是这种情形(dead=0)。
+        reported = len(units)
         self._align(t, objects, units)
         self._match(t, units)
-        # 这一帧还有可录单位 → 此时断掉的线是“被击毁”; 全场空 → 是回到车库/录制结束
-        self._expire(t, alive=bool(units), allow_dead=self._dead_allowed(t))
+        # 这一帧 8111 还报着可录单位 → 断掉的线是“被击毁”; 一个都不报 → 回到车库/录制结束
+        self._expire(t, alive=bool(reported), allow_dead=self._dead_allowed(t))
         if not units:
             if self.air_view:
                 # 空中视角: 8111 报的坐标系变了, 单位列表可能暂时是空的, 不算“空场”
@@ -616,7 +625,16 @@ class GlobalTracker:
         for u in units:
             u.x, u.y = fit.apply(u.x, u.y)
         # 换算后再按参考坐标系判一次范围(空战图里机场 AI 防空的坐标在 2.9~3.4)
+        before = len(units)
         units[:] = [u for u in units if 0.0 <= u.x <= 1.0 and 0.0 <= u.y <= 1.0]
+        if len(units) < before:
+            # 换算后被丢掉的多 → 记一笔。这样以后能分清是“8111 压根没报”还是
+            # “被我们的坐标换算算到图外丢了”(用户报的 A27/A30 就卡在这点上)。
+            self.dropped += before - len(units)
+            if t - self._drop_log_at > 10.0:
+                self._drop_log_at = t
+                log.info("全局录制: 坐标换算后丢掉 %d/%d 个单位(多为地图外的机场 AI 防空), "
+                         "保留 %d 个", before - len(units), before, len(units))
 
     def _cross_check(self, fit: FrameFit) -> str:
         """交叉校验: 拟合出的尺度 vs `/map_info.json` 的图框比。

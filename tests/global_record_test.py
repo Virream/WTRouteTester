@@ -248,6 +248,43 @@ def test_tick_interval_follows_mode(tmpdir: str):
     results.append("主循环频率跟随当前录制的轮询率(全局 10Hz 就是 10Hz) OK")
 
 
+def test_last_vehicle_death_with_offscreen_units():
+    """最后一辆玩家车被击毁时, 即使场上只剩“地图外”的单位(换算后被丢掉), 也要判死。
+
+    2026-10-23 用户实测: A27 在 6:28.8 消失(就是被打死那一刻), 但 `dead=0`。
+    原因: `_align` 把空中坐标系下落到图外的对象(机场 AI 防空, y=0.368 → 换算成 -3.2)
+    全删了, 于是 `alive=bool(units)` 变成 False → 被当成“全场一起消失”。
+    现在 `alive` 用**过滤前**的数量。
+    """
+    rec = GlobalRecord(route_id="g19", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "A", interval=0.04)
+    ground = [(0.10 + (i % 6) * 0.03, 0.15 + (i // 6) * 0.05) for i in range(30)]
+    ground_obj = [{"type": "respawn_base_tank", "icon": "respawn_base_tank",
+                   "x": x, "y": y} for x, y in ground]
+    tr.feed(0.0, ground_obj + [tank(0.30, 0.30)])       # 地面参考系
+
+    # 切到空中坐标系: 锚点被压成 1/32
+    s = 1.0 / 32.0
+    air_anchor = [{"type": "respawn_base_tank", "icon": "respawn_base_tank",
+                   "x": 0.5 + (x - 0.4) * s, "y": 0.5 + (y - 0.4) * s}
+                  for x, y in ground]
+    air_tank = {"type": "ground_model", "icon": "MediumTank", "color": BLUE,
+                "x": 0.5 + (0.30 - 0.4) * s, "y": 0.5 + (0.30 - 0.4) * s}
+    # 地图外的 AI 防空(换算后落到 -3.2, 会被过滤掉), 但它确实是个“可录类型”的对象
+    far = {"type": "ground_model", "icon": "Airdefence", "x": 0.5, "y": 0.368}
+
+    t = 1.0
+    while t < 8.0:                                      # 过掉“换视角不判死”的宽限期
+        tr.feed(t, air_anchor + [air_tank, far])
+        t += 0.04
+    assert tr.lives and not tr.lives[0].dead
+    while t < 12.0:                                     # 玩家车消失, 只剩地图外那个
+        tr.feed(t, air_anchor + [far])
+        t += 0.04
+    assert tr.lives[0].dead, "最后一辆车被打死时要判死, 不能因为丢掉了图外对象就漏标"
+    results.append("全局录制: 只剩地图外单位时最后一辆车也能判死 OK")
+
+
 def test_air_view_never_stops():
     """处于“空中视角坐标系”时, **多长都没地面单位也不停**(真正的回库由地图占位图判)。
 
@@ -1684,6 +1721,7 @@ def main() -> int:
     test_air_view_keeps_recording()
     test_no_units_does_not_stop(tmpdir)
     test_tick_interval_follows_mode(tmpdir)
+    test_last_vehicle_death_with_offscreen_units()
     test_air_view_never_stops()
     test_tracker_dead_flag()
     test_timeline_note()
