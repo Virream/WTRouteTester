@@ -522,6 +522,9 @@ class GlobalTracker:
         self.aligner = FrameAligner()
         self._view_changed_at: float | None = None      # 上一次“坐标系变了”的时刻
         self.frame_changes = 0                          # 换算过多少个不同坐标系(日志用)
+        # 当前是不是“非参考坐标系”的视野(观战者上了飞机 → 8111 只报空中单位)。
+        # 用途: 这时候“没有地面单位”是正常的, 不能当成“已回车库”(2026-10-23)。
+        self.air_view = False
         # 这一帧 /map_info.json 报的图框尺寸(米) —— **只用来交叉校验**拟合尺度:
         # 知识库(Dagor/8111)的口径是“归一化 × 图框 = 世界米”, 两个视角只是图框不同
         # (坦克图框 4096 m / 空中图框 65536 m → 比值 16), 所以拟合出的尺度应该与
@@ -562,6 +565,12 @@ class GlobalTracker:
         # 这一帧还有可录单位 → 此时断掉的线是“被击毁”; 全场空 → 是回到车库/录制结束
         self._expire(t, alive=bool(units), allow_dead=self._dead_allowed(t))
         if not units:
+            if self.air_view:
+                # **正在空中视角**: 8111 只报空中单位, 地面单位“看不见”是正常的 ——
+                # 不能因此判“回库”(2026-10-23 西奈半岛: 上机 3 秒就被停掉整局)。
+                # 真正的回库有硬判据: 地图变占位图 → route_recorder 直接 global_stop。
+                self._empty_since = None
+                return False
             if self._empty_since is None:
                 self._empty_since = t
             return (t - self._empty_since) >= EMPTY_STOP
@@ -595,7 +604,9 @@ class GlobalTracker:
             self._view_changed_at = t
             log.info("全局录制: 坐标系已恢复(%s)", fit.describe())
         if fit.same_as_reference:
+            self.air_view = False
             return
+        self.air_view = True
         for u in units:
             u.x, u.y = fit.apply(u.x, u.y)
         # 换算后再按参考坐标系判一次范围(空战图里机场 AI 防空的坐标在 2.9~3.4)

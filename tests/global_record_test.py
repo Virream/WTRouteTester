@@ -193,6 +193,39 @@ def test_air_view_keeps_recording():
     results.append("全局录制: 上飞机后地面单位消失也不会误停 OK")
 
 
+def test_air_view_never_stops():
+    """处于“空中视角坐标系”时, **多长都没地面单位也不停**(真正的回库由地图占位图判)。
+
+    西奈半岛那局: 上机后坐标系被拟合到 scale=32(空战图), 地面单位全消失。
+    现在 tracker 会记住 air_view, 只要还在这套坐标系里就不累计空场计时。
+    """
+    rec = GlobalRecord(route_id="g18", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "A", interval=0.04)
+
+    # 参考坐标系: 地面图里的静态地物(重生点/战区)
+    ground = [(0.10 + (i % 6) * 0.03, 0.15 + (i // 6) * 0.05) for i in range(30)]
+    ground_obj = [{"type": "respawn_base_tank", "icon": "respawn_base_tank",
+                   "x": x, "y": y} for x, y in ground]
+    assert not tr.feed(0.0, ground_obj + [tank(0.30, 0.30)])
+    assert not tr.air_view
+
+    # 上飞机: 同一批地物坐标被压成 1/32(空战图), 地面车全部消失
+    air_scale = 1.0 / 32.0
+    air_obj = [{"type": "respawn_base_tank", "icon": "respawn_base_tank",
+                "x": 0.5 + (x - 0.4) * air_scale, "y": 0.5 + (y - 0.4) * air_scale}
+               for x, y in ground]
+    air_obj.append({"type": "aircraft", "icon": "Player", "x": 0.5, "y": 0.5})
+    stopped = [tr.feed(1.0 + k * 10.0, air_obj) for k in range(1, 12)]   # 空 110 秒
+    assert tr.air_view, "应该识别成空中视角"
+    assert not any(stopped), "空中视角下空多久都不该停: %s" % (stopped,)
+
+    # 回到地面视角 → 恢复正常判空(超过阈値该停)
+    assert not tr.feed(200.0, ground_obj)
+    assert not tr.air_view
+    assert tr.feed(200.0 + EMPTY_STOP + 1.0, ground_obj[:1])
+    results.append("全局录制: 空中视角下空 110 秒也不会误停 OK")
+
+
 def test_tracker_speed():
     """速度用“帧间位移 × 地图边长”算出来(8111 只给摄像机的速度)。
 
@@ -1594,6 +1627,7 @@ def main() -> int:
     test_tracker_empty_stop()
     test_slow_move_speed()
     test_air_view_keeps_recording()
+    test_air_view_never_stops()
     test_tracker_dead_flag()
     test_timeline_note()
     test_split_sam_segments()
