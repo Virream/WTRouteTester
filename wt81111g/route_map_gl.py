@@ -971,8 +971,8 @@ class RouteMapGlView(RouteMapView):
             except (KeyError, TypeError, ValueError):
                 continue
             side = str(z.get("side") or "neutral")
-            color = QColor(rmv.ZONE_SIDE_COLORS.get(side, rmv.ZONE_SIDE_COLORS["neutral"]))
-            label_color = "#0f172a" if side == "neutral" else "#ffffff"
+            color = rmv._zone_fill_color(z)      # 8111 的占领进度混色(见父类同名函数)
+            label_color = "#0f172a" if color.lightnessF() > 0.72 else "#ffffff"
             quad = np.array([(x, y + ry, Z_ZONE), (x + rx, y, Z_ZONE),
                              (x, y - ry, Z_ZONE), (x - rx, y, Z_ZONE)], dtype=np.float32)
             fill = self._add(gfx.Mesh(
@@ -1000,7 +1000,7 @@ class RouteMapGlView(RouteMapView):
                     material=gfx.TextMaterial(color=label_color)), O_ZONE_LABEL)
                 text.local.position = (x, y, Z_ZONE + 0.002)
                 self._gl_zone_objs.append(text)
-            self._gl_zones.append((z, fill, color, text))
+            self._gl_zones.append((z, fill, color, text, label))
 
     def _build_marks(self) -> None:
         """轨迹上的起/终点标记: 圆环(8px) + 起点实心点(2.5px) + 时间数字。
@@ -1393,7 +1393,14 @@ class RouteMapGlView(RouteMapView):
                 arr[v0:v1, 3] = 1.0 if show else 0.0
             self._gl_dead.geometry.colors.update_full()
         if self._zones and self._show_zones and getattr(self, "_gl_zones", None):
-            for z, fill, color, _text in self._gl_zones:
+            # 占领中 8111 的颜色每秒会变几十次(进度混色) → 这里按**最新状态**取色,
+            # 不重建对象。按 label 对回去, 拿不到就用建层时的颜色。
+            live = {str(z.get("label") or ""): z for z in self._zones}
+            for z, fill, color, _text, label in self._gl_zones:
+                cur = live.get(label)
+                if cur is not None:
+                    z = cur
+                    color = rmv._zone_fill_color(cur)
                 blink = int(z.get("blink") or 0)
                 if blink <= 0:
                     fill.material.color = _rgba(color)

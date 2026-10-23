@@ -96,6 +96,25 @@ def _blend(color: QColor, rgb: tuple[int, int, int], k: float) -> QColor:
                   int(color.green() + (rgb[1] - color.green()) * k),
                   int(color.blue() + (rgb[2] - color.blue()) * k))
 
+
+def _zone_fill_color(z: dict) -> QColor:
+    """战区填充色: **优先用 8111 原始的 `color`** —— 它是游戏算好的占领进度混色。
+
+    实测(2026-10-22 的全局录像): 中立区被蓝方占领时依次是
+    `#ffFFFA → #feFEF9 → #587EFD → #174DFF`(blink 一直为 1, 满进度后归 0);
+    被红方占领时是 `#ffFFFA → #fc7E76 → #fa2F24 → #fa0C00`。
+    所以直接画这个颜色, 就与游戏里的图标进度一致。
+    拿不到/解析不了(旧数据、布局预览)才退回按归属的三色。
+    """
+    raw = str(z.get("color") or "").strip()
+    if raw:
+        c = QColor(raw)
+        if c.isValid():
+            return c
+    side = str(z.get("side") or "neutral")
+    return QColor(ZONE_SIDE_COLORS.get(side, ZONE_SIDE_COLORS["neutral"]))
+
+
 _SPEED_BUCKETS = 24  # 轨迹按速度量化的颜色档数(减少画笔切换)
 
 # 缩放/平移: zoom=1.0 即“适配窗口”(等比缩放居中), 与未启用缩放时行为一致
@@ -1967,8 +1986,14 @@ class RouteMapView(QWidget):
         """画战区: 小菱形 + 中心字母(A/B/C, 由 8111 的 zone_label 提供)。
 
         形状用菱形而不是圆圈: 图上圆圈已经表示起点/标记/终点, 菱形不会混淆。
-        颜色按归属: 蓝 = 我方, 红 = 敌方, 白 = 中立(见 zones.SIDE_*)。
-        被占领中(blink)时在本阵营色里脉冲: 变暗 ↔ 纯色(蓝闪蓝、红闪红, 不掺黄)。
+
+        **上色直接用 8111 给的 `color`**(2026-10-23 改): 它不是只有三种颜色, 而是
+        游戏自己算好的**占领进度混色** —— 中立白 `#ffFFFA` 往蓝 `#174DFF` 过
+        会依次出现 `#feFEF9`、`#587EFD`…; 往红 `#fa0C00` 过会走 `#fc7E76`、`#fa2F24`…
+        (真实录像里的时间轴见 docs\跑图线路测试器.md)。以前把它归为蓝/红/白三档
+        再上固定色, 进度就全丢了 —— 而且中途的混色(如 `#587EFD`)会被判成“中立”,
+        颜色也是错的。
+        被占领中(blink)时在本色里脉冲: 变暗 ↔ 纯色(不掺黄)。
         """
         if not self._show_zones or not self._zones:
             return
@@ -1979,9 +2004,11 @@ class RouteMapView(QWidget):
                 x, y = float(z["x"]), float(z["y"])
             except (KeyError, TypeError, ValueError):
                 continue
-            side = str(z.get("side") or "neutral")
-            fill = QColor(ZONE_SIDE_COLORS.get(side, ZONE_SIDE_COLORS["neutral"]))
-            label_color = QColor("#0f172a") if side == "neutral" else QColor("#ffffff")
+            side = str(z.get("side") or "neutral")   # noqa: F841 - 保留给“归属”语义/调试
+            fill = _zone_fill_color(z)
+            # 文字颜色: 浅底色(白/中性)用深字, 否则用白字
+            bright = fill.lightnessF() > 0.72
+            label_color = QColor("#0f172a") if bright else QColor("#ffffff")
             blink = int(z.get("blink") or 0)
             if blink > 0:
                 # 官方: bv = exp(-(5*t - 2)^4), t 在一个周期内 0→period

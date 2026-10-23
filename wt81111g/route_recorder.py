@@ -44,11 +44,17 @@ from .route_store import (
 from .zones import Zone, mode_name as zone_mode_name, signature as zones_signature
 from .zones import (Spawn, spawn_state, spawn_summary, spawns_from_objects, zone_state,
                     zones_from_objects, zones_to_json)
+from .zones import _parse_rgb as zone_rgb
 
 log = logging.getLogger("route_recorder")
 
 # 全局录制里战区状态时间轴的条数上限(正常一局只有几十条; 异常时也不写爆数据)
 MAX_ZONE_STATES = 4000
+
+# 战区颜色量化步长: 占领进度是用**颜色混色**表达的(白→蓝 / 白→红 / 红→蓝…),
+# 只有变化足够明显才记一条。120/步长 就是一次占领最多记多少条:
+#   12 → 每通道 21 档 ≈ 一次占领 20 条左右(实际只更少, 因为往往是渐变)。
+ZONE_COLOR_STEP = 12
 
 # 全局录制期间多久抓一次 /hudmsg 的增量(秒)。
 # 依据(用户 2026-10-22): 8111 的 damage 缓冲区装得下上百条, 而里面大部分并不是
@@ -748,8 +754,15 @@ class RouteRecorder(QObject):
         zones = self._zones
         if not zones:
             return
+
+        def _q(color: str) -> tuple[int, int, int]:
+            rgb = zone_rgb(color)
+            if rgb is None:
+                return (0, 0, 0)
+            return tuple(v // ZONE_COLOR_STEP for v in rgb)      # type: ignore[return-value]
+
         key = tuple((z.label, round(z.x, 5), round(z.y, 5), z.side,
-                     1 if z.blink else 0) for z in zones)
+                     1 if z.blink else 0, _q(z.color)) for z in zones)
         if key == self._zone_state_key:
             return
         self._zone_state_key = key
