@@ -34,7 +34,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .api8111 import WT8111
 from .config import WT_BASE_URL
-from .global_record import DEFAULT_MAP_SIZE, EMPTY_STOP, GlobalTracker, extract_units
+from .global_record import DEFAULT_MAP_SIZE, GlobalTracker, extract_units
 from . import kill_timeline
 from .map_cache import MapCache
 from .route_store import (
@@ -65,9 +65,13 @@ ZONE_COLOR_STEP = 12
 # 另: **停止录制时一定会再补取一次**(见 `_collect_kills`)。
 HUD_POLL_INTERVAL = 0.5
 
-# “对局还有战况”的判定窗口(秒): 最近这么久内有 hudmsg 新消息,
-# 就当对局还没结束 —— 用来区分“全场没有地面单位”是真的回库了, 还是观战者飞上天了。
-HUD_ALIVE_WINDOW = 20.0
+# ---- “已回车库”的判据(用户 2026-10-23 定, 只认这三条)
+# ① **8111 断开连接** —— 最可靠的信号: 用户实测“从战局回到车库时 8111 会断一下”;
+# ② 地图图片变成占位 “?” 图 → 立刻停(车库专用图, 见 `PLACEHOLDER_MAP_SHA1`);
+# ③ **连续拿不到地图图片** → 停(8111 已退出/断开时 `/map.img` 会直接失败)。
+# ⚠ 绝不能用“场上没有可录单位”判停 —— 没车 ≠ 结束, 有重生点就能再出车。
+MAP_MISS_STOP = 5          # 连续几次拿不到 /map.img(map_interval=2s ⇒ 约 10s)
+DISCONNECT_STOP = 5.0      # /indicators 连续拿不到多久(秒)算“8111 已断开”
 
 # 轮询/采样间隔: 默认 40ms(≈25Hz)。
 # 实测 8111 陆战数据本身約每 40ms 更新一次(rpm 变化间隔 p50=40ms),
@@ -213,6 +217,9 @@ class RouteRecorder(QObject):
         self._map_digest: str | None = None
         self._map_key = "unknown"
         self._map_thread: threading.Thread | None = None
+        # “已回车库”判定用的计数(见 MAP_MISS_STOP / DISCONNECT_STOP)
+        self._map_miss = 0              # 连续几次拿不到 /map.img
+        self._disconnected_since = 0.0  # 8111 开始拿不到 /indicators 的时刻(0=正常)
 
         # 当前战局的战区(轮询线程写入, GUI 只读引用): 坐标是模式指纹的来源
         self._zones: list[Zone] = []
@@ -268,33 +275,44 @@ class RouteRecorder(QObject):
         """
         while not self._stop.is_set():
             data = self.client.map_image()
-            if data:
-                digest = hashlib.sha1(data).hexdigest()
-                if digest != self._map_digest:
-                    self._map_digest = digest
-                    if self._map_lock:
-                        # 全局录制期间**锁定地面底图**: 玩家上飞机时 8111 会发空战地图,
-                        # 那种图的坐标系和地面图完全不是一回事, 绝不能跟着换。
-                        # 只有回到车库(占位图)才算“本局结束”, 顺便自动停止录制。
-                        if digest == PLACEHOLDER_MAP_SHA1:
-                            log.info("全局录制: 8111 回到占位图(疑已退回车库), 自动停止")
-                            self._cmds.put("global_stop")
-                        else:
-                            log.info("全局录制中地图图片变化(很可能是空战地图), 已忽略")
-                        continue
-                    try:
-                        # 注意: 用缓存返回的键, 而不是字节哈希 —— 同一张地图的
-                        # 不同分辨率会归到同一个键上(见 MapCache.save)
-                        key, created = self.map_cache.save(data)
-                        self._map_key = key
-                        if key != PLACEHOLDER_MAP_KEY:
-                            self.store.remember_map(key)
-                        self.map_cached.emit(key, created)
-                    except Exception as exc:  # noqa: BLE001 - 缓存失败不应影响显示
-                        log.warning("缓存地图图片失败: %s", exc)
-                        self._map_key = digest[:12]
-                    self.map_changed.emit(data)
-                    log.info("地图已更新 (key=%s)", self._map_key)
+            if not data:
+                # 拿不到地图图片: 8111 已退出/断开时 `/map.img` 会直接失败。
+                # 连续多次都拿不到 → 判为“已回车库”(用户 2026-10-23 定的三条之一)。
+                self._map_miss += 1
+                if self._map_lock and self._map_miss >= MAP_MISS_STOP:
+                    self._map_miss = 0
+                    log.info("全局录制: 连续 %d 次拿不到地图图片(8111 已断开?), "
+                             "判为已回车库, 自动停止", MAP_MISS_STOP)
+                    self._cmds.put("global_stop")
+                self._stop.wait(self.map_interval)
+                continue
+            self._map_miss = 0
+            digest = hashlib.sha1(data).hexdigest()
+            if digest != self._map_digest:
+                self._map_digest = digest
+                if self._map_lock:
+                    # 全局录制期间**锁定地面底图**: 玩家上飞机时 8111 会发空战地图,
+                    # 那种图的坐标系和地面图完全不是一回事, 绝不能跟着换。
+                    # 只有回到车库(占位图)才算“本局结束”, 顺便自动停止录制。
+                    if digest == PLACEHOLDER_MAP_SHA1:
+                        log.info("全局录制: 8111 回到占位图(已退回车库), 自动停止")
+                        self._cmds.put("global_stop")
+                    else:
+                        log.info("全局录制中地图图片变化(很可能是空战地图), 已忽略")
+                    continue
+                try:
+                    # 注意: 用缓存返回的键, 而不是字节哈希 —— 同一张地图的
+                    # 不同分辨率会归到同一个键上(见 MapCache.save)
+                    key, created = self.map_cache.save(data)
+                    self._map_key = key
+                    if key != PLACEHOLDER_MAP_KEY:
+                        self.store.remember_map(key)
+                    self.map_cached.emit(key, created)
+                except Exception as exc:  # noqa: BLE001 - 缓存失败不应影响显示
+                    log.warning("缓存地图图片失败: %s", exc)
+                    self._map_key = digest[:12]
+                self.map_changed.emit(data)
+                log.info("地图已更新 (key=%s)", self._map_key)
             self._stop.wait(self.map_interval)
 
     def request_start(self, start_on_move: bool = False) -> None:
@@ -452,6 +470,22 @@ class RouteRecorder(QObject):
         connected = bool(ind)
         vehicle = str(ind.get("type") or "") if ind else ""
         speed = _to_float(ind.get("speed")) or 0.0
+        # “已回车库”判据之一(也是最可靠的一款): **8111 断开**。
+        # 用户实测: 从战局回到车库时 8111 会断一下 —— 所以这里把“连续拿不到
+        # /indicators”当回库信号; 但要**连续**够久才算, 因为战局内换图/换局那
+        # 一两秒 8111 也会偶尔超时(实测 mission/hudmsg 要 1.7~2 秒)。
+        if connected:
+            self._disconnected_since = 0.0
+        elif self._global is not None:
+            if self._disconnected_since == 0.0:
+                self._disconnected_since = now
+                log.info("全局录制: 8111 暂时无响应(可能在换局 / 已回车库)")
+            elif now - self._disconnected_since >= DISCONNECT_STOP:
+                log.info("全局录制: 8111 已连续 %.0fs 无响应(断开连接), "
+                         "判为已回车库, 自动停止", DISCONNECT_STOP)
+                self._disconnected_since = 0.0
+                self._do_global_stop()
+                return
 
         # 玩家坐标: 每帧请求(轨迹平滑的关键)
         # 顺带从同一份数据里取战区 —— 不额外增加请求
@@ -796,24 +830,14 @@ class RouteRecorder(QObject):
             self.global_started.emit(rec, self._global_side)
         elapsed = now - self._global_t0
         if tracker.feed(elapsed, objects):
-            # ⚠ **2026-10-23 修**: 观战对象一上飞机, 8111 的 `/map_obj.json` 就
-            # 只报空中单位 —— 地面单位全部“消失”, 3 秒后旧逻辑直接判“回库”把整局
-            # 提前停了(用户看到悬浮窗消失、西奈半岛那局只录到 392s)。
-            # 现在看**对局还在不在打**: 最近 `HUD_ALIVE_WINDOW` 秒内还有新的阵亡消息
-            # 就说明对局没结束, 不停(真正的回库有硬判据: 地图变占位图 → global_stop)。
-            if (self._hud_last_new > 0.0
-                    and now - self._hud_last_new < HUD_ALIVE_WINDOW):
-                if now - self._empty_hold_log_at > 30.0:
-                    self._empty_hold_log_at = now
-                    log.info("全局录制: 已 %.0fs 没有地面单位(可能在看空中视角), "
-                             "但 hudmsg 仍在报战况 → 不停止录制", elapsed)
-                tracker.reset_empty()
-                rec.duration = elapsed
-                return elapsed
-            log.info("全局录制: 全场已无可录单位超过 %.0fs 且 %.0fs 内无战况, 自动停止",
-                     EMPTY_STOP, HUD_ALIVE_WINDOW)
-            self._do_global_stop()
-            return max(0.0, elapsed)
+            # **不停止录制**(用户 2026-10-23 反复强调: 没车 ≠ 输了/结束了 ——
+            # 只要有重生点, 随时能再出一辆, 8111 会重新报上来)。
+            # 这里只每 30 秒提一句, 免得用户以为卡住了。
+            if now - self._empty_hold_log_at > 30.0:
+                self._empty_hold_log_at = now
+                log.info("全局录制: 已 %.0fs 没有可录单位(可能在等重生), 继续录制",
+                         elapsed)
+            tracker.reset_empty()
         rec.duration = elapsed
         self._record_zone_state(rec, elapsed)
         # 点录制时可能还没拿到战区(进图瞬间) → 一旦知道就把模式/布局补进条目,

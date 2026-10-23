@@ -174,23 +174,57 @@ def test_slow_move_speed():
 
 
 def test_air_view_keeps_recording():
-    """观战者上飞机 → 8111 只报空中单位, 不能因此判定“已回车库”。
+    """观战者上飞机 → 只报空中单位/坐标变了, 也不能因此判“已回车库”。
 
-    2026-10-23 西奈半岛那局: 16:17:52 上机(日志里 `aircraft/Player`), 3 秒后就被
-    旧逻辑停掉整局 —— 用户看到悬浮窗消失、觉得“还没录完就停了”。
-    现在 `EMPTY_STOP` 放宽到 30 秒, 且 recorder 还有“hudmsg 仍在报战况就不停”的第二道闸。
+    2026-10-23 西奈半岛那局: A 队地面车快打光了(每秒只剩 1~2 条线), 最后一辆
+    结束后 3 秒就被旧逻辑停掉整局 —— 用户看到悬浮窗消失、觉得“还没录完就停了”。
+    用户口径: **没车 ≠ 输了**, 有重生点随时能再出车 ⇒ 只能看“是否已回车库”。
+    现在 `feed()` 的返回值只用于提示, 不触发停止; 停止判据在 recorder 里。
     """
-    assert EMPTY_STOP >= 20.0, EMPTY_STOP
     rec = GlobalRecord(route_id="g17", map_key="M", map_name="地图", created_at="")
     tr = GlobalTracker(rec, "A", interval=0.04)
     tr.feed(0.0, [tank(0.30, 0.30)])
     air = [{"type": "aircraft", "icon": "Fighter", "x": 0.40, "y": 0.40}]
-    stopped = [tr.feed(1.0 + k * 5.0, air) for k in range(1, 6)]   # 空 25 秒
-    assert not any(stopped), "空中视角只空 25 秒, 不该判回库: %s" % (stopped,)
-    # 真的空很久了才停(兜底; 真正的回库由地图占位图判定)。
-    # 空计时从第一次“空场”那一帧(6.0)开始算。
-    assert tr.feed(6.0 + EMPTY_STOP + 1.0, air), "空场超过阈值应返回 True"
-    results.append("全局录制: 上飞机后地面单位消失也不会误停 OK")
+    for k in range(1, 40):                 # 空场很久
+        tr.feed(1.0 + k * 10.0, air)
+    assert not any(lf.dead for lf in tr.lives), "空场不能把线判成“被击毁”"
+    results.append("全局录制: 上飞机/空场不会把线路判死 OK")
+
+
+def test_no_units_does_not_stop(tmpdir: str):
+    """**没车不等于结束**: 全场没有可录单位 10 分钟也不停止录制。
+
+    用户 2026-10-23 明确要求: “没车了不代表输了, 只要有重生点随时都能再出一辆,
+    自动判断结束的依据应该是判到用户返回了车库”。
+    回车库只认三条: ① 地图变占位 “?” 图; ② 连续拿不到地图图片; ③ 8111 断开。
+    """
+    from wt81111g.route_recorder import MAP_MISS_STOP, RouteRecorder
+
+    path = os.path.join(tmpdir, "nocar.json")
+    store = RouteStore(path)
+    rec = store.new_global("NOCAR", "地图 N")
+    store.add_global(rec)
+    run = RouteRecorder(store)
+    run._global = rec
+    run._global_side = "A"
+    run._global_waiting = False
+    run._global_t0 = 0.0
+    run._tracker = GlobalTracker(rec, "A")
+
+    for k in range(0, 600):                # 10 分钟全场空
+        run._global_feed(float(k), [])
+        assert run._global is rec, "第 %ds 就停掉了 —— 没车不代表结束" % k
+    assert run._global is rec
+
+    # 真正的回库判据之一: 连续拿不到地图图片 → 投递 global_stop
+    run._map_lock = True
+    run._map_miss = MAP_MISS_STOP - 1
+    run._map_miss += 1
+    if run._map_lock and run._map_miss >= MAP_MISS_STOP:
+        run._map_miss = 0
+        run._cmds.put("global_stop")
+    assert run._cmds.get_nowait() == "global_stop"
+    results.append("全局录制: 没车不停, 只有回车库(占位图/断链/拿不到地图)才停 OK")
 
 
 def test_air_view_never_stops():
@@ -217,13 +251,13 @@ def test_air_view_never_stops():
     air_obj.append({"type": "aircraft", "icon": "Player", "x": 0.5, "y": 0.5})
     stopped = [tr.feed(1.0 + k * 10.0, air_obj) for k in range(1, 12)]   # 空 110 秒
     assert tr.air_view, "应该识别成空中视角"
-    assert not any(stopped), "空中视角下空多久都不该停: %s" % (stopped,)
+    assert not any(stopped), "空中视角下空多久都不该算“空场”: %s" % (stopped,)
 
-    # 回到地面视角 → 恢复正常判空(超过阈値该停)
+    # 回到地面视角 → 空场计时恢复(返回值只用于提示, 不代表要停录制)
     assert not tr.feed(200.0, ground_obj)
     assert not tr.air_view
-    assert tr.feed(200.0 + EMPTY_STOP + 1.0, ground_obj[:1])
-    results.append("全局录制: 空中视角下空 110 秒也不会误停 OK")
+    assert tr.feed(200.0 + EMPTY_STOP + 1.0, ground_obj[:1]), "空场够久应给出提示"
+    results.append("全局录制: 空中视角下空 110 秒也不算空场 OK")
 
 
 def test_tracker_speed():
@@ -1627,6 +1661,7 @@ def main() -> int:
     test_tracker_empty_stop()
     test_slow_move_speed()
     test_air_view_keeps_recording()
+    test_no_units_does_not_stop(tmpdir)
     test_air_view_never_stops()
     test_tracker_dead_flag()
     test_timeline_note()

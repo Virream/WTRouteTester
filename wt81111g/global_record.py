@@ -73,12 +73,15 @@ SAMPLE_INTERVAL = 0.2
 MATCH_RADIUS = 0.004
 # 一条线连续多久没匹配上就算结束(秒)。要大于“短暂丢帧/闪烁”的时间
 END_GAP = 1.0
-# 全场一个可录单位都没有、持续多久 → 认为已经回到车库, 自动结束录制(秒)。
-# ⚠ **2026-10-23 从 3 秒改成 30 秒**: 观战对象一上飞机, 8111 的 `/map_obj.json`
-# 就只报空中单位、地面单位全部消失(实测西奈半岛那局 16:17:52 上机, 3 秒后就被
-# 判成“回库”把整局提前停了, 用户看到悬浮窗消失)。真正的“回库”有硬判据
-# —— `/map.img` 变成占位图时 `_map_loop` 会直接发 `global_stop`(见 route_recorder),
-# 所以这里放宽到 30 秒当兜底就够。
+# 全场没有可录单位超过这么久 → 只用来**提示**“可能在等重生”, **绝不触发停止**。
+#
+# ⚠ 用户口径(2026-10-23, 第二次强调): **没车 ≠ 输了/结束了** —— 只要有重生点,
+# 随时能再出一辆, 8111 会重新报上来。所以“自动结束录制”只能看**是否已回车库**:
+# ① 地图图片变成占位 “?” 图; ② 连续拿不到地图图片; ③ 8111 连接断开
+# (都在 `route_recorder._map_loop` / `_tick` 里判)。
+#
+# 历史: 这个常量从全局录制第一版就在, 当时拿它当“已回车库”的代理,
+# 结果 A 队被打光后整局录到一半就被停掉(西奈半岛那局只录到 392s)。
 EMPTY_STOP = 30.0
 # 位移小于这个距离(归一化)就算“没动”: 只把末点的 `hold` 往后延, 不新增点。
 # 它同时是一道**抖噪闸** —— 8111 的坐标末位会跳, 不设阈值的话静止的车会一直
@@ -556,7 +559,11 @@ class GlobalTracker:
         return len(self.lives)
 
     def feed(self, t: float, objects) -> bool:
-        """喂一帧数据。返回 True 表示“全场已经没有可录单位够久了” → 该停止录制。"""
+        """喂一帧数据。返回 True 表示“全场已经很久没有可录单位了” —— **仅供提示**。
+
+        ⚠ 返回值**不能**用来停录制: 没车不代表结束, 用户随时可能重生一辆新车。
+        “该不该停”只看是否已回车库(见 `route_recorder` 里的三条件)。
+        """
         units, skipped = extract_units(objects)
         for key, n in skipped.items():
             self.seen_skipped[key] = self.seen_skipped.get(key, 0) + n
@@ -566,13 +573,12 @@ class GlobalTracker:
         self._expire(t, alive=bool(units), allow_dead=self._dead_allowed(t))
         if not units:
             if self.air_view:
-                # **正在空中视角**: 8111 只报空中单位, 地面单位“看不见”是正常的 ——
-                # 不能因此判“回库”(2026-10-23 西奈半岛: 上机 3 秒就被停掉整局)。
-                # 真正的回库有硬判据: 地图变占位图 → route_recorder 直接 global_stop。
+                # 空中视角: 8111 报的坐标系变了, 单位列表可能暂时是空的, 不算“空场”
                 self._empty_since = None
                 return False
             if self._empty_since is None:
                 self._empty_since = t
+            # 只告诉调用方“已经空很久了”(用于日志/界面提示), 不影响录制
             return (t - self._empty_since) >= EMPTY_STOP
         self._empty_since = None
         return False
