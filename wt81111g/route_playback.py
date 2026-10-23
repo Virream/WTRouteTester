@@ -110,7 +110,11 @@ class RoutePlayer(QObject):
             if not pts:
                 continue
             starts.append(pts[0].t)
-            ends.append(pts[-1].t)
+            last = pts[-1]
+            # 末点的**有效结束时刻** = t + hold(静止段折叠, 见 route_store.TrackPoint)。
+            # 只取 `last.t` 的话, 最后那段“停着不动”的时间在回放里永远播不到
+            # (进度条提前结束)。RoutePoint 没有 hold → getattr 兜底成 0。
+            ends.append(last.t + float(getattr(last, "hold", 0.0) or 0.0))
         if not ends:
             return (0.0, 0.0)
         return (min(starts), max(ends))

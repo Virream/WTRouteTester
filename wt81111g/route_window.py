@@ -1020,7 +1020,8 @@ class RouteTesterWindow(QMainWindow):
                 litem.setIcon(_COL_EYE, eye_icon(life.life_id in self._visible_lives))
                 litem.setToolTip(_COL_EYE, "点击显示 / 隐藏这条线路")
                 litem.setToolTip(_COL_NAME,
-                                 f"{side} 队 · {life.icon or life.obj_type}\n"
+                                 f"线路 {life.short_id}（{side} 队）· "
+                                 f"{life.icon or life.obj_type}\n"
                                  f"出现 {fmt_time(life.t0)} → 消失 {fmt_time(life.t1)}\n"
                                  f"点数 {len(life.points)} · 最高速 "
                                  f"{fmt_speed(max((p.speed for p in life.points), default=0.0))} km/h\n"

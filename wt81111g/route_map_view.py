@@ -2418,8 +2418,11 @@ class RouteMapView(QWidget):
         2. 鼠标所在位置的用时与速度(毫秒精度, 便于对比微小时差);
         3. 整条路线的用时 + 该处的转弯半径(由朝向变化率反算, 见 `_turn_radius_text`)。
         """
+        short = str(getattr(rec, "short_id", "") or "")
         vehicle = f"车型 {getattr(rec, 'vehicle', '?')}"
-        head = f"{vehicle}（录制中）" if rec is self._live else vehicle
+        head = f"{short} · {vehicle}" if short else vehicle
+        if rec is self._live:
+            head += "（录制中）"
         lines = [head,
                  f"时间 {fmt_time_ms(pt.t)} | 速度 {fmt_speed(pt.speed)} km/h"]
         tail = [f"用时 {fmt_time(rec.duration)}"]

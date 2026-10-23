@@ -308,9 +308,18 @@ class UnitLife:
         return max(0.0, self.t1 - self.t0)
 
     @property
+    def short_id(self) -> str:
+        """侧栏/报 bug 时用的**短编号**: `<条目 id>:A19` → `A19`。
+
+        用户 2026-10-23: “没有这个，某条路线有 bug 我要报告时太麻烦”。
+        """
+        return self.life_id.rsplit(":", 1)[-1] or self.life_id
+
+    @property
     def label(self) -> str:
+        """侧栏显示名: `A19  01:47  SAM` —— 编号放最前面，方便直接报出来。"""
         name = self.icon or self.obj_type or "未知单位"
-        return f"{fmt_time(self.t0)}  {name}"
+        return f"{self.short_id}  {fmt_time(self.t0)}  {name}"
 
     def to_json(self) -> dict:
         # 点写成 [t, x, y, speed(, hold)] 的紧凑数组: 整局几十辆车 → 几十万个点,
