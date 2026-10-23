@@ -285,6 +285,54 @@ def test_last_vehicle_death_with_offscreen_units():
     results.append("全局录制: 只剩地图外单位时最后一辆车也能判死 OK")
 
 
+def test_zones_follow_frame(tmpdir: str):
+    """坐标系切到空中后, **战区/重生点也要换算回地面坐标**(否则“战区长腿跑了”)。
+
+    2026-10-23 用户实测: 正播着路线呢, 战区突然跑到中间一小团 —— 因为
+    `_align` 只换算可录单位, 战区的坐标还是空战图的 0.52 附近。
+    """
+    from wt81111g.route_recorder import RouteRecorder
+
+    store = RouteStore(os.path.join(tmpdir, "zoneframe.json"))
+    rec = store.new_global("ZF", "地图 ZF")
+    store.add_global(rec)
+    run = RouteRecorder(store)
+    run._global = rec
+    run._tracker = GlobalTracker(rec, "A", interval=0.04)
+
+    ground = [(0.10 + (i % 6) * 0.03, 0.15 + (i // 6) * 0.05) for i in range(30)]
+    g_objs = [{"type": "respawn_base_tank", "icon": "respawn_base_tank",
+               "x": x, "y": y} for x, y in ground]
+    g_objs.append({"type": "capture_zone", "icon": "capture_zone",
+                   "x": 0.50, "y": 0.55, "color": "#ffffff"})
+    run._tracker.feed(0.0, g_objs)
+    run._update_zones(g_objs)
+    assert len(run.zones) == 1
+    assert abs(run.zones[0].x - 0.50) < 1e-6 and abs(run.zones[0].y - 0.55) < 1e-6
+
+    # 切到空中坐标系: 所有坐标被压成 1/32(与实测的 scale=32 一致)
+    s = 1.0 / 32.0
+
+    def air(p):
+        return (0.5 + (p[0] - 0.4) * s, 0.5 + (p[1] - 0.4) * s)
+
+    a_objs = []
+    for x, y in ground:
+        ax, ay = air((x, y))
+        a_objs.append({"type": "respawn_base_tank", "icon": "respawn_base_tank",
+                       "x": ax, "y": ay})
+    ax, ay = air((0.50, 0.55))
+    # 归属色变一下, 保证 zone_state 与上一帧不同(否则会走“什么都没变”的短路)
+    a_objs.append({"type": "capture_zone", "icon": "capture_zone",
+                   "x": ax, "y": ay, "color": "#174DFF"})
+    run._tracker.feed(0.1, a_objs)
+    run._update_zones(a_objs)
+    z = run.zones[0]
+    assert abs(z.x - 0.50) < 0.01 and abs(z.y - 0.55) < 0.01, \
+        "战区应被换算回地面坐标, 实际 (%.4f, %.4f)" % (z.x, z.y)
+    results.append("全局录制: 坐标系切换后战区/重生点也跟着换算 OK")
+
+
 def test_air_view_never_stops():
     """处于“空中视角坐标系”时, **多长都没地面单位也不停**(真正的回库由地图占位图判)。
 
@@ -1722,6 +1770,7 @@ def main() -> int:
     test_no_units_does_not_stop(tmpdir)
     test_tick_interval_follows_mode(tmpdir)
     test_last_vehicle_death_with_offscreen_units()
+    test_zones_follow_frame(tmpdir)
     test_air_view_never_stops()
     test_tracker_dead_flag()
     test_timeline_note()

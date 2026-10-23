@@ -29,6 +29,7 @@ import queue
 import threading
 import time
 from collections import deque
+from dataclasses import replace
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -609,6 +610,21 @@ class RouteRecorder(QObject):
                 return (x, y)
         return None
 
+    def _frame_fit(self):
+        """当前需要的“坐标系 → 地面参考系”变换; 不需要换算时返回 None。
+
+        全局录制时 `GlobalTracker` 会拿静态锚点拟合出一个相似变换(见
+        `global_record.FrameAligner`); 这里取它最近一次的结果给战区/重生点用。
+        差一帧(40ms)无所谓 —— 坐标系切换不是每帧都发生。
+        """
+        tracker = self._tracker
+        if tracker is None:
+            return None
+        fit = tracker.aligner.fit
+        if fit is None or fit.same_as_reference:
+            return None
+        return fit
+
     def _update_zones(self, objects: list) -> None:
         """从地图对象里提取战区与**重生位置**; **归属/闪烁变化也要上报**。
 
@@ -622,6 +638,16 @@ class RouteRecorder(QObject):
         """
         zones = zones_from_objects(objects)
         spawns = spawns_from_objects(objects)
+        # ⚠ **战区和重生点也要换算坐标系**(2026-10-23 用户实测: “正播着路线呢突然
+        # 战区长腿跑了”)。录制中观战者上飞机后 8111 改成空战图坐标系, 战区坐标
+        # 从 0~1 被压成 0.52 附近的一小团 —— 若只换算可录单位而不换算战区,
+        # 实时显示与存进 `zone_states` 的时间轴全是错的。
+        fit = self._frame_fit()
+        if fit is not None:
+            zones = [replace(z, x=fit.apply(z.x, z.y)[0], y=fit.apply(z.x, z.y)[1])
+                     for z in zones]
+            spawns = [replace(sp, x=fit.apply(sp.x, sp.y)[0], y=fit.apply(sp.x, sp.y)[1])
+                      for sp in spawns]
         zstate = zone_state(zones)
         sstate = spawn_state(spawns)
         if zstate == self._zones_state and sstate == self._spawns_state:
