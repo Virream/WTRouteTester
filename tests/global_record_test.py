@@ -147,6 +147,52 @@ def test_tracker_two_and_death():
     results.append("全局跟踪: 并排两辆不串线 + 消失即结束 OK")
 
 
+def test_slow_move_speed():
+    """慢速移动的速度不能放大(2026-10-23 西奈半岛实测: 图上人人 85, 实际只有 ~30)。
+
+    根因: 每帧位移小于 `MIN_MOVE`(约 0.8 m) 时被当成“静止”, 把 `hold` 一路加到
+    当前帧 —— 下次存点时 `depart` 被顶到“现在”, `dt` 被压成一帧(40ms),
+    速度就放大成 真实间隔/40ms 倍。
+    """
+    rec = GlobalRecord(route_id="g16", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "A", interval=0.04)
+    # 18 km/h 的慢车: 0.00005 归一化/帧 @25Hz(0.00005×4096/0.04×3.6 ≈ 18.4),
+    # 关键是**每帧坐标都不同**(不是原地不动), 但单帧位移远小于 MIN_MOVE。
+    x = 0.30
+    t = 0.0
+    for _ in range(100):            # 4 秒
+        tr.feed(t, [tank(x, 0.30)])
+        x += 0.00005
+        t += 0.04
+    life = tr.lives[0]
+    sp = [p.speed for p in life.points[1:]]
+    assert len(sp) > 10, (len(life.points), sp)
+    sp.sort()
+    med = sp[len(sp) // 2]
+    assert 10.0 < med < 28.0, "慢速行驶的速度应约 18 km/h, 实际 %.1f" % med
+    results.append("全局跟踪: 慢速行驶的速度不会被放大(hold 不污染 dt) OK")
+
+
+def test_air_view_keeps_recording():
+    """观战者上飞机 → 8111 只报空中单位, 不能因此判定“已回车库”。
+
+    2026-10-23 西奈半岛那局: 16:17:52 上机(日志里 `aircraft/Player`), 3 秒后就被
+    旧逻辑停掉整局 —— 用户看到悬浮窗消失、觉得“还没录完就停了”。
+    现在 `EMPTY_STOP` 放宽到 30 秒, 且 recorder 还有“hudmsg 仍在报战况就不停”的第二道闸。
+    """
+    assert EMPTY_STOP >= 20.0, EMPTY_STOP
+    rec = GlobalRecord(route_id="g17", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "A", interval=0.04)
+    tr.feed(0.0, [tank(0.30, 0.30)])
+    air = [{"type": "aircraft", "icon": "Fighter", "x": 0.40, "y": 0.40}]
+    stopped = [tr.feed(1.0 + k * 5.0, air) for k in range(1, 6)]   # 空 25 秒
+    assert not any(stopped), "空中视角只空 25 秒, 不该判回库: %s" % (stopped,)
+    # 真的空很久了才停(兜底; 真正的回库由地图占位图判定)。
+    # 空计时从第一次“空场”那一帧(6.0)开始算。
+    assert tr.feed(6.0 + EMPTY_STOP + 1.0, air), "空场超过阈值应返回 True"
+    results.append("全局录制: 上飞机后地面单位消失也不会误停 OK")
+
+
 def test_tracker_speed():
     """速度用“帧间位移 × 地图边长”算出来(8111 只给摄像机的速度)。
 
@@ -1546,6 +1592,8 @@ def main() -> int:
     test_tracker_two_and_death()
     test_tracker_speed()
     test_tracker_empty_stop()
+    test_slow_move_speed()
+    test_air_view_keeps_recording()
     test_tracker_dead_flag()
     test_timeline_note()
     test_split_sam_segments()

@@ -1767,7 +1767,8 @@ def test_rate_menu(tmpdir: str):
     在主界面太显眼, 用户可能没事干就会调得过高或过低导致 bug”。
     所以这里同时断言: 默认就是 40 ms、菜单只勾一项、改动立即生效、非法值能归一。
     """
-    from wt81111g.route_window import INTERVAL_CHOICES_MS, rate_choice_ms
+    from wt81111g.route_window import (HUD_CHOICES_MS, INTERVAL_CHOICES_MS,
+                                       rate_choice_ms)
 
     assert int(rw.DEFAULT_INTERVAL_MS) in INTERVAL_CHOICES_MS
     assert rate_choice_ms(0) == INTERVAL_CHOICES_MS[0]
@@ -1783,24 +1784,38 @@ def test_rate_menu(tmpdir: str):
     app.processEvents()
     try:
         assert not hasattr(win, "cmb_rate"), "主界面不应再有采样间隔下拉框"
-        acts = win._rate_actions
-        assert len(acts) == len(INTERVAL_CHOICES_MS), len(acts)
-        checked = [a.text() for a in acts if a.isChecked()]
-        assert len(checked) == 1, checked
-        # QSettings 可能被上一次运行改过 —— 勾選的那项必须与 recorder 的实际值一致
-        assert checked[0].startswith(f"{int(win.recorder.target_interval_ms())} ms"), \
-            (checked, win.recorder.target_interval_ms())
+        # 三档各自一组互斥单选项, 且各自勾中的就是 recorder 当前实际值
+        for acts, choices, get in (
+                (win._rate_actions, INTERVAL_CHOICES_MS,
+                 win.recorder.target_interval_ms),
+                (win._rate_global_actions, INTERVAL_CHOICES_MS,
+                 win.recorder.target_global_interval_ms),
+                (win._rate_hud_actions, HUD_CHOICES_MS,
+                 win.recorder.target_hud_interval_ms)):
+            assert len(acts) == len(choices), (len(acts), len(choices))
+            checked = [a.text() for a in acts if a.isChecked()]
+            assert len(checked) == 1, checked
+            assert checked[0].startswith(f"{int(get())} ms"), (checked, get())
 
-        win._set_rate_ms(75)
-        assert abs(win.recorder.target_interval_ms() - 75.0) < 1e-6, \
-            win.recorder.target_interval_ms()
-        checked = [a.text() for a in acts if a.isChecked()]
-        assert len(checked) == 1 and checked[0].startswith("75 ms"), checked
-        assert "75" in win.lbl_status.text(), win.lbl_status.text()
+        # 三档必须**互不影响**
+        win._set_record_rate_ms(75)
+        win._set_global_rate_ms(50)
+        win._set_hud_rate_ms(1000)
+        assert abs(win.recorder.target_interval_ms() - 75.0) < 1e-6
+        assert abs(win.recorder.target_global_interval_ms() - 50.0) < 1e-6
+        assert abs(win.recorder.target_hud_interval_ms() - 1000.0) < 1e-6
+        for acts, want in ((win._rate_actions, "75 ms"),
+                           (win._rate_global_actions, "50 ms"),
+                           (win._rate_hud_actions, "1000 ms")):
+            checked = [a.text() for a in acts if a.isChecked()]
+            assert len(checked) == 1 and checked[0].startswith(want), checked
     finally:
-        win._set_rate_ms(int(rw.DEFAULT_INTERVAL_MS))   # 别把用户设置留在测试值上
+        # 别把用户设置留在测试值上
+        win._set_record_rate_ms(int(rw.DEFAULT_INTERVAL_MS))
+        win._set_global_rate_ms(int(rw.DEFAULT_GLOBAL_INTERVAL_MS))
+        win._set_hud_rate_ms(int(rw.DEFAULT_HUD_INTERVAL_MS))
         win.close()
-    results.append("采样间隔在菜单「设置」里(默认 40ms / 改动生效 / 主界面无下拉框) OK")
+    results.append("轮询率在菜单里且三档独立(单条 / 全局 / hudmsg) OK")
 
 
 def test_sound(tmpdir: str):

@@ -47,7 +47,8 @@ from .record_overlay import (
     ANCHORS, COLOR_TEXT, COLOR_TITLE, RecordOverlay, RecordOverlaySettings,
 )
 from .record_overlay_dialog import RecordOverlayDialog
-from .route_recorder import DEFAULT_INTERVAL_MS, RouteRecorder
+from .route_recorder import (DEFAULT_GLOBAL_INTERVAL_MS, DEFAULT_HUD_INTERVAL_MS,
+                             DEFAULT_INTERVAL_MS, RouteRecorder)
 from .route_store import (
     GLOBAL_SIDES, GLOBAL_SIDE_LABELS, PLACEHOLDER_MAP_KEY, GlobalRecord, RouteRecord,
     RouteStore, fmt_speed, fmt_time, fmt_time_ms,
@@ -86,18 +87,20 @@ def _create_map_view(parent) -> RouteMapView:
 #
 # **这不是一个该让用户随时调的东西**(2026-10-23 用户意见): 调得太小会把 8111
 # 轮询推到上限、调得太大轨迹会变稀疏出怪结果。所以它从信息区下拉框收进了
-# 菜单「设置 → 采样间隔」, 主界面只留一个很小的只读频率提示。
-# 单条录制与全局录制**共用**同一个值(两者就是同一个轮询线程)。
+# 菜单「设置 → 轮询间隔」, 主界面只留一个很小的只读频率提示。
 INTERVAL_CHOICES_MS = (20, 25, 30, 40, 50, 75, 100)
+# `/hudmsg` 的轮询选项(毫秒): 8111 官方页面自己就是 500ms; 调大很危险
+# (damage 是滚动窗口), 所以上限只给到 2 秒。
+HUD_CHOICES_MS = (200, 300, 500, 800, 1000, 2000)
 
 
-def rate_choice_ms(ms) -> int:
-    """把任意毫秒值归一成选项里的一个(取最接近的), 默认 40。"""
+def rate_choice_ms(ms, choices=INTERVAL_CHOICES_MS) -> int:
+    """把任意毫秒值归一成选项里的一个(取最接近的), 默认取表里的 40。"""
     try:
         value = float(ms)
     except (TypeError, ValueError):
-        return int(DEFAULT_INTERVAL_MS)
-    return int(min(INTERVAL_CHOICES_MS, key=lambda x: abs(x - value)))
+        value = float(DEFAULT_INTERVAL_MS)
+    return int(min(choices, key=lambda x: abs(x - value)))
 
 _ROLE_KIND = Qt.ItemDataRole.UserRole
 _ROLE_ID = Qt.ItemDataRole.UserRole + 1
@@ -161,14 +164,25 @@ class RouteTesterWindow(QMainWindow):
         # “粘性状态栏文字”: 提示类信息(回放开始/结束、显示切换…)在若干秒内不被刷新覆盖
         self._sticky_text = ""
         self._sticky_until = 0.0
-        # 采样间隔(毫秒, 默认 40ms ≈ 25Hz)持久化(PyQt 自带的 QSettings)。
-        # 入口在菜单「设置 → 采样间隔」—— 主界面不再放这个下拉框(見上方常量注释)。
+        # 采样/轮询间隔(毫秒)持久化(PyQt 自带的 QSettings)。
+        # **三档分开**(2026-10-23 用户要求): 单条录制 / 全局录制 / hudmsg。
+        # 入口在菜单「设置 → 轮询间隔」—— 主界面不再放这个下拉框(见上方常量注释)。
         self._settings = QSettings("WTBlackList", "RouteTester")
-        try:
-            self._saved_ms = int(self._settings.value("interval_ms", DEFAULT_INTERVAL_MS))
-        except (TypeError, ValueError):
-            self._saved_ms = int(DEFAULT_INTERVAL_MS)
-        self._saved_ms = rate_choice_ms(self._saved_ms)
+
+        def _saved_int(key: str, default: float, choices) -> int:
+            try:
+                raw = self._settings.value(key, default)
+            except TypeError:
+                raw = default
+            return rate_choice_ms(raw, choices)
+
+        self._saved_ms = _saved_int("interval_ms", DEFAULT_INTERVAL_MS,
+                                    INTERVAL_CHOICES_MS)
+        self._saved_global_ms = _saved_int("global_interval_ms",
+                                           DEFAULT_GLOBAL_INTERVAL_MS,
+                                           INTERVAL_CHOICES_MS)
+        self._saved_hud_ms = _saved_int("hud_interval_ms", DEFAULT_HUD_INTERVAL_MS,
+                                        HUD_CHOICES_MS)
         # “以速度从零变化时刻作为起始时间点”是**非默认开启**的功能: 每次启动都不勾选。
         # 不写入 QSettings —— 否则上次勾选的状态会被带到下次启动, 看起来就像默认开启。
         self._saved_on_move = False
@@ -240,6 +254,8 @@ class RouteTesterWindow(QMainWindow):
         if start_recorder:
             self.recorder.start()
         self.recorder.set_interval_ms(self._saved_ms)
+        self.recorder.set_global_interval_ms(self._saved_global_ms)
+        self.recorder.set_hud_interval_ms(self._saved_hud_ms)
         self.lbl_rate.setText(f"轮询 {1000 // int(self._saved_ms)} Hz")
 
         # 轨迹回放(按倍速推进 playhead)
@@ -311,35 +327,32 @@ class RouteTesterWindow(QMainWindow):
         self.act_spawns.toggled.connect(self._on_show_spawns)
         setting.addAction(self.act_spawns)
 
-        # ---- 采样间隔: 从信息区挪到菜单(2026-10-23)。
+        # ---- 轮询间隔: 从信息区挪到菜单(2026-10-23)。
         # 用户口径: “采样设置不该让用户经常改, 最好是定在一个合适的数值, 现在这项功能
         # 在主界面太显眼, 用户可能没事干就会调得过高或过低导致 bug。”
-        # 所以: 菜单里是一组互斥单选项(默认 40 ms), 并直接写一行“一般不用改”。
+        # 之后又要求**三档拆开**: 单条录制 / 全局录制 / hudmsg 各一个轮询率。
         setting.addSeparator()
-        rate_menu = setting.addMenu("采样间隔(&R)")
+        rate_menu = setting.addMenu("轮询间隔(&R)")
         rate_menu.setToolTip(
-            "8111 轮询与轨迹采样共用的间隔(单条录制与全局录制是同一个值)。\n"
-            "一般不用改: 40 ms(25 Hz)与 8111 陆战数据的更新率一致。")
-        self._rate_group = QActionGroup(self)
-        self._rate_group.setExclusive(True)
-        self._rate_actions: list[QAction] = []
-        for ms in INTERVAL_CHOICES_MS:
-            act = QAction(f"{ms} ms({1000 // ms} Hz)", self)
-            act.setCheckable(True)
-            act.setChecked(int(ms) == int(self._saved_ms))
-            act.setToolTip(
-                "8111 轮询与轨迹采样共用的间隔(单条录制与全局录制同一个值)。\n"
-                "40 ms(25 Hz)与 8111 陆战数据的更新率匹配, 是推荐值; "
-                "20 ms 已接近 8111 的请求上限, 调太小反而会拖慢整体轮询。"
-                if ms == int(DEFAULT_INTERVAL_MS) else
-                f"{ms} ms(≈{1000 // ms} Hz)。一般不用改 —— "
-                f"推荐 40 ms, 与 8111 陆战数据的更新率一致。")
-            act.triggered.connect(lambda _c=False, v=int(ms): self._set_rate_ms(v))
-            self._rate_group.addAction(act)
-            rate_menu.addAction(act)
-            self._rate_actions.append(act)
+            "三档独立的轮询率(单条录制 / 全局录制 / hudmsg)。\n"
+            "一般不用改: 前两个 40 ms(25 Hz)与 8111 陆战数据的更新率一致;\n"
+            "hudmsg 500 ms 就是 8111 官方网页自己的频率。")
+        self._rate_actions = self._build_rate_submenu(
+            rate_menu, "单条录制轮询率", self._saved_ms, INTERVAL_CHOICES_MS,
+            self._set_record_rate_ms,
+            "单条线路录制的轮询间隔: 决定主循环频率与单条轨迹的采样密度。")
+        self._rate_global_actions = self._build_rate_submenu(
+            rate_menu, "全局录制轮询率", self._saved_global_ms, INTERVAL_CHOICES_MS,
+            self._set_global_rate_ms,
+            "全局录制(整局所有玩家)的轮询间隔: 只影响全场单位数据的采样密度,\n"
+            "与上面的单条录制互不影响。")
+        self._rate_hud_actions = self._build_rate_submenu(
+            rate_menu, "hudmsg 轮询率", self._saved_hud_ms, HUD_CHOICES_MS,
+            self._set_hud_rate_ms,
+            "`/hudmsg`(击毁消息)的轮询间隔。500 ms 就是 8111 官方网页自己的频率;\n"
+            "⚠ 不要调太大: damage 是滚动窗口, 太慢会被挤掉(实测 15 秒会整段丢失)。")
         rate_menu.addSeparator()
-        act_rate_hint = QAction("建议保持 40 ms(25 Hz)—— 这一项一般不用改", self)
+        act_rate_hint = QAction("建议: 单条/全局 40 ms、hudmsg 500 ms —— 一般不用改", self)
         act_rate_hint.setEnabled(False)
         rate_menu.addAction(act_rate_hint)
 
@@ -2295,24 +2308,72 @@ class RouteTesterWindow(QMainWindow):
         else:
             self._set_status("回放显示: 不区分阵亡", sticky=3.0)
 
-    def _set_rate_ms(self, ms: int) -> None:
-        """菜单「设置 → 采样间隔」: 立即应用到轮询线程并记忆。
+    def _build_rate_submenu(self, parent, title: str, saved_ms: int, choices, on_pick,
+                            tip: str) -> list[QAction]:
+        """在「设置 → 轮询间隔」下建一组互斥单选项(三档轮询率各一个子菜单)。"""
+        sub = parent.addMenu(title)
+        sub.setToolTip(tip)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        acts: list[QAction] = []
+        for ms in choices:
+            text = (f"{ms} ms({1000 // ms} Hz)" if ms < 1000
+                    else f"{ms} ms({ms / 1000:g} s)")
+            act = QAction(text, self)
+            act.setCheckable(True)
+            act.setChecked(int(ms) == int(saved_ms))
+            act.setToolTip(tip)
+            act.triggered.connect(lambda _c=False, v=int(ms): on_pick(v))
+            group.addAction(act)
+            sub.addAction(act)
+            acts.append(act)
+        return acts
 
-        单条录制与全局录制**共用**这个值(两者本来就是同一个轮询线程),
-        所以这里只有一处设置入口。
-        """
-        ms = rate_choice_ms(ms)
+    @staticmethod
+    def _sync_rate_actions(acts, choices, ms: int) -> None:
+        """代码路径改值后也要让菜单勾选跟上(`setChecked` 不会触发 `triggered`)。"""
+        for act, val in zip(acts or (), choices):
+            act.setChecked(int(val) == int(ms))
+
+    def _set_record_rate_ms(self, ms: int) -> None:
+        """菜单「设置 → 轮询间隔 → 单条录制轮询率」。"""
+        ms = rate_choice_ms(ms, INTERVAL_CHOICES_MS)
         rec = getattr(self, "recorder", None)
         if rec is not None:
             rec.set_interval_ms(float(ms))
         self._settings.setValue("interval_ms", int(ms))
         self._saved_ms = int(ms)
-        for act, val in zip(getattr(self, "_rate_actions", ()), INTERVAL_CHOICES_MS):
-            act.setChecked(int(val) == int(ms))     # 代码路径也要同步菜单勾选
-        self.lbl_rate.setText(f"轮询 {1000 // int(ms)} Hz")
+        self._sync_rate_actions(getattr(self, "_rate_actions", ()),
+                                INTERVAL_CHOICES_MS, ms)
         self._set_status(
-            f"采样间隔已设为 {int(ms)} ms(≈{1000 // int(ms)} Hz) —— "
-            f"单条录制与全局录制同步", sticky=2.0)
+            f"单条录制轮询率已设为 {int(ms)} ms(≈{1000 // int(ms)} Hz)", sticky=2.0)
+
+    def _set_global_rate_ms(self, ms: int) -> None:
+        """菜单「设置 → 轮询间隔 → 全局录制轮询率」。"""
+        ms = rate_choice_ms(ms, INTERVAL_CHOICES_MS)
+        rec = getattr(self, "recorder", None)
+        if rec is not None:
+            rec.set_global_interval_ms(float(ms))
+        self._settings.setValue("global_interval_ms", int(ms))
+        self._saved_global_ms = int(ms)
+        self._sync_rate_actions(getattr(self, "_rate_global_actions", ()),
+                                INTERVAL_CHOICES_MS, ms)
+        self._set_status(
+            f"全局录制轮询率已设为 {int(ms)} ms(≈{1000 // int(ms)} Hz)", sticky=2.0)
+
+    def _set_hud_rate_ms(self, ms: int) -> None:
+        """菜单「设置 → 轮询间隔 → hudmsg 轮询率」。"""
+        ms = rate_choice_ms(ms, HUD_CHOICES_MS)
+        rec = getattr(self, "recorder", None)
+        if rec is not None:
+            rec.set_hud_interval_ms(float(ms))
+        self._settings.setValue("hud_interval_ms", int(ms))
+        self._saved_hud_ms = int(ms)
+        self._sync_rate_actions(getattr(self, "_rate_hud_actions", ()),
+                                HUD_CHOICES_MS, ms)
+        self._set_status(
+            f"hudmsg 轮询率已设为 {int(ms)} ms"
+            + ("(8111 官方网页就是 500 ms)" if int(ms) == 500 else ""), sticky=2.0)
 
     def _set_status(self, text: str, sticky: float = 0.0) -> None:
         """写状态栏。sticky>0 时该文字在这么多秒内不会被刷新的状态覆盖
@@ -2346,8 +2407,10 @@ class RouteTesterWindow(QMainWindow):
         # 等待移动期间还没定下起点, 标记没有意义
         self.btn_mark.setEnabled(recording and not armed)
         self.chk_start_on_move.setEnabled(not busy and not in_play)
-        # 采样间隔已收进菜单: 录制/回放期间同样不允许改
-        for act in getattr(self, "_rate_actions", ()):
+        # 三档轮询率都在菜单里: 录制/回放期间同样不允许改
+        for act in (list(getattr(self, "_rate_actions", ()))
+                    + list(getattr(self, "_rate_global_actions", ()))
+                    + list(getattr(self, "_rate_hud_actions", ()))):
             act.setEnabled(not busy and not in_play)
         self.tree.setEnabled(not in_play and not busy)   # 含眼睛点击与右键菜单
         # 全局录制按钮: 自己录制中时两个“录制”按钮禁用, 只留“停止”

@@ -73,8 +73,13 @@ SAMPLE_INTERVAL = 0.2
 MATCH_RADIUS = 0.004
 # 一条线连续多久没匹配上就算结束(秒)。要大于“短暂丢帧/闪烁”的时间
 END_GAP = 1.0
-# 全场一个可录单位都没有、持续多久 → 认为已经回到车库, 自动结束录制(秒)
-EMPTY_STOP = 3.0
+# 全场一个可录单位都没有、持续多久 → 认为已经回到车库, 自动结束录制(秒)。
+# ⚠ **2026-10-23 从 3 秒改成 30 秒**: 观战对象一上飞机, 8111 的 `/map_obj.json`
+# 就只报空中单位、地面单位全部消失(实测西奈半岛那局 16:17:52 上机, 3 秒后就被
+# 判成“回库”把整局提前停了, 用户看到悬浮窗消失)。真正的“回库”有硬判据
+# —— `/map.img` 变成占位图时 `_map_loop` 会直接发 `global_stop`(见 route_recorder),
+# 所以这里放宽到 30 秒当兜底就够。
+EMPTY_STOP = 30.0
 # 位移小于这个距离(归一化)就算“没动”: 只把末点的 `hold` 往后延, 不新增点。
 # 它同时是一道**抖噪闸** —— 8111 的坐标末位会跳, 不设阈值的话静止的车会一直
 # 被当成“在动”而逐帧存点。 0.0002 × 4000m ≈ 0.8m。
@@ -630,6 +635,14 @@ class GlobalTracker:
             return True
         return (t - self._view_changed_at) > VIEW_CHANGE_GRACE
 
+    def reset_empty(self) -> None:
+        """把“全场没有可录单位”的计时清零。
+
+        调用方(route_recorder)在“地面单位没了但对局显然还在打”时调它 ——
+        典型场景: 观战对象上了飞机, 8111 只报空中单位(2026-10-23 西雅那局)。
+        """
+        self._empty_since = None
+
     def finish(self) -> list[UnitLife]:
         """结束跟踪: 把还活着的线收尾(不再等 end_gap), 返回本队的全部线路。
 
@@ -730,7 +743,14 @@ class GlobalTracker:
 
         **每一帧的信息都不会丢**(2026-10-23 改): 车在动就追加一个带速度的点,
         车没动就只把末点的 `hold` 往后延 —— 静止段占 1 个点, 时间信息一点不少。
+
+        ⚠ “没动”必须是**坐标一模一样**才算(8111 对停着的车每帧报同一个数)。
+        “位移小于 `MIN_MOVE`”不等于没动 —— 慢速行驶(每帧不到 0.8 m)也是那种情况,
+        以前把它当静止累加 `hold`, 于是下次存点时 `depart` 被顶到当前时刻、
+        `dt` 被压成 40 ms, 速度就被放大 2~4 倍(2026-10-23 西奈半岛实测:
+        图上人人 85 km/h, 而按点反算只有 ~30)。
         """
+        still = (u.x == lv.x and u.y == lv.y)      # 与**上一帧**完全同一个坐标
         lv.x, lv.y = u.x, u.y
         lv.last_seen = t
         lv.life.color = u.color
@@ -744,21 +764,24 @@ class GlobalTracker:
         if u.icon and u.icon.lower() != "player" and \
                 (lv.life.icon or "").lower() in ("", "player"):
             lv.life.icon = u.icon
-        moved = math.hypot(u.x - lv.last_x, u.y - lv.last_y)
-        if moved < MIN_MOVE:
-            # 一动不动: **不新增点**, 只把“停在这儿多久”累加到末点的 `hold` 上。
-            # 这样一棵不动的高炮蹲 20 分钟也只占 1 个点(坐标没变, 变的只有时间),
-            # 而线尾时刻依旧是真实的(见 `_close`)。
+        if still:
+            # 真的没动(坐标一模一样): **不新增点**, 只把“停在这儿多久”累加到末点的
+            # `hold` 上。一棵不动的高炮蹲 20 分钟也只占 1 个点。
             last = lv.life.points[-1]
             if t > last.t:
                 last.hold = round(t - last.t, 2)
             return
+        moved = math.hypot(u.x - lv.last_x, u.y - lv.last_y)
+        if moved < MIN_MOVE:
+            # 在动, 但还没走够一个“分辨率单元”(约 0.8 m): 这一帧不记账。
+            # ⚠ 这里**绝不能**累加 hold —— 那就是速度被放大的根因。
+            return
         if (t - lv.last_store) >= self.interval:
-            # 速度要按“**静止段结束之后的**帧间隔”算: 停了 10 分钟才起步的那一帧,
-            # 若拿末点的时间当起点, 10 分钟的距离/10 分钟 = 0 km/h, 速度配色就废了。
+            # 速度 = 从上一存点到此的真实位移 / **真实间隔**。
+            # `depart` = 末点位置“一直保持到”的时刻(静止段结束), 从那时起才开始跑。
             last = lv.life.points[-1]
             depart = last.t + float(getattr(last, "hold", 0.0) or 0.0)
-            dt = t - min(depart, t - self.interval)
+            dt = max(1e-3, t - min(depart, t))
             speed = self._speed(lv.last_x, lv.last_y, u.x, u.y, dt)
             lv.life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=speed))
             lv.last_x, lv.last_y = u.x, u.y

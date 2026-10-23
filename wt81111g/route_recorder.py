@@ -34,7 +34,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .api8111 import WT8111
 from .config import WT_BASE_URL
-from .global_record import DEFAULT_MAP_SIZE, GlobalTracker, extract_units
+from .global_record import DEFAULT_MAP_SIZE, EMPTY_STOP, GlobalTracker, extract_units
 from . import kill_timeline
 from .map_cache import MapCache
 from .route_store import (
@@ -65,10 +65,23 @@ ZONE_COLOR_STEP = 12
 # 另: **停止录制时一定会再补取一次**(见 `_collect_kills`)。
 HUD_POLL_INTERVAL = 0.5
 
+# “对局还有战况”的判定窗口(秒): 最近这么久内有 hudmsg 新消息,
+# 就当对局还没结束 —— 用来区分“全场没有地面单位”是真的回库了, 还是观战者飞上天了。
+HUD_ALIVE_WINDOW = 20.0
+
 # 轮询/采样间隔: 默认 40ms(≈25Hz)。
 # 实测 8111 陆战数据本身約每 40ms 更新一次(rpm 变化间隔 p50=40ms),
 # 再快只能重复采到同一批数据(46Hz 采样时每个数据点被重复采约 1.85 次)。
 DEFAULT_INTERVAL_MS = 40.0
+
+# 全局录制的轮询间隔(毫秒): **与单条录制分开设**(2026-10-23 用户要求)。
+# 默认同 40ms; 想省体积/减开销可以单独降到 100~200ms, 不影响单条轨迹。
+DEFAULT_GLOBAL_INTERVAL_MS = 40.0
+
+# `/hudmsg` 的轮询间隔(毫秒): 独立的第三档。
+# 500ms 是 **8111 自己网页的频率**(`setInterval(updateSlow, 500)`);
+# 调大很危险: damage 是滚动窗口, 交火期几秒就能滚过一小批。
+DEFAULT_HUD_INTERVAL_MS = 500.0
 DEFAULT_INTERVAL = DEFAULT_INTERVAL_MS / 1000.0
 DEFAULT_HZ = 1.0 / DEFAULT_INTERVAL
 _MIN_INTERVAL = 0.01          # 最快 100Hz(10ms)
@@ -174,11 +187,17 @@ class RouteRecorder(QObject):
         # ---- 全局录制状态(同样只由轮询线程修改)
         self._global: GlobalRecord | None = None   # 正在录的条目
         self._global_side = ""                      # "A" / "B"
+        # 全局录制的轮询间隔(秒): 与单条录制的 `interval` 分开, 各自可调
+        self.global_interval = max(_MIN_INTERVAL,
+                                   float(DEFAULT_GLOBAL_INTERVAL_MS) / 1000.0)
+        # `/hudmsg` 的轮询间隔(秒): 第三档, 与上面两个都无关
+        self.hud_interval = float(DEFAULT_HUD_INTERVAL_MS) / 1000.0
         self._global_created = False                # 条目是不是这次新建的(取消时要删掉)
         self._global_prev_lives: list = []           # 重录前的旧线路(取消时恢复)
         self._tracker: GlobalTracker | None = None
         self._global_waiting = False                # 还没等到第一名玩家重生
         self._global_t0 = 0.0
+        self._global_feed_at = 0.0                  # 上次把单位喂给跟踪器的时刻
         self._map_lock = False                      # 全局录制期间锁定地面底图
         # 地图实际边长(米, 来自 /map_info.json): 归一化位移 × 边长 → 速度(km/h)
         self._map_size: tuple[float, float] = DEFAULT_MAP_SIZE
@@ -209,6 +228,10 @@ class RouteRecorder(QObject):
         # 网页每次请求都把它们一起发上去, 我们只关心 damage, 但发送方式照抄。
         self._hud_cursor = 0
         self._hud_evt_cursor = 0
+        # 最近一次 hudmsg 带来新消息的单调时刻(0 = 还没有)。
+        # 用途: 判断“全场没有地面单位”到底是真的回库了, 还是只是观战者飞上天了。
+        self._hud_last_new = 0.0
+        self._empty_hold_log_at = 0.0
         # 下次读 /hudmsg 的时刻(monotonic)。为什么要**录制期间每 0.5 秒读一次**:
         # `/hudmsg` 的 damage 是**有上限的滚动窗口**, 只在结束时读一次的话前面的击杀
         # 早被挤掉了(2026-10-22 实测: 一位阵亡 3 次的玩家只看到 2 条)。
@@ -300,15 +323,45 @@ class RouteRecorder(QObject):
         self._cmds.put("global_stop")
 
     def set_interval_ms(self, ms: float) -> None:
-        """按毫秒设置轮询间隔(GUI 线程调用), 采样间隔同步跟随。"""
+        """单条线路录制的轮询间隔(毫秒): 主循环频率与轨迹采样间隔。
+
+        与“全局录制轮询率”“hudmsg 轮询率”**互相独立**(2026-10-23 用户要求)。
+        """
         interval = max(_MIN_INTERVAL, min(_MAX_INTERVAL, float(ms) / 1000.0))
         with self._interval_lock:
             self.interval = interval
             self.sample_interval = interval
-        log.info("采样间隔已设为 %.0f ms (%.0f Hz)", interval * 1000, 1.0 / interval)
+        log.info("单条录制轮询间隔已设为 %.0f ms (%.0f Hz)",
+                 interval * 1000, 1.0 / interval)
+
+    def set_global_interval_ms(self, ms: float) -> None:
+        """全局录制的轮询间隔(毫秒) —— 只影响 "/map_obj → 跟踪器" 的喂数据频率。"""
+        interval = max(_MIN_INTERVAL, min(_MAX_INTERVAL, float(ms) / 1000.0))
+        with self._interval_lock:
+            self.global_interval = interval
+            self._global_feed_at = 0.0        # 改完立刻生效
+        log.info("全局录制轮询间隔已设为 %.0f ms (%.0f Hz)",
+                 interval * 1000, 1.0 / interval)
+
+    def set_hud_interval_ms(self, ms: float) -> None:
+        """`/hudmsg` 的轮询间隔(毫秒)。
+
+        这个不需要很快 —— 8111 官方页面自己就是 500 ms; 但**不能太慢**:
+        damage 是滚动窗口, 交火期 15 秒就能把前面的消息挤掉(实测过)。
+        """
+        interval = max(0.05, min(5.0, float(ms) / 1000.0))
+        self.hud_interval = interval
+        self._hud_read_at = 0.0              # 改完立刻拉一次
+        log.info("hudmsg 轮询间隔已设为 %.0f ms", interval * 1000)
 
     def target_interval_ms(self) -> float:
         return self.interval * 1000.0
+
+    def target_global_interval_ms(self) -> float:
+        return self.global_interval * 1000.0
+
+    def target_hud_interval_ms(self) -> float:
+        return self.hud_interval * 1000.0
 
     def target_hz(self) -> float:
         return 1.0 / self.interval if self.interval > 0 else 0.0
@@ -374,9 +427,11 @@ class RouteRecorder(QObject):
                 self._tick()
             except Exception as exc:  # noqa: BLE001 - 单次异常不应终止线程
                 log.exception("route recorder tick error: %s", exc)
-            # 目标周期调度(而非“固定 sleep”), 否则请求耗时会被叠加, 实际频率远低于设定值
+            # 目标周期调度(而非“固定 sleep”), 否则请求耗时会被叠加, 实际频率远低于设定值。
+            # ⚠ 主循环速度 = **两者中更快的那个**: 单条录制与全局录制各有各的轮询率,
+            # 主循环必须能满足快的那一个, 慢的那个自己节流(见 `_tick`)。
             with self._interval_lock:
-                interval = self.interval
+                interval = min(self.interval, self.global_interval)
             next_at += interval
             delay = next_at - time.monotonic()
             if delay <= 0.0:        # 跟不上(请求耗时过长)则重置, 避免累积滞后
@@ -437,10 +492,15 @@ class RouteRecorder(QObject):
             if now - self._map_info_at >= 2.0:
                 self._map_info_at = now
                 self._update_map_size()
-            global_elapsed = self._global_feed(now, objects)
-            # 定期把 /hudmsg 的增量存进条目 —— 不能等到结束时才读(损坏窗口只有 ~50 条)
+            # 全局录制有自己的轮询率(默认 40ms): 与单条录制分开设, 互不影响
+            if now - self._global_feed_at >= self.global_interval:
+                self._global_feed_at = now
+                global_elapsed = self._global_feed(now, objects)
+            elif self._global_t0 > 0.0:
+                global_elapsed = now - self._global_t0
+            # 定期把 /hudmsg 的增量存进条目 —— 不能等到结束时才读(滚动窗口很小)
             if now >= self._hud_read_at:
-                self._hud_read_at = now + HUD_POLL_INTERVAL
+                self._hud_read_at = now + self.hud_interval
                 self._poll_kills(self._global)
 
         self.tick.emit({
@@ -736,7 +796,22 @@ class RouteRecorder(QObject):
             self.global_started.emit(rec, self._global_side)
         elapsed = now - self._global_t0
         if tracker.feed(elapsed, objects):
-            log.info("全局录制: 全场已无可录单位超过阈值, 自动停止")
+            # ⚠ **2026-10-23 修**: 观战对象一上飞机, 8111 的 `/map_obj.json` 就
+            # 只报空中单位 —— 地面单位全部“消失”, 3 秒后旧逻辑直接判“回库”把整局
+            # 提前停了(用户看到悬浮窗消失、西奈半岛那局只录到 392s)。
+            # 现在看**对局还在不在打**: 最近 `HUD_ALIVE_WINDOW` 秒内还有新的阵亡消息
+            # 就说明对局没结束, 不停(真正的回库有硬判据: 地图变占位图 → global_stop)。
+            if (self._hud_last_new > 0.0
+                    and now - self._hud_last_new < HUD_ALIVE_WINDOW):
+                if now - self._empty_hold_log_at > 30.0:
+                    self._empty_hold_log_at = now
+                    log.info("全局录制: 已 %.0fs 没有地面单位(可能在看空中视角), "
+                             "但 hudmsg 仍在报战况 → 不停止录制", elapsed)
+                tracker.reset_empty()
+                rec.duration = elapsed
+                return elapsed
+            log.info("全局录制: 全场已无可录单位超过 %.0fs 且 %.0fs 内无战况, 自动停止",
+                     EMPTY_STOP, HUD_ALIVE_WINDOW)
             self._do_global_stop()
             return max(0.0, elapsed)
         rec.duration = elapsed
@@ -895,6 +970,8 @@ class RouteRecorder(QObject):
             return 0        # 0.5 秒一次: 没新增就什么都不写(否则日志会被刷爆)
         rec.kills.extend(new)
         rec.kills = kill_timeline.merge_kills(rec)
+        # 最近一次“对局还有战况”的时刻(单调时钟): 给 `_global_feed` 判“是否真已回库”用
+        self._hud_last_new = time.monotonic()
         log.info("全局录制: hudmsg 新增阵亡 %d 条(%d 条消息), 游标 -> %d",
                  len(new), len(rows), self._hud_cursor)
         return len(new)
