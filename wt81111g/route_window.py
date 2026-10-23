@@ -60,6 +60,8 @@ from .tree_view import RouteTreeWidget
 from .watcher_dialog import WatcherDialog
 from .zones import ground_spawns, layout_spread, ownership_text, spawns_from_json
 from .zones import spawns_to_json, zones_to_json
+from .zones import CAPTURE_ANCHORS, SIDE_ENEMY, SIDE_NEUTRAL, SIDE_OURS
+from .zones import remap_capture_color
 
 log = logging.getLogger("route_window")
 
@@ -1341,10 +1343,54 @@ class RouteTesterWindow(QMainWindow):
                 return owner
         return None
 
+    def _zone_state_side(self) -> str:
+        """回放时按哪一次观战(A/B)的战区快照取色。
+
+        播放的线路都来自同一队 → 就用那一队; A/B 混播时取**条数多的那一队**
+        (平手取 A)。反正取到之后都会按“两队各自的重生点颜色”重映射一次,
+        所以选谁只影响用哪一份快照, 不影响最终配色。
+        """
+        counts: dict[str, int] = {}
+        for rec in self.map_view.playback_records:
+            side = str(getattr(rec, "side", "") or "")
+            if side in ("A", "B"):
+                counts[side] = counts.get(side, 0) + 1
+        if not counts:
+            return ""
+        return max(sorted(counts), key=lambda s: counts[s])
+
+    def _remap_zone_state(self, snap: list[dict], session_side: str) -> list[dict]:
+        """把战区快照的颜色从“观战者视角”换到“两队各自重生点的颜色”。
+
+        8111 的颜色里 `#174DFF` 永远是**摄像机那一队**。A、B 是两次观战、视角相反,
+        所以同一条状态在两次录制里的 `ours` 指的是不同队伍。这里按
+        “`ours` → 该次观战那一队在地图上的重生点颜色 / `enemy` → 另一队的”重算混色
+        (进度比例不变), 于是回放时两支队伍的颜色始终固定(2026-10-23 用户要求)。
+        算不出队伍颜色(没有线路可投票)时原样返回。
+        """
+        if not session_side:
+            return list(snap)
+        other = "B" if session_side == "A" else "A"
+        own = self.map_view._side_spawn_color(session_side)
+        opp = self.map_view._side_spawn_color(other)
+        if own is None or opp is None:
+            return list(snap)
+        palette = {
+            SIDE_NEUTRAL: CAPTURE_ANCHORS[SIDE_NEUTRAL],
+            SIDE_OURS: (own.red(), own.green(), own.blue()),
+            SIDE_ENEMY: (opp.red(), opp.green(), opp.blue()),
+        }
+        out: list[dict] = []
+        for z in snap:
+            row = dict(z)
+            new = remap_capture_color(row.get("color"), palette)
+            if new:
+                row["color"] = new
+            out.append(row)
+        return out
+
     def _apply_zones(self, info: dict | None = None) -> None:
         """决定地图上画哪套战区(小菱形 + A/B/C)。
-
-        优先级:
         1. **回放全局录制** → 用录像里记的战区状态时间轴(归属变化、占领中都能重现);
            这是 2026-10-22 用户要求的: 回放 AB 队线路时不该显示当前战局/别的录像的战区;
         2. 战局内且 8111 正在给同一张图 → 用**实时**战区;
@@ -1361,9 +1407,14 @@ class RouteTesterWindow(QMainWindow):
         # 1) 回放全局录制: 按 playhead 取当时的战区快照
         if self._in_playback():
             g = self._playback_global()
-            snap = g.zone_state_at(self.player.time) if g is not None else None
-            if snap:
-                self.map_view.set_zones(snap)
+            entry = g.zone_state_entry(self.player.time, self._zone_state_side()) \
+                if g is not None else None
+            if entry:
+                zones = entry.get("zones") or []
+                # 重映射用**这条快照自己的 side**(哪一次观战录的), 不是播放的那一队:
+                # 旧数据没有 side → 不动颜色(那时也分不出两次观战)
+                self.map_view.set_zones(self._remap_zone_state(
+                    zones, str(entry.get("side") or "")))
                 self.map_view.set_spawns(spawns_to_json(ground_spawns(
                     spawns_from_json((layout or {}).get("spawns")))))
                 return
@@ -2368,9 +2419,10 @@ class RouteTesterWindow(QMainWindow):
         g = self._playback_global()
         if g is None:
             return
-        snap = g.zone_state_at(t)
-        if snap:
-            self.map_view.set_zones(snap)
+        entry = g.zone_state_entry(t, self._zone_state_side())
+        if entry:
+            self.map_view.set_zones(self._remap_zone_state(
+                entry.get("zones") or [], str(entry.get("side") or "")))
 
     def _on_playback_progress(self, t: float) -> None:
         recs = self.player.records

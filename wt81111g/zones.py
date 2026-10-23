@@ -148,6 +148,83 @@ def side_of(color: str | None) -> str:
     return SIDE_NEUTRAL
 
 
+# ---------------------------------------------------------------- 占领进度混色
+# 8111 给战区的 `color` 是“旧归属色 → 新占领色”的**插值**(2026-10-23 用真实录像
+# 验证过, 见 docs/跑图线路测试器.md「颜色就是进度条」): 中立 `(255,255,250)` → 蓝
+# `(23,77,255)` 的 0.72 处正好是 `#587EFD`, 中立 → 红 `(250,12,0)` 的 0.53 处是
+# `#fc7E76`。所以“进度”可以直接从这个颜色反解出来。
+CAPTURE_ANCHORS = {
+    SIDE_NEUTRAL: (255, 255, 250),
+    SIDE_OURS: (23, 77, 255),
+    SIDE_ENEMY: (250, 12, 0),
+}
+_CAPTURE_SEGMENTS = (
+    (SIDE_NEUTRAL, SIDE_OURS),
+    (SIDE_NEUTRAL, SIDE_ENEMY),
+    (SIDE_OURS, SIDE_ENEMY),
+)
+# 混色点到锚点连线的距离超过这个值就不当“进度混色”(比如玩家黄、灰)
+CAPTURE_MAX_RESIDUAL = 30.0
+
+
+def decode_capture(color: str | None) -> tuple[str, str, float] | None:
+    """把 8111 的混色颜色反解成 `(端点A, 端点B, 进度0~1)`; 不是混色就返回 None。
+
+    三个锚点两两连线(中立-蓝 / 中立-红 / 蓝-红), 取残差最小的那条;
+    残差太大(不是沿着某条线)就返回 None —— 调用方这时应该原样用这个颜色。
+    """
+    rgb = _parse_rgb(str(color or ""))
+    if rgb is None:
+        return None
+    best = None
+    for a, b in _CAPTURE_SEGMENTS:
+        pa, pb = CAPTURE_ANCHORS[a], CAPTURE_ANCHORS[b]
+        ab = (pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2])
+        ac = (rgb[0] - pa[0], rgb[1] - pa[1], rgb[2] - pa[2])
+        denom = ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2
+        if denom <= 0:
+            continue
+        t = (ac[0] * ab[0] + ac[1] * ab[1] + ac[2] * ab[2]) / denom
+        t = max(0.0, min(1.0, t))
+        err = math.sqrt((ac[0] - ab[0] * t) ** 2 + (ac[1] - ab[1] * t) ** 2
+                        + (ac[2] - ab[2] * t) ** 2)
+        if best is None or err < best[0]:
+            best = (err, a, b, t)
+    if best is None or best[0] > CAPTURE_MAX_RESIDUAL:
+        return None
+    return best[1], best[2], best[3]
+
+
+def capture_hex(color_a: str, color_b: str, t: float) -> str:
+    """两个锚点色按 t 插值 → `#RRGGBB`。"""
+    pa = CAPTURE_ANCHORS.get(color_a, CAPTURE_ANCHORS[SIDE_NEUTRAL])
+    pb = CAPTURE_ANCHORS.get(color_b, CAPTURE_ANCHORS[SIDE_NEUTRAL])
+    t = max(0.0, min(1.0, float(t)))
+    rgb = tuple(int(round(pa[i] + (pb[i] - pa[i]) * t)) for i in range(3))
+    return "#%02X%02X%02X" % rgb
+
+
+def remap_capture_color(color: str | None, palette: dict) -> str | None:
+    """把混色**换一套锚点色**重算(比例不变)。
+
+    `palette` 是 `{SIDE_NEUTRAL/SIDE_OURS/SIDE_ENEMY: (r, g, b)}`。
+    用途: 8111 的颜色是“站在观战者视角”的(蓝 = 摄像机那一队), 而全局录制的 A/B
+    是两次观战、视角相反 —— 重映射后不管这条状态是哪一次录的, 画出来都是同一支队伍
+    同一个颜色。不是混色(或调色板缺项)返回 None。
+    """
+    got = decode_capture(color)
+    if got is None:
+        return None
+    a, b, t = got
+    pa = palette.get(a)
+    pb = palette.get(b)
+    if pa is None or pb is None:
+        return None
+    t = max(0.0, min(1.0, float(t)))
+    rgb = tuple(int(round(pa[i] + (pb[i] - pa[i]) * t)) for i in range(3))
+    return "#%02X%02X%02X" % rgb
+
+
 def _color_of(obj: dict) -> str:
     """取对象的颜色字符串: 优先 `color`, 其次 `color[]` 数组(转回 #RRGGBB)。"""
     raw = obj.get("color")

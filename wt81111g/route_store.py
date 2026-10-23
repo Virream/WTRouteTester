@@ -366,26 +366,49 @@ class GlobalRecord:
     # (点它就打开修正界面); 重录任何一队都会重置成 `False`。
     fixed: bool = False
 
-    def zone_state_at(self, t: float) -> list[dict] | None:
-        """取回放时刻 `t` 的战区快照(没有时间轴返回 None)。
+    def zone_state_entry(self, t: float, side: str = "") -> dict | None:
+        """取回放时刻 `t` 的战区快照**整条**(`{"t","side","zones"}`); 没有返回 None。
 
         用时间轴里 `<= t` 的最后一条 —— 战区状态是“阶毯式”变化(只在不连续时刻变),
-        用“最近的前一条”才是当时真实的样子; 取最近的一条(不管是前是后)会在
+        用“最近的前一条”才是当时真实的样子; 取最近的(不管是前是后)会在
         占领发生**之前**就先把颜色改了。
+
+        `side` 用来限“只看某一次观战(A/B)录到的那批”: 8111 的颜色站在观战者视角,
+        A/B 两次观战视角相反, 混着取会让颜色一会儿蓝一会儿红(2026-10-23 修)。
+        旧数据没有 `side` 字段 → 一律算命中; 指定了 side 但一条都没有 → 退回全部。
+
+        ⚠ 旧数据(没有 side)是 A、B 两段拼在一个列表里的, **时间会重新从 0 开始** ——
+        所以这里不能“遇到第一条 t 更大的就停”, 必须整表扫一遍取最后一条。
         """
         states = self.zone_states
         if not states:
             return None
-        lo, hi, best = 0, len(states) - 1, -1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if float(states[mid].get("t") or 0.0) <= t:
-                best, lo = mid, mid + 1
-            else:
-                hi = mid - 1
-        if best < 0:
-            best = 0                     # 早于第一条 → 用第一条(录制开始那一刻)
-        zones = states[best].get("zones")
+
+        def pick(pool: list[dict]) -> dict | None:
+            if not pool:
+                return None
+            best = -1
+            for i, st in enumerate(pool):
+                if float(st.get("t") or 0.0) <= t:
+                    best = i
+            if best < 0:
+                best = 0                 # 早于第一条 → 用第一条(录制开始那一刻)
+            return pool[best]
+
+        if side:
+            mine = [st for st in states
+                    if not st.get("side") or str(st.get("side")) == side]
+            got = pick(mine)
+            if got is not None:
+                return got
+        return pick(list(states))
+
+    def zone_state_at(self, t: float, side: str = "") -> list[dict] | None:
+        """只要快照里的战区列表(见 `zone_state_entry`)。"""
+        entry = self.zone_state_entry(t, side)
+        if entry is None:
+            return None
+        zones = entry.get("zones")
         return list(zones) if isinstance(zones, list) else None
 
     @property

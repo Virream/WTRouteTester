@@ -2958,6 +2958,49 @@ def test_playback_zoom_resumes(tmpdir: str):
     results.append("回放中缩放后自动恢复(延迟重建不会被每帧刷新时间戳顶掉) OK")
 
 
+def test_zone_capture_color(tmpdir: str):
+    """战区颜色 = 8111 的占领进度混色; A/B 视角相反时要能换边重算。
+
+    实测依据: 中立 (255,255,250) → 蓝 (23,77,255) 的 0.72 处就是 `#587EFD`,
+    中立 → 红 (250,12,0) 的 0.53 处是 `#fc7E76`(见 docs/跑图线路测试器.md)。
+    """
+    from wt81111g import zones as z
+
+    white = z.CAPTURE_ANCHORS[z.SIDE_NEUTRAL]
+    blue = z.CAPTURE_ANCHORS[z.SIDE_OURS]
+    red = z.CAPTURE_ANCHORS[z.SIDE_ENEMY]
+
+    # 1) 反解: 端点 + 进度
+    from_side, to_side, t = z.decode_capture("#587EFD")
+    assert (from_side, to_side) == (z.SIDE_NEUTRAL, z.SIDE_OURS), (from_side, to_side)
+    assert abs(t - 0.72) < 0.02, t
+    from_side, to_side, t = z.decode_capture("#fc7E76")
+    assert (from_side, to_side) == (z.SIDE_NEUTRAL, z.SIDE_ENEMY), (from_side, to_side)
+    assert abs(t - 0.53) < 0.02, t
+
+    # 2) 同一套锚点重算 → 原色(允许 ±1 的取整)
+    same = {z.SIDE_NEUTRAL: white, z.SIDE_OURS: blue, z.SIDE_ENEMY: red}
+    for hex_in in ("#ffFFFA", "#587EFD", "#fc7E76", "#fa0C00", "#174DFF", "#e5EBFA"):
+        got = z.remap_capture_color(hex_in, same)
+        assert got is not None, hex_in
+        a, b = z._parse_rgb(hex_in), z._parse_rgb(got)
+        assert max(abs(a[i] - b[i]) for i in range(3)) <= 2, (hex_in, got)
+
+    # 3) 换边重算: 蓝↔红 对调, 进度不变
+    swap = {z.SIDE_NEUTRAL: white, z.SIDE_OURS: red, z.SIDE_ENEMY: blue}
+    assert z.remap_capture_color("#174DFF", swap) == "#FA0C00"
+    assert z.remap_capture_color("#fa0C00", swap) == "#174DFF"
+    got = z.remap_capture_color("#587EFD", swap)
+    a, b = z._parse_rgb(got), z._parse_rgb(z.capture_hex(z.SIDE_NEUTRAL, z.SIDE_ENEMY, 0.7216))
+    assert max(abs(a[i] - b[i]) for i in range(3)) <= 2, got
+
+    # 4) 不是混色的颜色(玩家黄 / 灰)不许乱认
+    assert z.decode_capture("#faC81E") is None, "玩家黄不能被当成进度混色"
+    assert z.decode_capture("#808080") is None
+    assert z.remap_capture_color("#808080", swap) is None
+    results.append("战区颜色 = 8111 进度混色 + A/B 换边重算 OK")
+
+
 def test_dead_style(tmpdir: str):
     """回放的两个“被击毁”选项: 阵亡后线路变半透明纯灰 + 末端红叉。
 
@@ -3300,6 +3343,7 @@ def main() -> int:
     test_zoom_reuses_layer(tmpdir)
     test_zoom_scaled_blit_offset(tmpdir)
     test_playback_zoom_resumes(tmpdir)
+    test_zone_capture_color(tmpdir)
     test_dead_style(tmpdir)
     test_map_sharpest(tmpdir)
     test_cached_map_switch(tmpdir)

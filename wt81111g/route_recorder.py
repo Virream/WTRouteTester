@@ -690,6 +690,11 @@ class RouteRecorder(QObject):
             rec.kills = []
             rec.watchers = {}
             rec.fixed = False
+        if rec.lives(side):
+            # 重录某一队 → 把**这一队**之前录的战区时间轴丢掉(另一队的保留):
+            # 时间轴里每条都带 side, 混着留会让回放取到上一局的旧状态。
+            rec.zone_states = [st for st in rec.zone_states
+                               if str(st.get("side") or "") != side]
         # 锁定地面底图: 录制期间玩家可能上飞机, 8111 会改发空战地图
         self._map_lock = True
         self._map_info_at = 0.0          # 下一次 tick 立刻取一次地图边长
@@ -771,6 +776,10 @@ class RouteRecorder(QObject):
             return
         rec.zone_states.append({
             "t": round(elapsed, 2),
+            # **哪一次观战录到的**: 8111 的颜色是“站在观战者视角”的, A/B 两次观战
+            # 视角相反, 同一个 #174DFF 指的不是同一支队伍 → 回放时要按 side 取对应
+            # 那一侧的快照, 再按重生点颜色重映射(见 `zones.remap_capture_color`)。
+            "side": self._global_side or "",
             "zones": zones_to_json(zones),
         })
 
