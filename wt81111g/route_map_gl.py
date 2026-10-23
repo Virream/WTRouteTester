@@ -25,7 +25,7 @@ import time
 import numpy as np
 
 # 必须先导入 PyQt6, rendercanvas 靠它判断用哪个 Qt 绑定
-from PyQt6.QtCore import QEvent, QPointF
+from PyQt6.QtCore import QEvent, QPointF, Qt
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage
 from PyQt6.QtWidgets import QApplication, QVBoxLayout
 
@@ -182,14 +182,13 @@ def _rgba(c: QColor, mul: float = 1.0) -> tuple[float, float, float, float]:
     return (c.redF(), c.greenF(), c.blueF(), c.alphaF() * mul)
 
 
-def _img_to_rgb(data: bytes) -> np.ndarray | None:
-    """地图字节 → (h, w, 3) uint8 RGB。
+def _qimage_to_rgb(img: QImage) -> np.ndarray | None:
+    """QImage → (h, w, 3) uint8 RGB。
 
     坑: `QImage.Format_RGB32` 是 0xffRRGGBB, 小端内存里字节序是 **B,G,R,A** ——
     直接取 `[:, :3]` 是 BGR, 送到 GPU 会红蓝互换(实测源 (114,115,110) 画成
     (110,115,114))。所以最后要 `[..., ::-1]`。
     """
-    img = QImage.fromData(data)
     if img.isNull():
         return None
     img = img.convertToFormat(QImage.Format.Format_RGB32)
@@ -198,6 +197,11 @@ def _img_to_rgb(data: bytes) -> np.ndarray | None:
     buf.setsize(img.sizeInBytes())
     bgra = np.frombuffer(buf, np.uint8).reshape(h, img.bytesPerLine() // 4, 4)[:, :w, :3]
     return np.ascontiguousarray(bgra[..., ::-1])
+
+
+def _img_to_rgb(data: bytes) -> np.ndarray | None:
+    """地图字节 → (h, w, 3) uint8 RGB。"""
+    return _qimage_to_rgb(QImage.fromData(data))
 
 
 def _pos3(xy: np.ndarray, z: float) -> np.ndarray:
@@ -326,6 +330,7 @@ class RouteMapGlView(RouteMapView):
         self._scene.add(self._camera)
         self._tex = None
         self._plane = None
+        self._base_tex: dict[int, object] = {}     # 降采样底图: 倍数 -> gfx.Texture
         self._hover_obj = None
         self._canvas.request_draw(self._draw)
 
@@ -347,6 +352,7 @@ class RouteMapGlView(RouteMapView):
         return changed
 
     def _update_texture(self, data: bytes | None) -> None:
+        self._drop_base_levels()
         if not data or self._pixmap is None:      # 空数据/占位图 → 不画底图
             if self._plane is not None:
                 self._drop_object(self._plane)
@@ -372,7 +378,51 @@ class RouteMapGlView(RouteMapView):
             self._plane.material.render_queue = RENDER_QUEUE
             self._plane.render_order = O_MAP
             self._scene.add(self._plane)
+        # 降采样档位**立刻建好**: 换图时多花 15 ms 看不出来(地图本来就在换)。
+        # 注意切换那一帧仍会多花 ~27 ms —— wgpu 是在**首次绘制**时才建 bind group 的,
+        # 赋值 `material.map` 本身不会预热它。把它留在换图后第一次放大时(一次性),
+        # 比在换图时偷偷渲染一帧安全。
+        for _f in sorted({f for _t, f in rmv.BASE_LEVELS}):
+            self._ensure_base_level(_f)
         self.update()
+
+    def _drop_base_levels(self) -> None:
+        self._base_tex = {}
+
+    def _ensure_base_level(self, factor: int) -> None:
+        """按需建一张“预降采样”底图纹理(高倍放大时用, 否则满屏方块)。
+
+        降采样用 `QImage.scaled(SmoothTransformation)` = 盒式低通: 源图的逐像素噪点
+        (地图 JPEG 里很常见, 草地最明显)被平均掉, 放大后不会一格一格。
+        实测对比(8 倍放大): 直接双线性 = 方块清楚可见; 降 2 倍 → 变淡;
+        降 4 倍 → 方块消失。降采样 4096²→1024² 约 12 ms, 只在跨过阈值时做一次。
+
+        注意用**同一种材质换纹理**(`material.map`)而不是再建一个 Mesh: 新的
+        `MeshBasicMaterial` 会让 pygfx 重新编译管线, 实测切换要多花 35 ms。
+        """
+        if factor <= 1 or factor in self._base_tex or self._pixmap is None:
+            return
+        img = self._pixmap.toImage()
+        w = max(1, img.width() // factor)
+        h = max(1, img.height() // factor)
+        small = img.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+        arr = _qimage_to_rgb(small)
+        if arr is None:
+            return
+        self._base_tex[factor] = gfx.Texture(arr, dim=2)
+
+    def _apply_base_level(self) -> None:
+        """底图只用其中一张 —— 只换 `material.map`(纹理绑定), 不新建材质。"""
+        if self._plane is None or self._tex is None:
+            return
+        factor = self._base_level()
+        if factor != 1:
+            self._ensure_base_level(factor)
+        tex = self._tex if factor == 1 else self._base_tex.get(factor, self._tex)
+        cur = getattr(self._plane.material.map, "texture", None)
+        if cur is not tex:
+            self._plane.material.map = tex
 
     # -------------------------------------------------------- 事件转发
     def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 命名
@@ -707,6 +757,7 @@ class RouteMapGlView(RouteMapView):
             self._rebuild_hover()
         elif getattr(self, "_gl_tracks", None):
             self._extend_tracks()          # 录制中点涨了 → 只补新段
+        self._apply_base_level()
         self._apply_progress()
         self._apply_anim()
 

@@ -101,6 +101,17 @@ _SPEED_BUCKETS = 24  # 轨迹按速度量化的颜色档数(减少画笔切换)
 # 缩放/平移: zoom=1.0 即“适配窗口”(等比缩放居中), 与未启用缩放时行为一致
 MIN_ZOOM = 1.0
 MAX_ZOOM = 20.0
+
+# 底图缩放档位:(放大倍数下限, 源图降采样倍数)
+#
+# 为什么需要: 双击放大到 20 倍时, 源图上一个像素占屏幕十几像素, 而地图 JPEG 里
+# 本来就有逐像素的噪点(草地尤其明显) —— 双线性放大后就是一个一个方块(用户
+# 2026-10-23 反馈“放大到最大可以看见一个一个方块”)。实测对比(8 倍放大):
+#   直接双线性 = 方块清楚可见; 先降采样 2 倍再双线性 → 方块变淡但仍能看出;
+#   先降采样 4 倍 → 方块消失(平滑), 代价是细节变少 —— 但 6 倍以上本来也看不到细节。
+# 降采样用 `QImage.scaled(SmoothTransformation)`(盒式低通, SIMD, 4096²→1024² 约
+# 12 ms), **只在跨过阈值时构建一次**, 之后每帧只是把小图贴到大矩形上(反而更快)。
+BASE_LEVELS = ((6.0, 4), (2.5, 2))
 WHEEL_STEP = 1.15        # 每格滚轮的缩放倍率
 PAN_MARGIN = 40.0        # 平移时地图至少需留在视野内的像素
 
@@ -272,6 +283,8 @@ class RouteMapView(QWidget):
 
         self._pixmap: QPixmap | None = None
         self._map_digest: str | None = None
+        # 底图的“预降采样”版本: 降采样倍数 -> (digest, QPixmap)。只保留最近用到的那一档
+        self._base_small: dict[int, tuple[str, QPixmap]] = {}
         # 地图**身份**(可能由缓存层归并过: 同一张地图的不同分辨率共用一个键),
         # 与字节指纹 _map_digest 分开 —— 后者只用来判断“图变了没有”
         self._map_key: str | None = None
@@ -554,6 +567,7 @@ class RouteMapView(QWidget):
             return False
         self._map_digest = digest
         self._map_key = key or digest[:12]
+        self._base_small.clear()
         if digest == PLACEHOLDER_MAP_SHA1:
             # 战局外的 “?” 占位图: 不是地图, 不绘制
             self._pixmap = None
@@ -869,6 +883,44 @@ class RouteMapView(QWidget):
             p.end()
 
     # ------------------------------------------------------------ 绘制缓存层
+    def _base_level(self) -> int:
+        """当前该用几倍降采样的底图(1 = 原图, 不降采样)。
+
+        判据是**屏幕上每个源图像素被放大成多少像素**(`_fit_scale() * zoom`),
+        因为“看得见方块”只与这个倍数有关, 与 zoom 的绝对值无关
+        (窗口大小不同、地图分辨率不同, 同一个 zoom 的实际放大倍数差好几倍)。
+        """
+        mag = self._fit_scale() * self._zoom
+        for threshold, factor in BASE_LEVELS:
+            if mag >= threshold:
+                return factor
+        return 1
+
+    def _base_pixmap(self) -> QPixmap | None:
+        """底图(按当前放大倍数选档)—— 高倍时用预先降采样的小图, 放大后不再一格一格。
+
+        降采样只在**跨过阈值时**做一次, 用的都是 `SmoothTransformation`(盒式低通):
+        它会把源图的逐像素噪点平均掉, 这正是方块感的来源。之后每帧把它们贴到整个
+        地图矩形上, 源数据反而更小(比现在更快)。
+        """
+        pm = self._pixmap
+        if pm is None:
+            return None
+        factor = self._base_level()
+        if factor <= 1 or pm.width() < factor * 8 or pm.height() < factor * 8:
+            return pm
+        got = self._base_small.get(factor)
+        if got is not None and got[0] == self._map_digest:
+            return got[1]
+        small = pm.toImage().scaled(max(1, pm.width() // factor),
+                                    max(1, pm.height() // factor),
+                                    Qt.AspectRatioMode.IgnoreAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation)
+        sp = QPixmap.fromImage(small)
+        sp.setDevicePixelRatio(pm.devicePixelRatio())
+        self._base_small = {factor: (self._map_digest or "", sp)}   # 只留当前这一档
+        return sp
+
     def _draw_base(self, p: QPainter) -> None:
         """底图: 地图图片 + 边框(用控件坐标画, 每帧一次 —— 缩放贴图只要零点几毫秒)。
 
@@ -878,7 +930,10 @@ class RouteMapView(QWidget):
         r = self._map_rect()
         if r.isEmpty():
             return
-        p.drawPixmap(r, self._pixmap, QRectF(self._pixmap.rect()))
+        pm = self._base_pixmap()
+        if pm is None:
+            return
+        p.drawPixmap(r, pm, QRectF(pm.rect()))
         p.setPen(QPen(COLOR_GRID, 1))
         p.drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5))
 
