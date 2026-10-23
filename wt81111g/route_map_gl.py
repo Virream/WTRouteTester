@@ -1332,10 +1332,11 @@ class RouteMapGlView(RouteMapView):
             if tr.colors is None or tr.play is None:
                 continue
             pts = tr.rec.points
-            end = pts[-1].t if pts else 0.0
-            # 注意: 这里的 dead 是“玩家已阵亡”, 与“变暗”开关无关 —— 开关只决定
-            # 阵亡后是留一条灰线还是直接清除(开关随时可切, 所以每帧比对 visible)。
-            died = bool(getattr(tr.rec, "dead", False)) and head >= end
+            # 注意: 判“已阵亡”必须用 `_dead_now`(末点时刻 + **hold**) —— 以前这里
+            # 直接取 `pts[-1].t`, 而静止车被折叠成“一个点 + hold”后, 末点时刻会比
+            # 真实消失早好几秒(实测西奈半岛那辆 SAM: 末点 304.6s、hold 12.4s)。
+            # 后果就是回放到 304.6s 那条线就变灰/消失, 比实际阵亡早 12 秒。
+            died = self._dead_now(tr.rec, head)
             if died != tr.dead:
                 tr.dead = died
             if tr.under is not None:
