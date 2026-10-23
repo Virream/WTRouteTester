@@ -215,6 +215,54 @@ def test_timeline_note():
     results.append("全局录制: A/B 时间轴对比(0 点 + 结尾差诊断) OK")
 
 
+def test_split_sam_segments():
+    """分体防空(雷达车 + 发射车): 三条线都算 Player 线, 但**只有最外层**才算“一命”。
+
+    2026-10-23 实测(IRIS-T SLM): 三台车颜色都是自己黄 → 都被认成观战对象;
+    雷达车那条跨全程, 两台发射车是它里面的短段(在死亡那一刻断掉)。
+    修正功能若把三段当三次命, 会算成“阵亡 3 次”。这里验证 `player_segments`
+    只留最外层那条, 并且 icon 会从 `Player` 更新成真实类别(雷达车)。
+    """
+    from wt81111g import kill_timeline as kt
+    from wt81111g.global_record import GlobalTracker
+
+    rec = GlobalRecord(route_id="g10", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "A", match_radius=0.02, end_gap=0.5)
+
+    def obj(x, icon, color="#faC81E"):
+        """一帧里的原始对象(`feed` 内部按 /map_obj.json 那个形状解析)。"""
+        return {"type": "ground_model", "icon": icon, "color": color, "x": x, "y": 0.3}
+
+    # t=0 雷达车(摄像机在它上面 → Player), t=1 部署发射车1, t=2 部署发射车2
+    # 每帧往前挤一点点 —— 不动就没采样点, 各条线的区间会退化成单点(真实对局里车会动)
+    tr.feed(0.0, [obj(0.300, "Player")])
+    tr.feed(1.0, [obj(0.301, "Radar"), obj(0.400, "SAM")])
+    tr.feed(2.0, [obj(0.302, "Radar"), obj(0.401, "SAM"), obj(0.500, "SAM")])
+    tr.feed(3.0, [obj(0.303, "Radar"), obj(0.402, "SAM"), obj(0.501, "SAM")])
+    tr.feed(4.0, [obj(0.304, "Radar"), obj(0.403, "SAM"), obj(0.502, "SAM")])
+    # 两台发射车在 t=5 同时消失(被连带), 雷达车还在(摄像机挂着它 → 不消失)
+    tr.feed(5.0, [obj(0.305, "Radar")])
+    tr.feed(8.0, [obj(0.308, "Radar")])
+    lives = tr.finish()
+    rec.sides["A"] = list(lives)
+
+    assert len(lives) == 3, [lf.icon for lf in lives]
+    watched = [lf for lf in lives if lf.watched]
+    assert len(watched) == 3, "三台车都是自己黄 → 都被认成观战对象"
+    sam = [lf for lf in lives if lf.icon == "SAM"]
+    assert len(sam) == 2 and all(lf.dead for lf in sam), \
+        "两台发射车消失时应判被击毁: %s" % [(lf.icon, lf.dead) for lf in lives]
+    radar = [lf for lf in lives if lf.icon == "Radar"]
+    assert len(radar) == 1, "雷达车的 icon 应从 Player 更新成 Radar(侧栏才分得清)"
+    assert not radar[0].dead, "摄像机挂着的那条不消失, 不算被击毁"
+
+    segs = kt.player_segments(rec, "A")
+    assert len(segs) == 1, "发射车那两段被雷达车包住 → 只算 1 段: %s" % (
+        [(round(a, 1), round(b, 1)) for _lf, a, b in segs],)
+    assert segs[0][0].icon == "Radar", segs[0][0].icon
+    results.append("分体防空: 三条线各自判死 + 修正只认最外层一段 OK")
+
+
 def test_frame_align():
     """观战玩家上了固定翼 → 8111 切成空战图, 单位坐标整体被缩放/平移。
 
@@ -1354,6 +1402,7 @@ def main() -> int:
     test_tracker_empty_stop()
     test_tracker_dead_flag()
     test_timeline_note()
+    test_split_sam_segments()
     test_frame_align()
     test_store(tmpdir)
     test_map_paint()

@@ -374,12 +374,26 @@ def player_segments(record, side: str) -> list[tuple]:
 
     这些时间段**互不重叠**、且一段只可能有一次他的阵亡 —— 这就是"按昵称认领
     阵亡"的全部依据, 不需要任何静止/停车推断。
+
+    ⚠ 分体防空(雷达车 + 发射车)会打破"一个玩家一条线"(2026-10-23 实测):
+    三台车都是"自己黄", 于是三条线都被认成 Player 线, 而且**时间区间互相包含**
+    (雷达车那条跨全程, 两台发射车是它里面的短段)。这里只保留**不被别的段包含**
+    的那些(最外层), 即"摄像机挂着的那条/那几条" —— 发射车线本来就死得准(它们
+    消失时确实死了), 不需要修正; 需要修死亡时刻的只有摄像机那条。
     """
-    out = []
+    segs = []
     for life in sorted(player_lines(record, side),
                        key=lambda lf: raw_points(lf)[0].t):
         pts = raw_points(life)
-        out.append((life, pts[0].t, pts[-1].t))
+        segs.append((life, pts[0].t, pts[-1].t))
+    out: list[tuple] = []
+    best_t1 = float("-inf")
+    for life, t0, t1 in segs:
+        if t1 <= best_t1:
+            # 整段落在前面某条更长的段里(分体防空的发射车) → 不算一次“新的一命”
+            continue
+        out.append((life, t0, t1))
+        best_t1 = t1
     return out
 
 

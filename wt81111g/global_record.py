@@ -713,6 +713,12 @@ class GlobalTracker:
             # 摄像机可能中途才切到他(或 8111 中途才把 icon 改成 Player) —— 一旦认到
             # 就不再清除: 这条线是不是“观战对象”是个回溯性的事实。
             lv.life.watched = True
+        # icon 会变: 摄像机在上面的那台报 `Player`, 视角切走就报它真实的类别。
+        # 首帧往往是 `Player`, 直接留着的话侧栏三条线全叫 “Player”, 分不清
+        # 雷达车/发射车(分体防空, 2026-10-23)。所以记住**第一个非 Player 的类别**。
+        if u.icon and u.icon.lower() != "player" and \
+                (lv.life.icon or "").lower() in ("", "player"):
+            lv.life.icon = u.icon
         moved = math.hypot(u.x - lv.last_x, u.y - lv.last_y)
         if moved < MIN_MOVE:
             # 一动不动: 只保留偶尔的心跳点(“在这儿停了 5 分钟”也要留痕)
