@@ -263,6 +263,37 @@ def test_split_sam_segments():
     results.append("分体防空: 三条线各自判死 + 修正只认最外层一段 OK")
 
 
+def test_mark_and_stationary_end():
+    """两件小事:
+
+    1. **A/B 队录制标记不落盘**(用户 2026-10-23): 它只是“下次点录制录到哪一条”的
+       临时指向, 关掉软件就该忘掉; 旧文件里存着的一律忽略。
+    2. **静止车的线尾 = 最后一次见到它的时刻**(不是最后一次心跳)。采样只在移动/每
+       15 秒心跳时存点, 否则“一直停着的车”的线会比真实消失早最多 15 秒 ——
+       实测两台同时被毁的发射车因此差了 9 秒。
+    """
+    rec = GlobalRecord(route_id="g11", map_key="M", map_name="地图", created_at="")
+    rec.marks = ["A"]
+    data = rec.to_json()
+    assert "marks" not in data, "标记不该写进 routes.json"
+    back = GlobalRecord.from_json({**data, "marks": ["B"]})
+    assert back is not None and back.marks == [], "旧文件里的标记也要忽略"
+
+    rec2 = GlobalRecord(route_id="g12", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec2, "A")
+    tank = lambda: {"type": "ground_model", "icon": "MediumTank",
+                    "color": "#174DFF", "x": 0.3, "y": 0.3}
+    t = 0.0
+    while t <= 12.0:                    # 一动不动地待 12 秒(小于 HEARTBEAT=15)
+        tr.feed(t, [tank()])
+        t = round(t + 0.2, 2)
+    lives = tr.finish()
+    assert len(lives) == 1
+    assert abs(lives[0].t1 - 12.0) < 0.25, \
+        "静止车的线尾应补到最后一次见到的时刻, 实际 %.2f" % lives[0].t1
+    results.append("A/B 标记不落盘 + 静止车的线尾补到消失时刻 OK")
+
+
 def test_frame_align():
     """观战玩家上了固定翼 → 8111 切成空战图, 单位坐标整体被缩放/平移。
 
@@ -1403,6 +1434,7 @@ def main() -> int:
     test_tracker_dead_flag()
     test_timeline_note()
     test_split_sam_segments()
+    test_mark_and_stationary_end()
     test_frame_align()
     test_store(tmpdir)
     test_map_paint()

@@ -855,13 +855,23 @@ class RouteRecorder(QObject):
             log.warning("全局录制: 读取 hudmsg 增量失败: %s", exc)
             return 0
         if not rows:
+            log.info("全局录制: hudmsg 本轮无新增(游标 %d)", self._hud_cursor)
             return 0
         new = [r for r in rows if kill_timeline.is_death_msg(r["msg"])]
         rec.kills.extend(new)
         rec.kills = kill_timeline.merge_kills(rec)
         try:
-            self._hud_cursor = max(self._hud_cursor,
-                                   max(int(k.get("id") or 0) for k in rows))
+            ids = [int(r.get("id") or 0) for r in rows]
+            lo = min(ids)
+            if lo > self._hud_cursor + 60:
+                # 环形缓冲区在我们两次轮询之间滚掉了这么多条 —— 中间的阵亡会丢,
+                # 死亡时刻修正就少数据(2026-10-23 西奈半岛那局只采到 11 条就是这样)
+                log.warning("全局录制: hudmsg 的 id 跳跃 %d -> %d(中间 %d 条没拿到, "
+                            "环形缓冲区可能已滚动)", self._hud_cursor, lo,
+                            lo - self._hud_cursor)
+            log.info("全局录制: hudmsg 增量 %d 条(其中阵亡 %d 条), 游标 %d -> %d",
+                     len(rows), len(new), self._hud_cursor, max(ids))
+            self._hud_cursor = max(self._hud_cursor, max(ids))
         except ValueError:
             pass
         return len(new)

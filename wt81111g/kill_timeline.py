@@ -413,8 +413,10 @@ def resolve_side(record, side: str, name: str, shift: float, hits: int,
         row["note"] = "这一队没有观战玩家的线路(icon=Player), 不用修正"
         return row
     deaths = (stats.get(name) or {}).get("deaths") or []
+    total_kills = len(getattr(record, "kills", None) or [])
     if not deaths:
-        row["note"] = "本局没有这位玩家的阵亡记录"
+        row["note"] = ("本局没有这位玩家的阵亡记录"
+                       "(本局共采到 %d 条击毁消息 —— 没有就是没采到)" % total_kills)
         return row
     for life, t0, t1 in segs:
         hit = deaths_in(deaths, shift, t0, t1)
@@ -428,7 +430,9 @@ def resolve_side(record, side: str, name: str, shift: float, hits: int,
             fix["note"] = ("阵亡 %.1fs, 这条线之后还上报了 %.1fs 残骸"
                            % (death, fix["tail"]))
         else:
-            fix["note"] = "这一段没有他的阵亡 → 他在这段活到结束"
+            live = max(0.0, t1 - t0)
+            fix["note"] = ("这一段没有他的阵亡记录(%.0fs, 本局共采到 %d 条击毁) "
+                           "→ 要么没采全, 要么他真的没死" % (live, total_kills))
         row["fixes"].append(fix)
     fixed = [f for f in row["fixes"] if f["ok"]]
     # “像不像观战对象”: **每一条命(每一段)都有他的阵亡** —— 他只有死了才会重生、

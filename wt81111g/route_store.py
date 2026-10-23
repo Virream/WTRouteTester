@@ -474,7 +474,9 @@ class GlobalRecord:
             "zone_signature": self.zone_signature,
             "mode_name": self.mode_name,
             "duration": self.duration,
-            "marks": list(self.marks),
+            # `marks`(A/B 队录制目标)**故意不落盘**(用户 2026-10-23 要求):
+            # 它只是个“下次点录制录到哪一条”的临时指向, 关掉软件就该忘掉;
+            # 写进 routes.json 会让人第二天莫名其妙地录到旧的条目上。
             "zone_states": self.zone_states,
             "kills": self.kills,
             "watchers": dict(self.watchers),
@@ -495,8 +497,7 @@ class GlobalRecord:
                 zone_signature=str(data.get("zone_signature") or ""),
                 mode_name=str(data.get("mode_name") or ""),
                 duration=float(data.get("duration") or 0.0),
-                marks=[str(m) for m in (data.get("marks") or [])
-                       if str(m) in GLOBAL_SIDES],
+                # 旧文件里可能还存着 marks —— 一律忽略(标记不跨会话保留)
                 watchers={str(k): str(v) for k, v in
                           (data.get("watchers") or {}).items()
                           if str(k) in GLOBAL_SIDES and str(v or "").strip()},
@@ -923,7 +924,11 @@ class RouteStore:
         return None
 
     def set_mark(self, gid: str, side: str, on: bool) -> None:
-        """给条目打/清标记。**同一队只会有一条**记录带标记 —— 打新标记时清掉旧条目上的。"""
+        """给条目打/清标记。**同一队只会有一条**记录带标记 —— 打新标记时清掉旧条目上的。
+
+        标记**只存在内存里**(不落盘, 见 `to_json`): 它是“下次点录制录到哪一条”的
+        临时指向, 关掉软件就该忘掉。
+        """
         if side not in GLOBAL_SIDES:
             return
         with self._lock:
@@ -939,7 +944,6 @@ class RouteStore:
                 elif not on and side in target.marks:
                     target.marks.remove(side)
                 target.marks.sort(key=GLOBAL_SIDES.index)
-        self.save()
 
     def clear_marks(self, gid: str) -> None:
         """清掉某个条目的全部标记(右键「清除标记」)。"""
@@ -947,7 +951,6 @@ class RouteStore:
             target = self.get_global(gid)
             if target is not None:
                 target.marks.clear()
-        self.save()
 
     def set_fixed(self, gid: str, value: bool) -> None:
         """改“死亡时刻是否已确认” —— `False` 时侧栏条目上会挂一个黄色感叹号。"""

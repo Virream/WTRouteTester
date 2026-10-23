@@ -669,13 +669,22 @@ class GlobalTracker:
                      last_x=u.x, last_y=u.y)
 
     def _close(self, lv: _Live, dead: bool = False) -> None:
-        """收尾一条线: 记下“是否被击毁”, 并补上最后一个已知位置(若与已存的点不同)。"""
+        """收尾一条线: 记下“是否被击毁”, 并补上最后一个已知位置(若与已存的点不同)。
+
+        ⚠ **静止的车也必须补这一点**(2026-10-23 修): 采样只在移动时存点、静止时每
+        15 秒补一个心跳点, 所以“一直停着的车”的最后一点可能是它消失前 15 秒的位置 ——
+        于是线的结束时刻比真实消失早最多 15 秒。实测(分体防空那一局)两台同时被毁的
+        发射车, 一条结束在 307.5s、另一条在 316.6s, 差 9 秒就是这么来的。
+        这里无条件把“最后一帧见到它的时刻”补成终点, 位置相同也不要紧(只是多一个点)。
+        """
         lv.life.dead = bool(dead)
-        if lv.life.points:
-            last = lv.life.points[-1]
-            if math.hypot(lv.x - last.x, lv.y - last.y) > 1e-9:
-                lv.life.points.append(TrackPoint(x=lv.x, y=lv.y, t=lv.last_seen,
-                                                 speed=last.speed))
+        if not lv.life.points:
+            return
+        last = lv.life.points[-1]
+        if abs(last.t - lv.last_seen) < 1e-9:
+            return
+        lv.life.points.append(TrackPoint(x=lv.x, y=lv.y, t=lv.last_seen,
+                                         speed=last.speed))
 
     def _match(self, t: float, units: list[Unit]) -> None:
         """帧间最近邻 + 贪心匹配(先按距离排序, 短的先配)。"""
