@@ -5,7 +5,10 @@
 地图身份只能靠图片哈希。所以这里让用户把哈希对应成看得懂的名字,
 名字存进 `RouteStore.map_names`, 左侧侧栏会立刻显示这个名字。
 
-列表列: 预览 / 名称 / 图片大小 / 轨迹数 / 首次缓存时间
+列表列: 预览 / 名称 / 隐藏 / 图片大小 / 轨迹数 / 首次缓存时间
+
+「隐藏」勾上去只是**不在左侧列表里显示**这张地图 —— 轨迹、名称、缓存图片全部保留,
+用来看空战之类永远用不到的图(它们也会被当成“新地图”收进来)。
 
 名称改在窗口顶部固定的「地图名称」输入框里 —— 表格内部**完全禁止编辑**。
 之前用“双击单元格就地编辑”, 编辑器会落在图片所在的那一格里被缩略图盖住
@@ -34,6 +37,9 @@ log = logging.getLogger("map_manager")
 _THUMB = 84          # 预览缩略图边长(px)
 _NAME_COL_W = 300    # “名称”列宽度(必须给足, 否则编辑框会压在预览图上)
 
+# 列号
+COL_PREVIEW, COL_NAME, COL_HIDDEN, COL_SIZE, COL_COUNT, COL_WHEN = range(6)
+
 
 class MapManagerDialog(QDialog):
     """缓存地图管理(命名 / 预览 / 删除缓存图片)。"""
@@ -54,6 +60,8 @@ class MapManagerDialog(QDialog):
             "8111 不提供地图名, 所以这里用「图片内容哈希」区分地图。\n"
             "改名字的步骤: 先在下面的列表里**选中一张地图**, 再在顶部「地图名称」框里输入,\n"
             "按回车(或点「保存名称」)立即生效 —— 表格里的名字只是显示, 不用双击去改。\n"
+            "勾上「隐藏」= 这张地图不在左侧列表里显示(只用得到的地图就看得到了): "
+            "轨迹、名称、缓存图片都不会被删, 随时取消勾选就能恢复。\n"
             "名称会显示在左侧列表, 也会写进已录制的轨迹记录; 缓存图片在 data/maps 下,"
             "同一张图只存一份; 删除图片不会删除轨迹记录。")
         tip.setWordWrap(True)
@@ -79,8 +87,9 @@ class MapManagerDialog(QDialog):
         name_row.addWidget(self.btn_apply)
         root.addLayout(name_row)
 
-        self.table = QTableWidget(0, 5, self)
-        self.table.setHorizontalHeaderLabels(["预览", "名称", "图片", "轨迹", "首次缓存"])
+        self.table = QTableWidget(0, 6, self)
+        self.table.setHorizontalHeaderLabels(
+            ["预览", "名称", "隐藏", "图片", "轨迹", "首次缓存"])
         self.table.verticalHeader().setVisible(False)
         self.table.setIconSize(QSize(_THUMB, _THUMB))
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -89,17 +98,21 @@ class MapManagerDialog(QDialog):
         # 会在图片格上叠一个输入框(被缩略图盖住, 只剩左右两条竖线)。
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        # 「隐藏」列的勾选框: 点一下立即落盘(与改名一样不需要点保存)
+        self.table.itemChanged.connect(self._on_item_changed)
         self._loading = False
         self._cur_key: str | None = None     # 名称输入框当前对应的地图
         # 列宽: 预览固定; 名称列伸缩; 其余按内容。
         head = self.table.horizontalHeader()
         head.setStretchLastSection(False)
-        head.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        head.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for col in (2, 3, 4):
+        head.setSectionResizeMode(COL_PREVIEW, QHeaderView.ResizeMode.Fixed)
+        head.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
+        head.setSectionResizeMode(COL_HIDDEN, QHeaderView.ResizeMode.Fixed)
+        for col in (COL_SIZE, COL_COUNT, COL_WHEN):
             head.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.setColumnWidth(0, _THUMB + 16)
-        self.setMinimumWidth(_THUMB + 16 + _NAME_COL_W + 300)
+        self.table.setColumnWidth(COL_PREVIEW, _THUMB + 16)
+        self.table.setColumnWidth(COL_HIDDEN, 60)
+        self.setMinimumWidth(_THUMB + 16 + _NAME_COL_W + 380)
         root.addWidget(self.table, 1)
 
         self.lbl_summary = QLabel("")
@@ -138,17 +151,25 @@ class MapManagerDialog(QDialog):
                 self._add_row(entry)
         finally:
             self._loading = False
+        self._update_summary()
+        if self.table.rowCount() and self.table.currentRow() < 0:
+            self.table.setCurrentCell(0, 0)      # 默认选中第一张, 输入框直接可用
+        self._on_selection_changed()
+
+    def _update_summary(self) -> None:
+        """底部汇总: 缓存张数 + 占用 + 隐藏了几张。"""
+        entries = self.cache.entries()
         missing = [k for k in self.store.ordered_map_keys() if not self.cache.has(k)]
+        hidden = sum(1 for e in entries if self.store.is_map_hidden(e.key))
         extra = ""
         if missing:
-            extra = (f"    另有 {len(missing)} 张地图只有轨迹、没有缓存图片"
-                     f"(未在游戏里再进过该图时无法显示底图)")
+            extra += (f"    另有 {len(missing)} 张地图只有轨迹、没有缓存图片"
+                      f"(未在游戏里再进过该图时无法显示底图)")
+        if hidden:
+            extra += f"    已隐藏 {hidden} 张(不在左侧列表显示)"
         self.lbl_summary.setText(
             f"共 {len(entries)} 张缓存地图, 合计 "
             f"{self.cache.total_bytes() / 1024.0 / 1024.0:.1f} MB{extra}")
-        if entries and self.table.currentRow() < 0:
-            self.table.setCurrentCell(0, 0)      # 默认选中第一张, 输入框直接可用
-        self._on_selection_changed()
 
     def _add_row(self, entry: MapEntry) -> None:
         row = self.table.rowCount()
@@ -165,39 +186,54 @@ class MapManagerDialog(QDialog):
                                           Qt.TransformationMode.SmoothTransformation)))
         thumb.setData(Qt.ItemDataRole.UserRole, entry.key)
         thumb.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-        self.table.setItem(row, 0, thumb)
+        self.table.setItem(row, COL_PREVIEW, thumb)
 
         name = QTableWidgetItem()          # 只显示, 编辑在顶部输入框里做
         name.setData(Qt.ItemDataRole.UserRole, entry.key)
         name.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-        self.table.setItem(row, 1, name)
+        self.table.setItem(row, COL_NAME, name)
         self._update_name_cell(entry.key)
+
+        # 隐藏: 勾上就不在左侧列表显示(空战地图之类永远用不到的图)
+        hide = QTableWidgetItem()
+        hide.setData(Qt.ItemDataRole.UserRole, entry.key)
+        hide.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        hide.setCheckState(Qt.CheckState.Checked if self.store.is_map_hidden(entry.key)
+                           else Qt.CheckState.Unchecked)
+        hide.setToolTip("勾上 = 不在左侧列表里显示这张地图\n"
+                        "轨迹/名称/缓存图片都不会删, 取消勾选就回来")
+        self.table.setItem(row, COL_HIDDEN, hide)
 
         size = QTableWidgetItem(f"{entry.size_text}  {_image_size_text(entry.path)}")
         size.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        self.table.setItem(row, 2, size)
+        self.table.setItem(row, COL_SIZE, size)
 
         count = QTableWidgetItem(str(sum(1 for r in self.store.routes
                                          if r.map_key == entry.key)))
         count.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        self.table.setItem(row, 3, count)
+        self.table.setItem(row, COL_COUNT, count)
 
         when = QTableWidgetItem(entry.saved_at_text)
         when.setFlags(Qt.ItemFlag.ItemIsEnabled)
         when.setToolTip(f"地图键: {entry.key}")
-        self.table.setItem(row, 4, when)
+        self.table.setItem(row, COL_WHEN, when)
 
     def _update_name_cell(self, key: str) -> None:
-        """把「名称」列刷新成当前真实值(没名字显示灰色“未命名”)。"""
+        """把「名称」列刷新成当前真实值(没名字显示灰色“未命名”, 隐藏的加个标记)。"""
         for r in range(self.table.rowCount()):
-            it = self.table.item(r, 1)
+            it = self.table.item(r, COL_NAME)
             if it is None or it.data(Qt.ItemDataRole.UserRole) != key:
                 continue
             name = self.store.name_of(key)
-            it.setText(name or "未命名")
-            it.setForeground(QBrush() if name else QBrush(Qt.GlobalColor.gray))
+            hidden = self.store.is_map_hidden(key)
+            it.setText((name or "未命名") + ("  (已隐藏)" if hidden else ""))
+            it.setForeground(QBrush(Qt.GlobalColor.gray)
+                             if hidden or not name else QBrush())
             default = self.store.display_name(key)
-            it.setToolTip(f"地图键: {key}\n留空则按顺序自动编号为「{default}」")
+            tip = f"地图键: {key}\n留空则按顺序自动编号为「{default}」"
+            if hidden:
+                tip += "\n(已勾选「隐藏」: 不在左侧列表显示)"
+            it.setToolTip(tip)
             return
 
     # ------------------------------------------------------------------ 操作
@@ -239,11 +275,26 @@ class MapManagerDialog(QDialog):
             f"已保存: {shown}(第 {self.renamed} 次修改, 左侧列表已同步)")
         log.info("地图管理: 重命名 %s -> %r", key, new)
 
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        """「隐藏」列被点了一下 → 立即落盘(不关窗口, 左侧列表随后刷新)。"""
+        if self._loading or item.column() != COL_HIDDEN:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if not key:
+            return
+        hidden = item.checkState() == Qt.CheckState.Checked
+        if hidden == self.store.is_map_hidden(key):
+            return
+        self.store.set_map_hidden(key, hidden)
+        self._update_name_cell(key)
+        self._update_summary()
+        log.info("地图管理: %s %r", "隐藏" if hidden else "取消隐藏", key)
+
     def _current_key(self) -> str | None:
         row = self.table.currentRow()
         if row < 0:
             return None
-        item = self.table.item(row, 0)
+        item = self.table.item(row, COL_PREVIEW)
         return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
 
     def _open_dir(self) -> None:

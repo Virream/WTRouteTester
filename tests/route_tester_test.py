@@ -2403,7 +2403,11 @@ def test_map_manager(tmpdir: str):
     dlg = MapManagerDialog(win.store, win.map_cache, win)
     assert dlg.table.rowCount() == 1, "地图管理应列出缓存的地图"
     assert dlg.table.item(0, 0).data(Qt.ItemDataRole.UserRole) == key
-    assert dlg.table.item(0, 3).text() == "1"        # 该图的轨迹数
+    assert dlg.table.item(0, 4).text() == "1"        # 该图的轨迹数(第 5 列)
+    # 表头必须有「隐藏」列(空战地图永远用不到, 只会碍事)
+    heads = [dlg.table.horizontalHeaderItem(c).text()
+             for c in range(dlg.table.columnCount())]
+    assert "隐藏" in heads, heads
     # 表格里一律不许就地编辑(以前双击图片会在图片格里弹出输入框)
     assert dlg.table.editTriggers() == QAbstractItemView.EditTrigger.NoEditTriggers
     assert not (dlg.table.model().flags(dlg.table.model().index(0, 0))
@@ -2427,6 +2431,32 @@ def test_map_manager(tmpdir: str):
     again = RouteStore(os.path.join(tmpdir, "manager.json"))
     assert again.name_of(key) == "诺曼底"
     assert key in again.known_maps
+
+    # 「隐藏」列: 勾上后左侧列表不再显示这张地图, 但轨迹/名称/缓存图片都在
+    hide_item = dlg.table.item(0, 2)
+    assert hide_item.flags() & Qt.ItemFlag.ItemIsUserCheckable, "隐藏列要可勾选"
+    assert hide_item.checkState() == Qt.CheckState.Unchecked
+    hide_item.setCheckState(Qt.CheckState.Checked)
+    app.processEvents()
+    assert win.store.is_map_hidden(key), "勾选后应立即可查"
+    assert dlg.table.item(0, 1).text().endswith("(已隐藏)"), dlg.table.item(0, 1).text()
+    win._reload_tree()
+    app.processEvents()
+    assert win.tree.topLevelItemCount() == 0, "隐藏的地图不该占侧栏一行"
+    assert win.store.get(rec.route_id) is not None, "隐藏不能删轨迹"
+    assert win.map_cache.has(key), "隐藏不能删缓存图片"
+    # 落盘: 重建 store 后隐藏标记仍在(下次启动不会再冒出来)
+    persisted = RouteStore(os.path.join(tmpdir, "manager.json"))
+    assert persisted.is_map_hidden(key)
+    assert persisted.name_of(key) == "诺曼底"
+    # 取消勾选 → 侧栏恢复
+    hide_item.setCheckState(Qt.CheckState.Unchecked)
+    app.processEvents()
+    assert not win.store.is_map_hidden(key)
+    win._reload_tree()
+    app.processEvents()
+    assert win.tree.topLevelItemCount() == 1
+    results.append("地图管理: 「隐藏」勾选 → 侧栏不显示/落盘/不删数据/取消后恢复 OK")
     dlg.close()
     win.close()
     results.append("地图管理(缓存列表/命名/落盘/菜单栏) OK")

@@ -24,6 +24,7 @@
 {
   "version": 1,
   "map_names": {"<地图指纹>": "地图名"},
+  "hidden_maps": ["<地图指纹>", ...],
   "layout_names": {"<地图指纹>": {"<战区坐标串>": "版本名"}},
   "known_maps": ["<地图指纹>", ...],
   "map_zones": {"<地图指纹>": [{"sig": .., "count": .., "mode": ..,
@@ -752,6 +753,9 @@ class RouteStore:
         self.path = path or os.path.join(data_dir(), "routes.json")
         self._lock = threading.RLock()
         self.map_names: dict[str, str] = {}
+        # 用户在「地图管理」里勾了“隐藏”的地图: 只是**不在左侧列表里显示**,
+        # 轨迹数据/名称/缓存图片都不动(空战地图永迹不会用到, 留着只碍事)
+        self.hidden_maps: list[str] = []
         # 用户给“模式版本(战区布局)”起的名字: {地图键: {战区坐标串: 名字}}
         self.layout_names: dict[str, dict[str, str]] = {}
         # 见过的地图键(含**只缓存了图片、还没录过轨迹**的地图):
@@ -774,6 +778,9 @@ class RouteStore:
             names = data.get("map_names")
             if isinstance(names, dict):
                 self.map_names = {str(k): str(v) for k, v in names.items()}
+            hidden = data.get("hidden_maps")
+            if isinstance(hidden, list):
+                self.hidden_maps = [str(k) for k in hidden if str(k)]
             known = data.get("known_maps")
             if isinstance(known, list):
                 self.known_maps = [str(k) for k in known if str(k)]
@@ -860,6 +867,7 @@ class RouteStore:
             payload = {
                 "version": 1,
                 "map_names": self.map_names,
+                "hidden_maps": self.hidden_maps,
                 "layout_names": self.layout_names,
                 "known_maps": self.ordered_map_keys(),
                 "map_zones": self.map_zones,
@@ -1123,6 +1131,24 @@ class RouteStore:
                     r.map_name = self.map_names[map_key]
         self.save()
 
+    def is_map_hidden(self, map_key: str) -> bool:
+        """这张地图是否被用户在「地图管理」里勾了“隐藏”。"""
+        return map_key in self.hidden_maps
+
+    def set_map_hidden(self, map_key: str, hidden: bool) -> None:
+        """勾选/取消“隐藏”。**只影响左侧列表**, 轨迹与缓存图片都不动。"""
+        if not map_key:
+            return
+        with self._lock:
+            if hidden:
+                if map_key not in self.hidden_maps:
+                    self.hidden_maps.append(map_key)
+            else:
+                while map_key in self.hidden_maps:
+                    self.hidden_maps.remove(map_key)
+        self.save()
+        log.info("地图管理: %s %s", "隐藏" if hidden else "取消隐藏", map_key)
+
     def merge_map_keys(self, keep: str, drop: str) -> bool:
         """把 `drop` 这张地图的全部数据并到 `keep` 上, 并删掉 `drop` 条目。
 
@@ -1163,6 +1189,12 @@ class RouteStore:
             if not self.name_of(keep) and self.name_of(drop):
                 self.map_names[keep] = self.map_names[drop]
             self.map_names.pop(drop, None)
+            # 隐藏标记也是“同一张图”的属性: 任一被隐藏则合并后仍隐藏
+            was_hidden = (drop in self.hidden_maps) or (keep in self.hidden_maps)
+            while drop in self.hidden_maps:
+                self.hidden_maps.remove(drop)
+            if was_hidden and keep not in self.hidden_maps:
+                self.hidden_maps.append(keep)
             # 战区布局: 按指纹合并(同一布局只留一份, 取较新的 seen_at)
             merged: dict[str, dict] = {}
             for layout in (self.map_zones.get(keep) or []) + (self.map_zones.get(drop) or []):

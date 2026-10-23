@@ -629,11 +629,14 @@ class RouteTesterWindow(QMainWindow):
         dlg = MapManagerDialog(self.store, self.map_cache, self)
         dlg.exec()
         self._reload_tree()
+        hidden = sum(1 for k in self.store.ordered_map_keys()
+                     if self.store.is_map_hidden(k))
+        tail = f", 已隐藏 {hidden} 张" if hidden else ""
         if dlg.renamed:
-            self._set_status(f"已保存 {dlg.renamed} 处地图名称改动(左侧列表已同步)",
+            self._set_status(f"已保存 {dlg.renamed} 处地图名称改动(左侧列表已同步{tail})",
                              sticky=3.0)
         else:
-            self._set_status("地图管理已关闭(名称改动会立即保存)", sticky=2.0)
+            self._set_status(f"地图管理已关闭(名称/隐藏改动都会立即保存{tail})", sticky=2.0)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -950,6 +953,8 @@ class RouteTesterWindow(QMainWindow):
         glob = self.store.globals_by_group()
         out: list[tuple[str, list[tuple[str, list[tuple[str, str, list, list]]]]]] = []
         for key in self.store.ordered_map_keys():
+            if self.store.is_map_hidden(key):
+                continue                     # 用户在「地图管理」里勾了隐藏
             modes: list[tuple[str, list[tuple[str, str, list, list]]]] = []
             used: set[str] = set()
             for mode_label, variants in routes.get(key, []):
@@ -1117,6 +1122,8 @@ class RouteTesterWindow(QMainWindow):
         for map_key in self.store.ordered_map_keys():
             if map_key in listed or not self.map_cache.has(map_key):
                 continue
+            if self.store.is_map_hidden(map_key):
+                continue                     # 勾了隐藏的不占侧栏
             top = QTreeWidgetItem(["", self.store.display_name(map_key), "仅缓存"])
             top.setData(0, _ROLE_KIND, "map")
             top.setData(0, _ROLE_ID, map_key)
