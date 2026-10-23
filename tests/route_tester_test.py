@@ -1722,7 +1722,8 @@ def test_playback_lock(tmpdir: str):
     assert win.tree.isEnabled() is False, "回放中侧栏(眼睛)应禁用"
     assert win.btn_start.isEnabled() is False
     assert win.chk_start_on_move.isEnabled() is False
-    assert win.cmb_rate.isEnabled() is False
+    assert not any(a.isEnabled() for a in win._rate_actions), \
+        "回放中采样间隔菜单也应当禁用"
     assert win.btn_play_stop.isEnabled() is True
 
     # 回放中直接调用眼睛点击入口也应被拒绝(防止绕过 UI 禁用)
@@ -1748,7 +1749,8 @@ def test_playback_lock(tmpdir: str):
     assert win.map_view.playback_records == []
     assert len(win.map_view.visible_tracks) == 2, "退出回放后应恢复显示点亮的轨迹"
     assert win.tree.isEnabled() and win.btn_start.isEnabled()
-    assert win.chk_start_on_move.isEnabled() and win.cmb_rate.isEnabled()
+    assert win.chk_start_on_move.isEnabled()
+    assert all(a.isEnabled() for a in win._rate_actions), "退出回放后采样间隔菜单应解锁"
     assert win.btn_play_stop.isEnabled() is False
 
     # 解锁后眼睛又能用了
@@ -1756,6 +1758,49 @@ def test_playback_lock(tmpdir: str):
     assert len(win.map_view.visible_tracks) == 1
     win.close()
     results.append("回放锁定其余功能 + 结束播放解锁 OK")
+
+
+def test_rate_menu(tmpdir: str):
+    """采样间隔收进菜单「设置」(2026-10-23 用户要求): 主界面不再有下拉框。
+
+    原话: “采样设置似乎不应该让用户经常改, 最好是定在一个合适的数值, 现在这项功能
+    在主界面太显眼, 用户可能没事干就会调得过高或过低导致 bug”。
+    所以这里同时断言: 默认就是 40 ms、菜单只勾一项、改动立即生效、非法值能归一。
+    """
+    from wt81111g.route_window import INTERVAL_CHOICES_MS, rate_choice_ms
+
+    assert int(rw.DEFAULT_INTERVAL_MS) in INTERVAL_CHOICES_MS
+    assert rate_choice_ms(0) == INTERVAL_CHOICES_MS[0]
+    assert rate_choice_ms(9999) == INTERVAL_CHOICES_MS[-1]
+    assert rate_choice_ms(None) == int(rw.DEFAULT_INTERVAL_MS)
+    assert rate_choice_ms(33) in (30, 40), rate_choice_ms(33)
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "rate.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.show()
+    app.processEvents()
+    try:
+        assert not hasattr(win, "cmb_rate"), "主界面不应再有采样间隔下拉框"
+        acts = win._rate_actions
+        assert len(acts) == len(INTERVAL_CHOICES_MS), len(acts)
+        checked = [a.text() for a in acts if a.isChecked()]
+        assert len(checked) == 1, checked
+        # QSettings 可能被上一次运行改过 —— 勾選的那项必须与 recorder 的实际值一致
+        assert checked[0].startswith(f"{int(win.recorder.target_interval_ms())} ms"), \
+            (checked, win.recorder.target_interval_ms())
+
+        win._set_rate_ms(75)
+        assert abs(win.recorder.target_interval_ms() - 75.0) < 1e-6, \
+            win.recorder.target_interval_ms()
+        checked = [a.text() for a in acts if a.isChecked()]
+        assert len(checked) == 1 and checked[0].startswith("75 ms"), checked
+        assert "75" in win.lbl_status.text(), win.lbl_status.text()
+    finally:
+        win._set_rate_ms(int(rw.DEFAULT_INTERVAL_MS))   # 别把用户设置留在测试值上
+        win.close()
+    results.append("采样间隔在菜单「设置」里(默认 40ms / 改动生效 / 主界面无下拉框) OK")
 
 
 def test_sound(tmpdir: str):
@@ -3333,6 +3378,7 @@ def main() -> int:
     test_map_switch(tmpdir)
     test_eye_visibility_opacity(tmpdir)
     test_playback_lock(tmpdir)
+    test_rate_menu(tmpdir)
     test_recording_end_eye(tmpdir)
     test_record_overlay(tmpdir)
     test_playback_source_selection(tmpdir)

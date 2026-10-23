@@ -82,8 +82,22 @@ def _create_map_view(parent) -> RouteMapView:
 
 
 # 采样间隔选项(毫秒):
-# 40ms(≈25Hz)与 8111 陆战数据更新率匹配; 20ms(≈50Hz)接近 8111 请求上限
+# 40ms(≈25Hz)与 8111 陆战数据更新率匹配; 20ms(≈50Hz)接近 8111 请求上限。
+#
+# **这不是一个该让用户随时调的东西**(2026-10-23 用户意见): 调得太小会把 8111
+# 轮询推到上限、调得太大轨迹会变稀疏出怪结果。所以它从信息区下拉框收进了
+# 菜单「设置 → 采样间隔」, 主界面只留一个很小的只读频率提示。
+# 单条录制与全局录制**共用**同一个值(两者就是同一个轮询线程)。
 INTERVAL_CHOICES_MS = (20, 25, 30, 40, 50, 75, 100)
+
+
+def rate_choice_ms(ms) -> int:
+    """把任意毫秒值归一成选项里的一个(取最接近的), 默认 40。"""
+    try:
+        value = float(ms)
+    except (TypeError, ValueError):
+        return int(DEFAULT_INTERVAL_MS)
+    return int(min(INTERVAL_CHOICES_MS, key=lambda x: abs(x - value)))
 
 _ROLE_KIND = Qt.ItemDataRole.UserRole
 _ROLE_ID = Qt.ItemDataRole.UserRole + 1
@@ -147,12 +161,14 @@ class RouteTesterWindow(QMainWindow):
         # “粘性状态栏文字”: 提示类信息(回放开始/结束、显示切换…)在若干秒内不被刷新覆盖
         self._sticky_text = ""
         self._sticky_until = 0.0
-        # 采样间隔(毫秒, 默认 40ms ≈ 25Hz)持久化(PyQt 自带的 QSettings)
+        # 采样间隔(毫秒, 默认 40ms ≈ 25Hz)持久化(PyQt 自带的 QSettings)。
+        # 入口在菜单「设置 → 采样间隔」—— 主界面不再放这个下拉框(見上方常量注释)。
         self._settings = QSettings("WTBlackList", "RouteTester")
         try:
             self._saved_ms = int(self._settings.value("interval_ms", DEFAULT_INTERVAL_MS))
         except (TypeError, ValueError):
             self._saved_ms = int(DEFAULT_INTERVAL_MS)
+        self._saved_ms = rate_choice_ms(self._saved_ms)
         # “以速度从零变化时刻作为起始时间点”是**非默认开启**的功能: 每次启动都不勾选。
         # 不写入 QSettings —— 否则上次勾选的状态会被带到下次启动, 看起来就像默认开启。
         self._saved_on_move = False
@@ -224,7 +240,7 @@ class RouteTesterWindow(QMainWindow):
         if start_recorder:
             self.recorder.start()
         self.recorder.set_interval_ms(self._saved_ms)
-        self.lbl_rate.setText(f"目标 {self._saved_ms} ms")
+        self.lbl_rate.setText(f"轮询 {1000 // int(self._saved_ms)} Hz")
 
         # 轨迹回放(按倍速推进 playhead)
         self.player = RoutePlayer(parent=self)
@@ -294,6 +310,38 @@ class RouteTesterWindow(QMainWindow):
             "战局外/看缓存底图时, 画的是这张地图这个版本以前记下的重生位置。")
         self.act_spawns.toggled.connect(self._on_show_spawns)
         setting.addAction(self.act_spawns)
+
+        # ---- 采样间隔: 从信息区挪到菜单(2026-10-23)。
+        # 用户口径: “采样设置不该让用户经常改, 最好是定在一个合适的数值, 现在这项功能
+        # 在主界面太显眼, 用户可能没事干就会调得过高或过低导致 bug。”
+        # 所以: 菜单里是一组互斥单选项(默认 40 ms), 并直接写一行“一般不用改”。
+        setting.addSeparator()
+        rate_menu = setting.addMenu("采样间隔(&R)")
+        rate_menu.setToolTip(
+            "8111 轮询与轨迹采样共用的间隔(单条录制与全局录制是同一个值)。\n"
+            "一般不用改: 40 ms(25 Hz)与 8111 陆战数据的更新率一致。")
+        self._rate_group = QActionGroup(self)
+        self._rate_group.setExclusive(True)
+        self._rate_actions: list[QAction] = []
+        for ms in INTERVAL_CHOICES_MS:
+            act = QAction(f"{ms} ms({1000 // ms} Hz)", self)
+            act.setCheckable(True)
+            act.setChecked(int(ms) == int(self._saved_ms))
+            act.setToolTip(
+                "8111 轮询与轨迹采样共用的间隔(单条录制与全局录制同一个值)。\n"
+                "40 ms(25 Hz)与 8111 陆战数据的更新率匹配, 是推荐值; "
+                "20 ms 已接近 8111 的请求上限, 调太小反而会拖慢整体轮询。"
+                if ms == int(DEFAULT_INTERVAL_MS) else
+                f"{ms} ms(≈{1000 // ms} Hz)。一般不用改 —— "
+                f"推荐 40 ms, 与 8111 陆战数据的更新率一致。")
+            act.triggered.connect(lambda _c=False, v=int(ms): self._set_rate_ms(v))
+            self._rate_group.addAction(act)
+            rate_menu.addAction(act)
+            self._rate_actions.append(act)
+        rate_menu.addSeparator()
+        act_rate_hint = QAction("建议保持 40 ms(25 Hz)—— 这一项一般不用改", self)
+        act_rate_hint.setEnabled(False)
+        rate_menu.addAction(act_rate_hint)
 
         # ---- 叠加层(录制时浮在屏幕角落的小窗)
         setting.addSeparator()
@@ -707,7 +755,7 @@ class RouteTesterWindow(QMainWindow):
         line.setStyleSheet("background-color:#94a3b8; border:none;")
         grid.addWidget(line, 1, 0, 1, 4)
 
-        # ---- 第 2 行: 连接状态 + 采样间隔设置
+        # ---- 第 2 行: 连接状态(+ 一个极小的只读轮询频率)
         # 两段长文字都允许被压缩(否则窄窗口下会把侧栏挤到最小宽度)
         self.lbl_status = QLabel("正在连接 8111…")
         self.lbl_status.setStyleSheet("color:#94a3b8;")
@@ -716,27 +764,14 @@ class RouteTesterWindow(QMainWindow):
                                       QSizePolicy.Policy.Preferred)
         grid.addWidget(self.lbl_status, 2, 0, 1, 3)
 
-        # 采样间隔设置(影响轮询与轨迹采样密度, 越小越频繁)
-        rate_box = QHBoxLayout()
-        rate_box.setSpacing(6)
-        rate_box.addWidget(QLabel("采样间隔:"))
-        self.cmb_rate = QComboBox()
-        for ms in INTERVAL_CHOICES_MS:
-            self.cmb_rate.addItem(f"{ms} ms  ({1000 // ms} Hz)", ms)
-        idx = self.cmb_rate.findData(self._saved_ms)
-        self.cmb_rate.setCurrentIndex(
-            idx if idx >= 0 else self.cmb_rate.findData(int(DEFAULT_INTERVAL_MS)))
-        self.cmb_rate.currentIndexChanged.connect(self._on_rate_changed)
-        self.cmb_rate.setToolTip(
-            "采样间隔(毫秒), 越小越频繁。\n"
-            "8111 陆战数据約每 40ms 更新一次, 40ms 即与之匹配;\n"
-            "20ms(≈50Hz)已接近 8111 请求上限, 实际值见右侧")
-        rate_box.addWidget(self.cmb_rate)
+        # 采样间隔**不再放在主界面**(2026-10-23): 它是装机时定一次的东西, 摆在
+        # 信息区里太显眼 —— 用户随手调到过大/过小反而会出问题。现在收进
+        # 菜单「设置 → 采样间隔」; 这里只留一个很小的只读实际轮询频率(排查用)。
         self.lbl_rate = QLabel("")
         self.lbl_rate.setStyleSheet("color:#64748b; font-size:11px;")
-        rate_box.addWidget(self.lbl_rate)
-        rate_box.addStretch(1)
-        grid.addLayout(rate_box, 2, 3)
+        self.lbl_rate.setToolTip(
+            "8111 的实际轮询频率。\n采样间隔在菜单「设置 → 采样间隔」里, 一般不用改")
+        grid.addWidget(self.lbl_rate, 2, 3, alignment=Qt.AlignmentFlag.AlignRight)
 
         # ---- 第 3 行: 载具 / 速度 / 计时 / 标记
         self.lbl_vehicle = self._info_field("载具", "—")
@@ -2260,20 +2295,24 @@ class RouteTesterWindow(QMainWindow):
         else:
             self._set_status("回放显示: 不区分阵亡", sticky=3.0)
 
-    def _on_rate_changed(self) -> None:
-        """采样间隔下拉框变更: 立即应用到轮询线程并记忆。"""
-        ms = self.cmb_rate.currentData()
-        if ms is None:
-            return
+    def _set_rate_ms(self, ms: int) -> None:
+        """菜单「设置 → 采样间隔」: 立即应用到轮询线程并记忆。
+
+        单条录制与全局录制**共用**这个值(两者本来就是同一个轮询线程),
+        所以这里只有一处设置入口。
+        """
+        ms = rate_choice_ms(ms)
         rec = getattr(self, "recorder", None)
-        if rec is None:
-            return
-        rec.set_interval_ms(float(ms))
+        if rec is not None:
+            rec.set_interval_ms(float(ms))
         self._settings.setValue("interval_ms", int(ms))
         self._saved_ms = int(ms)
+        for act, val in zip(getattr(self, "_rate_actions", ()), INTERVAL_CHOICES_MS):
+            act.setChecked(int(val) == int(ms))     # 代码路径也要同步菜单勾选
+        self.lbl_rate.setText(f"轮询 {1000 // int(ms)} Hz")
         self._set_status(
-            f"采样间隔已设为 {int(ms)} ms(≈{1000 // int(ms)} Hz) —— 轮询与轨迹采样同步",
-            sticky=2.0)
+            f"采样间隔已设为 {int(ms)} ms(≈{1000 // int(ms)} Hz) —— "
+            f"单条录制与全局录制同步", sticky=2.0)
 
     def _set_status(self, text: str, sticky: float = 0.0) -> None:
         """写状态栏。sticky>0 时该文字在这么多秒内不会被刷新的状态覆盖
@@ -2307,7 +2346,9 @@ class RouteTesterWindow(QMainWindow):
         # 等待移动期间还没定下起点, 标记没有意义
         self.btn_mark.setEnabled(recording and not armed)
         self.chk_start_on_move.setEnabled(not busy and not in_play)
-        self.cmb_rate.setEnabled(not busy and not in_play)
+        # 采样间隔已收进菜单: 录制/回放期间同样不允许改
+        for act in getattr(self, "_rate_actions", ()):
+            act.setEnabled(not busy and not in_play)
         self.tree.setEnabled(not in_play and not busy)   # 含眼睛点击与右键菜单
         # 全局录制按钮: 自己录制中时两个“录制”按钮禁用, 只留“停止”
         self.btn_rec_a.setEnabled(not busy and not in_play)
@@ -2462,7 +2503,7 @@ class RouteTesterWindow(QMainWindow):
 
             rate = float(info.get("rate") or 0.0)
             if rate:
-                self.lbl_rate.setText(f"实际 {rate:.0f} Hz")
+                self.lbl_rate.setText(f"轮询 {rate:.0f} Hz")
 
             ginfo = info.get("global")
             if ginfo:
