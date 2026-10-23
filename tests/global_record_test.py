@@ -294,6 +294,111 @@ def test_mark_and_stationary_end():
     results.append("A/B 标记不落盘 + 静止车的线尾补到消失时刻 OK")
 
 
+def test_stationary_two_die_together():
+    """两辆**静止**的车同时消失 → 两条线的 t1 必须相同(实测差 9 秒的那个 bug)。
+
+    复现西奈半岛那局: 两台发射车一开始就停着不动(只有 15 s 心跳), 在 t=100 一起
+    消失。修复前: 第一条停在最后一次心跳(90.0)、第二条停在 90.0 附近但各自不同
+    —— 视觉上就是“一台先死、另一台后死”。
+    """
+    rec = GlobalRecord(route_id="g13", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "A")
+
+    def pair(t):
+        """两辆静止的发射车; 第二辆在 t=50.3 才出现(心跳相位错开, 复现真实那局)。"""
+        out = [{"type": "ground_model", "icon": "SAM", "color": "#faC81E",
+                "x": 0.30, "y": 0.30}]
+        if t >= 50.3:
+            out.append({"type": "ground_model", "icon": "SAM", "color": "#faC81E",
+                        "x": 0.60, "y": 0.60})
+        return out
+
+    # 前 90 秒两人都在(心跳 15s), 第 90~100 秒只有 A 在 → 但 B 不该判死(end_gap=1s
+    # 才判), 所以这里干脆让两辆一起留到 100 秒, 101 秒同帧消失。
+    t = 0.0
+    while t <= 100.0:
+        tr.feed(t, pair(t))
+        t = round(t + 0.2, 2)
+    tr.feed(100.4, [{"type": "ground_model", "icon": "SAM", "color": "#faC81E",
+                     "x": 0.90, "y": 0.10}])      # 场上还有别的单位 → 消失的算被击毁
+    for t2 in (100.6, 101.0, 101.4, 101.8, 102.2):
+        tr.feed(t2, [{"type": "ground_model", "icon": "SAM", "color": "#faC81E",
+                      "x": 0.90, "y": 0.10}])
+    lives = tr.finish()
+    sam = [lf for lf in lives if abs(lf.points[0].x - 0.90) > 1e-6]
+    assert len(sam) == 2, [lf.points[0].x for lf in lives]
+    ends = sorted(round(lf.t1, 2) for lf in sam)
+    assert ends[1] - ends[0] < 0.01, "两台同时消失的车 t1 必须一致: %s" % (ends,)
+    assert abs(ends[0] - 100.0) < 0.3, "线尾应是最后见到的时刻(约 100s), 实际 %s" % (ends,)
+    assert all(lf.dead for lf in sam), "同帧消失且场上还有别人 → 都算被击毁"
+    results.append("两辆静止车同帧消失 → 两条线结束时刻一致 OK")
+
+
+def test_full_rate_and_hold(tmpdir: str):
+    """存储改造(2026-10-23): 移动段逐帧全存, 静止段折叠成“坐标 + hold”。
+
+    用户口径: “从 8111 拉多少数据就存多少数据, 存的时候想办法压缩一下 —— 假如
+    这位玩家一直没动, 坐标不会变, 变的只有时间, 那就存坐标 + 静止时间”。
+
+    * 移动: 每帧一个点(25Hz 不抽稀, 转弯细节不丢);
+    * 静止: **不新增点**, 只把末点的 `hold` 往后延(蹲 5 分钟也只占 1 个点);
+    * 落盘/读回后 `hold` 与 `t1` 不变(旧数据无 hold → 行为与以前一致)。
+    """
+    from wt81111g.route_store import point_at
+
+    rec = GlobalRecord(route_id="g14", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "A", interval=0.04)          # 25Hz
+    t = 0.0
+    for i in range(50):                                   # ① 匀速移动 2 秒
+        tr.feed(t, [tank(0.20 + 0.001 * i, 0.30)])
+        t += 0.04
+    life = tr.lives[0]
+    moving_pts = len(life.points)
+    assert moving_pts >= 45, "移动段应逐帧全存(25Hz), 实际 %d 个点" % moving_pts
+
+    x_end = 0.20 + 0.001 * 49
+    for _ in range(int(300 / 0.04)):                      # ② 原地不动 300 秒
+        tr.feed(t, [tank(x_end, 0.30)])
+        t += 0.04
+    assert len(life.points) <= moving_pts + 1, \
+        "静止 300 秒不该新增点: %d -> %d" % (moving_pts, len(life.points))
+    last = life.points[-1]
+    assert last.hold >= 299.0, "末点应记下“停在这儿多久”, 实际 hold=%.2f" % last.hold
+    assert abs(life.t1 - 302.0) < 0.5, "线尾 = 2s 移动 + 300s 静止, 实际 %.2f" % life.t1
+    p = point_at(life.points, 100.0)                      # ③ 静止段里取点 = 停在原地
+    assert abs(p.x - x_end) < 1e-4 and abs(p.y - 0.30) < 1e-4, (p.x, p.y)
+    tr.finish()
+
+    # ④ 落盘/读回: hold 与 t1 都要保留
+    path = os.path.join(tmpdir, "hold.json")
+    store = RouteStore(path)
+    g = store.new_global("HOLD", "地图 H")
+    g.sides["A"] = [life]
+    store.add_global(g)
+    store.save()
+    got = RouteStore(path).get_global(g.route_id)
+    l2 = got.lives("A")[0]
+    assert len(l2.points) == len(life.points), (len(l2.points), len(life.points))
+    assert abs(l2.t1 - life.t1) < 0.02, (l2.t1, life.t1)
+    assert abs(l2.points[-1].hold - last.hold) < 0.02, l2.points[-1].hold
+
+    # ⑤ 静止很久后起步: 速度要按“静止段结束之后的帧间隔”算, 不能变 0
+    rec2 = GlobalRecord(route_id="g15", map_key="M", map_name="地图", created_at="")
+    tr2 = GlobalTracker(rec2, "B", interval=0.04)
+    tt = 0.0
+    for _ in range(600):                                  # 先停 24 秒
+        tr2.feed(tt, [tank(0.40, 0.40, color=YELLOW)])
+        tt += 0.04
+    for i in range(1, 6):                                 # 再每帧动 0.001
+        tr2.feed(tt, [tank(0.40 + 0.001 * i, 0.40, color=YELLOW)])
+        tt += 0.04
+    ls = tr2.finish()
+    assert len(ls) == 1, len(ls)
+    sp = ls[0].points[-1].speed
+    assert sp > 20.0, "起步那一帧的速度应按帧间隔算, 实际 %.1f km/h" % sp
+    results.append("全局录制存储: 移动段逐帧全存 + 静止段折叠为 hold OK")
+
+
 def test_frame_align():
     """观战玩家上了固定翼 → 8111 切成空战图, 单位坐标整体被缩放/平移。
 
@@ -1378,23 +1483,30 @@ def test_zone_layout_pick(tmpdir: str):
 
 
 def test_hud_poll(tmpdir: str):
-    """录制期间定期读 /hudmsg —— 只在结束时读一次会漏掉被挤出缓冲区的击杀。
+    """录制期间定期读 /hudmsg —— 只在结束时读一次会漏掉被挤出滚动窗口的击杀。
 
     背景(用户 2026-10-22): 一局阵亡 3 次的玩家, 修正界面里只显示 2 次。
-    实测 `/hudmsg` 的 `damage` 只保留最近约 50 条, 而程序原先**只在录制结束时读
-    一次** —— 前几分钟的击杀那时已经被挤掉了。改成录制期间每 5 秒取增量后, 只要
-    两次读取的间隔内滚动不超过 50 条(一局里绝不可能)就不会丢。
+    实测 `/hudmsg` 的 `damage` 是**滚动窗口**, 而程序原先**只在录制结束时读一次**
+    —— 前几分钟的击杀那时已经被挤掉了。
+
+    **间隔必须以 8111 自己的网页为准**: 它的首页内联脚本里是
+    `setInterval(updateSlow, 500)`, `/hudmsg` 就在 updateSlow 里, 并且每次把
+    `lastEvt` 与 `lastDmg` 一起发上去。所以这里断言: 间隔 ≤ 1 秒、两个游标都在发。
 
     这里用假 client 模拟"缓冲区往前滚", 并验证按 `(时间, 文本)` 去重
     (两次回放的 `id` 各自重新编号, 不能按 id 去重)。
     """
-    from wt81111g.route_recorder import RouteRecorder
+    from wt81111g.route_recorder import HUD_POLL_INTERVAL, RouteRecorder
+
+    assert 0.0 < HUD_POLL_INTERVAL <= 1.0, HUD_POLL_INTERVAL
 
     class FakeClient:
         def __init__(self):
             self.window: list[dict] = []
+            self.calls: list[tuple] = []
 
-        def hudmsg(self, _a, cursor):
+        def hudmsg(self, evt, cursor):
+            self.calls.append((evt, cursor))
             return {"events": [],
                     "damage": [r for r in self.window if int(r["id"]) > int(cursor)]}
 
@@ -1416,10 +1528,13 @@ def test_hud_poll(tmpdir: str):
                    {"id": 4, "time": 30, "msg": "g (T-80) 击毁了 h (M1)"}]
     assert run._poll_kills(rec) == 1
     assert [k["t"] for k in rec.kills] == [10.0, 20.0, 30.0], rec.kills
+    # 游标推进方式与网页一致: 第二次请求带的是 lastDmg = 上一轮的最后一个 id
+    assert fake.calls[-1][1] == 3, fake.calls
     # 模拟"另一队回放时 id 重新编号": 同一条事件换了 id → 不能重复入库
     fake.window = [{"id": 900, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"}]
     run._poll_kills(rec)
     assert [k["t"] for k in rec.kills] == [10.0, 20.0, 30.0], rec.kills
+    assert run._hud_cursor == 900, run._hud_cursor
     results.append("全局录制: hudmsg 录制期间定期取增量 + 按(时间,文本)去重 OK")
 
 
@@ -1435,6 +1550,8 @@ def main() -> int:
     test_timeline_note()
     test_split_sam_segments()
     test_mark_and_stationary_end()
+    test_stationary_two_die_together()
+    test_full_rate_and_hold(tmpdir)
     test_frame_align()
     test_store(tmpdir)
     test_map_paint()

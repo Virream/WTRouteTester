@@ -74,6 +74,25 @@ def clean_text(text) -> str:
     return str(text or "").replace(ZW_SPACE, "").strip()
 
 
+def rows_of(data, cursor: int = 0) -> list[dict]:
+    """把一次 `/hudmsg` 回答里的 `damage` 清成 `[{id, t, msg}]`(按 id 升序)。
+
+    `cursor` 用来丢掉 id <= cursor 的旧条目。
+    """
+    out: list[dict] = []
+    for row in (data or {}).get("damage") or []:
+        try:
+            rid = int(row.get("id") or 0)
+            t = float(row.get("time") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if rid <= int(cursor):
+            continue
+        out.append({"id": rid, "t": t, "msg": clean_text(row.get("msg"))})
+    out.sort(key=lambda r: r["id"])
+    return out
+
+
 def read_cursor(client) -> int:
     """读 `/hudmsg` 当前的 damage 最大 id, 作为"录制开始前的游标"。"""
     try:
@@ -81,17 +100,15 @@ def read_cursor(client) -> int:
     except Exception as exc:  # noqa: BLE001 - 抓不到就当没有, 不能影响录制
         log.warning("读取 hudmsg 游标失败: %s", exc)
         return 0
-    ids = []
-    for row in data.get("damage") or []:
-        try:
-            ids.append(int(row.get("id") or 0))
-        except (TypeError, ValueError):
-            continue
-    return max(ids, default=0)
+    return max((r["id"] for r in rows_of(data, 0)), default=0)
 
 
-def read_damage(client, cursor: int) -> list[dict]:
+def read_damage(client, cursor: int, evt_cursor: int = 0) -> list[dict]:
     """取比 `cursor` 新的**全部** damage 消息: `[{id, t, msg}]`(按 id 升序)。
+
+    请求参数与 8111 首页内联脚本完全一致 —— 它发的是
+    `/hudmsg?lastEvt=<lastEvtMsgId>&lastDmg=<lastDmgMsgId>`; 我们只用 damage,
+    但 `lastEvt` 也照传(默认 0)。
 
     不只看击毁: 8111 的 `damage` 里还混着“引燃了 / 获得嘉奖”这类条目, 以及
     **弃车、被淹死、坠毁**这类“不是被别人打死”的阵亡(用户 2026-10-22 实测: 它们
@@ -99,22 +116,11 @@ def read_damage(client, cursor: int) -> list[dict]:
     `DEATH_MARKS` 分捡。
     """
     try:
-        data = client.hudmsg(0, int(cursor))
+        data = client.hudmsg(int(evt_cursor), int(cursor))
     except Exception as exc:  # noqa: BLE001
         log.warning("读取 hudmsg 增量失败: %s", exc)
         return []
-    out: list[dict] = []
-    for row in data.get("damage") or []:
-        try:
-            rid = int(row.get("id") or 0)
-            t = float(row.get("time") or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if rid <= int(cursor):
-            continue
-        out.append({"id": rid, "t": t, "msg": clean_text(row.get("msg"))})
-    out.sort(key=lambda r: r["id"])
-    return out
+    return rows_of(data, cursor)
 
 
 def is_death_msg(msg) -> bool:
@@ -164,6 +170,19 @@ def raw_points(life) -> list:
     """
     trimmed = getattr(life, "trimmed", None)
     return list(trimmed) if trimmed else list(life.points)
+
+
+def end_of(pts) -> float:
+    """一条线的**有效结束时刻** = 末点时刻 + 它的静止持续时长(`hold`)。
+
+    静止段被折叠成“一个点 + hold”(见 `route_store.TrackPoint.hold`), 所以直接拿
+    `pts[-1].t` 会把“停在那儿很久才被毁”的线当成提前结束 —— 偏移拟合与
+    “这段里有几次阵亡”都会跟着错。旧数据没 hold → 与以前一致。
+    """
+    if not pts:
+        return 0.0
+    last = pts[-1]
+    return float(last.t) + float(getattr(last, "hold", 0.0) or 0.0)
 
 
 def deaths_in(deaths, shift: float, t0: float, t1: float,
@@ -304,7 +323,7 @@ def side_ends(record, side: str) -> list[float]:
             continue
         if is_player_line(life):
             continue
-        ends.append(pts[-1].t)
+        ends.append(end_of(pts))
     return ends
 
 
@@ -368,9 +387,10 @@ def player_lines(record, side: str) -> list:
 def player_segments(record, side: str) -> list[tuple]:
     """这一队的 Player 线按起点排好 → `[(line, t0, t1)]`。
 
-    `t0` = 这一命被 8111 首次上报的时刻, `t1` = 这条线的最后一个点。
-    他阵亡后车身不再动, 线会一直延伸到"他重生那一刻"(残骸尾巴, 比真实死亡
-    晚几秒); 最后一条线如果他是退出对局/活到结束, 尾巴能拖到录制结束。
+    `t0` = 这一命被 8111 首次上报的时刻, `t1` = 这条线的**有效结束**
+    (`end_of`: 末点 + 静止持续时长)。他阵亡后车身不再动, 线会一直延伸到"他重生
+    那一刻"(残骸尾巴, 比真实死亡晚几秒); 最后一条线如果他是退出对局/活到结束,
+    尾巴能拖到录制结束。
 
     这些时间段**互不重叠**、且一段只可能有一次他的阵亡 —— 这就是"按昵称认领
     阵亡"的全部依据, 不需要任何静止/停车推断。
@@ -385,7 +405,7 @@ def player_segments(record, side: str) -> list[tuple]:
     for life in sorted(player_lines(record, side),
                        key=lambda lf: raw_points(lf)[0].t):
         pts = raw_points(life)
-        segs.append((life, pts[0].t, pts[-1].t))
+        segs.append((life, pts[0].t, end_of(pts)))
     out: list[tuple] = []
     best_t1 = float("-inf")
     for life, t0, t1 in segs:
@@ -536,7 +556,7 @@ def analyze(record, tol: float = 1.5) -> dict:
             if is_player_line(life):
                 players.append((side, life.life_id))
                 continue
-            ends.append(pts[-1].t)
+            ends.append(end_of(pts))
     shift, _hits = estimate_shift(ends, kill_times, tol=tol)
     pairs = [(k, k + shift) for k in kill_times
              if any(abs(e - (k + shift)) <= tol for e in ends)]

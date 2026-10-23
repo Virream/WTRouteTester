@@ -1754,8 +1754,15 @@ class RouteMapView(QWidget):
         return bool(getattr(rec, "dead", False)) and bool(rec.points)
 
     def _dead_now(self, rec, head: float) -> bool:
-        """回放到此刻为止, 这条线的玩家是否已经阵亡(已过掉线时刻)。"""
-        return self._is_dead(rec) and head >= rec.points[-1].t
+        """回放到此刻为止, 这条线的玩家是否已经阵亡(已过掉线时刻)。
+
+        末点的时刻要加 `hold`(静止段折叠后的持续时长), 否则“停住很久才被打死”的
+        车会在停住那一刻就提前画红叉。
+        """
+        if not self._is_dead(rec):
+            return False
+        last = rec.points[-1]
+        return head >= last.t + float(getattr(last, "hold", 0.0) or 0.0)
 
     def _dead_dimmed(self, rec, head: float) -> bool:
         """阵亡后整条线路要不要变半透明纯灰(开关 `被击毁后路线变暗`)。"""

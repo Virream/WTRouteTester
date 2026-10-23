@@ -186,6 +186,48 @@ class TrackPoint:
     speed: float = 0.0
     dx: float = 0.0
     dy: float = 0.0
+    # **静止持续时长**(秒, 只对全局录制有效): 从这个点开始, 单位一直停在 (x, y)
+    # 直到 `t + hold`。
+    #
+    # 这么做的原因(用户 2026-10-23): 8111 每帧都在报同一个坐标, 静止的车如果
+    # 逐帧存点, 一棵不动的防空车蹲 20 分钟就是 3 万个点 —— 而它们**坐标完全一样,
+    # 只差时间**。所以静止段折叠成“一个点 + hold”, 移动段仍然逐帧全存(不抽稀),
+    # 等于“拉多少数据就存多少信息”, 但体积不是一回事。
+    # 旧数据没有这个字段 → 0, 行为与以前完全一致。
+    hold: float = 0.0
+
+
+def _pack_point(p) -> list:
+    """一个全局轨迹点 → 紧凑数组 `[t, x, y, speed(, hold)]`。
+
+    `hold` 只在非 0 时写第五个数 —— 移动点和旧数据都还是 4 个数的样子,
+    读回来完全兼容。
+    """
+    row = [round(p.t, 2), round(p.x, 5), round(p.y, 5), round(p.speed, 1)]
+    hold = float(getattr(p, "hold", 0.0) or 0.0)
+    if hold > 0.0:
+        row.append(round(hold, 2))
+    return row
+
+
+def _unpack_point(row) -> TrackPoint | None:
+    """紧凑数组 → `TrackPoint`(坏行返回 None, 由调用方过滤)。"""
+    try:
+        t, x, y = float(row[0]), float(row[1]), float(row[2])
+    except (IndexError, TypeError, ValueError):
+        return None
+    speed = hold = 0.0
+    if len(row) > 3:
+        try:
+            speed = float(row[3])
+        except (TypeError, ValueError):
+            speed = 0.0
+    if len(row) > 4:
+        try:
+            hold = max(0.0, float(row[4]))
+        except (TypeError, ValueError):
+            hold = 0.0
+    return TrackPoint(x=x, y=y, t=t, speed=speed, hold=hold)
 
 
 @dataclass
@@ -251,7 +293,15 @@ class UnitLife:
 
     @property
     def t1(self) -> float:
-        return self.points[-1].t if self.points else 0.0
+        """线尾时刻 = 最后一个已知时刻 + 该点的**静止持续时长**(`hold`)。
+
+        静止段的采样被折叠成“一个点 + hold”(见 `TrackPoint.hold`), 所以末点的
+        有效结束时刻是 `t + hold`; 旧数据没 hold → 与以前完全一致。
+        """
+        if not self.points:
+            return 0.0
+        last = self.points[-1]
+        return last.t + float(getattr(last, "hold", 0.0) or 0.0)
 
     @property
     def duration(self) -> float:
@@ -263,8 +313,9 @@ class UnitLife:
         return f"{fmt_time(self.t0)}  {name}"
 
     def to_json(self) -> dict:
-        # 点写成 [t, x, y, speed] 的紧凑数组: 整局几十辆车 → 几十万个点,
-        # 用 {"x":..,"y":..,"t":..} 的字典形式会让 routes.json 膨胀 3 倍以上
+        # 点写成 [t, x, y, speed(, hold)] 的紧凑数组: 整局几十辆车 → 几十万个点,
+        # 用 {"x":..,"y":..,"t":..} 的字典形式会让 routes.json 膨胀 3 倍以上。
+        # `hold` 只在非 0 时写第五个数(静止段), 移动点仍然是 4 个数的老格式。
         out = {
             "id": self.life_id,
             "icon": self.icon,
@@ -273,8 +324,7 @@ class UnitLife:
             "map_key": self.map_key,
             "side": self.side,
             "dead": 1 if self.dead else 0,
-            "pts": [[round(p.t, 2), round(p.x, 5), round(p.y, 5), round(p.speed, 1)]
-                    for p in self.points],
+            "pts": [_pack_point(p) for p in self.points],
         }
         if self.death_t:
             out["death_t"] = round(self.death_t, 2)
@@ -282,8 +332,7 @@ class UnitLife:
             out["w"] = 1
         if self.trimmed:
             # 只存被截掉的尾巴 —— 未修正的线没有这个字段, 旧数据也不需要兼容
-            out["trim"] = [[round(p.t, 2), round(p.x, 5), round(p.y, 5),
-                            round(p.speed, 1)] for p in self.trimmed]
+            out["trim"] = [_pack_point(p) for p in self.trimmed]
         return out
 
     @classmethod
@@ -294,20 +343,8 @@ class UnitLife:
             return None
 
         def read_points(rows) -> list[TrackPoint]:
-            pts: list[TrackPoint] = []
-            for row in rows or []:
-                try:
-                    t, x, y = float(row[0]), float(row[1]), float(row[2])
-                except (IndexError, TypeError, ValueError):
-                    continue
-                speed = 0.0
-                if len(row) > 3:
-                    try:
-                        speed = float(row[3])
-                    except (TypeError, ValueError):
-                        speed = 0.0
-                pts.append(TrackPoint(x=x, y=y, t=t, speed=speed))
-            return pts
+            return [p for p in (_unpack_point(row) for row in rows or [])
+                    if p is not None]
 
         try:
             death_t = float(data.get("death_t") or 0.0)
@@ -454,8 +491,9 @@ class GlobalRecord:
         for side in GLOBAL_SIDES:
             lives = [lf for lf in self.lives(side) if lf.points]
             if lives:
-                spans.append((side, len(lives),
-                              max(lf.points[-1].t for lf in lives)))
+                # 用 `t1`(末点 + hold)而不是 `points[-1].t`: 静止车的线尾被折叠成
+                # 一个带持续时长的点, 直接取 `t` 会把“结尾”算早
+                spans.append((side, len(lives), max(lf.t1 for lf in lives)))
         if not spans:
             return "无线路"
         parts = [f"{side} 队 {n} 条 0~{last:.1f}s" for side, n, last in spans]
@@ -615,8 +653,13 @@ def point_at(points: list[RoutePoint], t: float) -> RoutePoint | None:
         else:
             hi = mid
     a, b = points[lo], points[hi]
-    span = b.t - a.t
-    k = 0.0 if span <= 0 else (t - a.t) / span
+    # 静止段折叠(`hold`): a 点在 [a.t, a.t + a.hold] 期间坐标不变, 真正“开始移动”
+    # 是 a.t + hold, 所以插值要从那里开始算 —— 否则静止越久, 起步那一下就越像瞬移。
+    # RoutePoint 没有 hold 字段 → getattr 取到 0, 行为与以前完全一致。
+    start = a.t + float(getattr(a, "hold", 0.0) or 0.0)
+    span = b.t - start
+    k = 0.0 if span <= 0 else (t - start) / span
+    k = min(1.0, max(0.0, k))
     # 朝向取**更近那一端**的采样值: 单位向量做线性插值在掉头时会退化成零向量
     # (方向丢失), 而采样间隔只有几十 ms, 取端点肉眼看不出跳变。
     src = a if k < 0.5 else b
@@ -964,9 +1007,9 @@ class RouteStore:
     def _apply_death(life: UnitLife, death_t: float) -> None:
         """把一条线截断到 `death_t` 并补一个合成点, 记下原始点以便回退。
 
-        为什么要补合成点: 停止时程序是"每 15 秒一个心跳点", 死亡时刻往往落在两个
-        心跳点之间(实测有一位停稳 9.8 秒才被打死)。不补的话线尾会落在停住那一刻,
-        地图上的阵亡叉与"用时"都会少算这 9.8 秒。
+        为什么要补合成点: 静止的车被折叠成“点 + hold”, 而死亡时刻往往落在移动
+        结束之后(实测有一位停稳 9.8 秒才被打死)。不补的话线尾会落在“开始停住”
+        那一刻(现在 hold 会被夹到死亡时刻), 地图上的阵亡叉与“用时”都会少算。
         """
         if not life.trimmed:
             life.trimmed = list(life.points)
@@ -975,6 +1018,11 @@ class RouteStore:
             life.points = list(life.trimmed)
             return
         last = pts[-1]
+        # 末点的静止持续时长不能超过死亡时刻(否则回放会“死了还在原地待到 hold 结束”)
+        keep = max(0.0, round(float(death_t) - last.t, 2))
+        pts[-1] = TrackPoint(x=last.x, y=last.y, t=last.t, speed=last.speed,
+                             dx=last.dx, dy=last.dy,
+                             hold=min(float(getattr(last, "hold", 0.0) or 0.0), keep))
         pts.append(TrackPoint(x=last.x, y=last.y, t=round(float(death_t), 2),
                               speed=0.0))
         life.points = pts

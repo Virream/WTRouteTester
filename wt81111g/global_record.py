@@ -60,8 +60,12 @@ from .zones import COLOR_SELF, SIDE_ENEMY, _color_of, side_of
 
 log = logging.getLogger("global_record")
 
-# 采样间隔(秒): 5Hz。全局录制只是“看路线怎么走”, 不需要单条录制那种 25~50Hz。
-# 一局 20 分钟 × 30 辆车 × 5Hz ≈ 18 万个点 —— 再密的话 routes.json 会很大。
+# 采样间隔(秒): 只作为“追点的最小间隔”的下限。
+# **2026-10-23 改**: 以前这里写死 0.2(5Hz) 并配一道“15 秒心跳”抽稀, 结果是
+#   ① 移动中的车每 200ms 才存一个点, 转弯的细节丢了;
+#   ② 静止的车每 15 秒才能补一个点, 线尾比真实消失晚最多 15 秒。
+# 现在改成“8111 报了多少帧就记多少帧”: 移动段逐帧全存(不抽稀), 静止段用
+# `TrackPoint.hold` 折叠成“一个点 + 持续时长”(坐标没变, 变的只有时间)。
 SAMPLE_INTERVAL = 0.2
 # 帧间最近邻匹配半径(归一化坐标, 地图 = 1.0)。
 # 25Hz 轮询下坦克单帧位移 < 0.001, 0.004 已经很宽松;
@@ -71,11 +75,10 @@ MATCH_RADIUS = 0.004
 END_GAP = 1.0
 # 全场一个可录单位都没有、持续多久 → 认为已经回到车库, 自动结束录制(秒)
 EMPTY_STOP = 3.0
-# 只在移动超过这个距离时才存点(归一化): 静止的浮点抖动不该进文件,
-# 也让“一直停着的车”不会产生成千上万个点。但每条线**至少保留首尾两个点**。
+# 位移小于这个距离(归一化)就算“没动”: 只把末点的 `hold` 往后延, 不新增点。
+# 它同时是一道**抖噪闸** —— 8111 的坐标末位会跳, 不设阈值的话静止的车会一直
+# 被当成“在动”而逐帧存点。 0.0002 × 4000m ≈ 0.8m。
 MIN_MOVE = 0.0002
-# 心跳: 即使一动不动, 每隔这么久也补一个点 —— 保证“停了 5 分钟”这种事实留得下来
-HEARTBEAT = 15.0
 # 速度上限(km/h): 帧间“跳一下”(刚被匹配上但其实是另一个单位)不该变成尖峰
 MAX_SPEED_KMH = 200.0
 # 新建线路时, 起点离**任一重生点**超过这个距离(归一化)就记一条警告。
@@ -669,22 +672,31 @@ class GlobalTracker:
                      last_x=u.x, last_y=u.y)
 
     def _close(self, lv: _Live, dead: bool = False) -> None:
-        """收尾一条线: 记下“是否被击毁”, 并补上最后一个已知位置(若与已存的点不同)。
+        """收尾一条线: 记下“是否被击毁”, 并保证线尾停在**真正消失的那一刻**。
 
-        ⚠ **静止的车也必须补这一点**(2026-10-23 修): 采样只在移动时存点、静止时每
-        15 秒补一个心跳点, 所以“一直停着的车”的最后一点可能是它消失前 15 秒的位置 ——
-        于是线的结束时刻比真实消失早最多 15 秒。实测(分体防空那一局)两台同时被毁的
-        发射车, 一条结束在 307.5s、另一条在 316.6s, 差 9 秒就是这么来的。
-        这里无条件把“最后一帧见到它的时刻”补成终点, 位置相同也不要紧(只是多一个点)。
+        分两种情况:
+
+        * **最后一帧它还在动**(位置与末点差 >= `MIN_MOVE`) → 补一个点, 否则
+          “最后一段路”会丢掉(以前无条件补, 现在只在需要时补);
+        * **最后一帧它停着** → 只把末点的 `hold` 延到 `last_seen`。车可能停在那儿
+          十几分钟才被打死, 以前靠“每 15 秒心跳”近似, 结果两台同时被毁的发射车
+          一条结束在 307.5s、另一条在 316.6s(2026-10-23 实测)。
         """
         lv.life.dead = bool(dead)
         if not lv.life.points:
             return
         last = lv.life.points[-1]
-        if abs(last.t - lv.last_seen) < 1e-9:
+        if lv.last_seen <= last.t:
             return
-        lv.life.points.append(TrackPoint(x=lv.x, y=lv.y, t=lv.last_seen,
-                                         speed=last.speed))
+        depart = last.t + float(getattr(last, "hold", 0.0) or 0.0)
+        moved = math.hypot(lv.x - last.x, lv.y - last.y)
+        if moved >= MIN_MOVE:
+            speed = self._speed(last.x, last.y, lv.x, lv.y,
+                                max(1e-6, lv.last_seen - depart))
+            lv.life.points.append(TrackPoint(x=lv.x, y=lv.y, t=lv.last_seen,
+                                             speed=speed))
+            return
+        last.hold = round(lv.last_seen - last.t, 2)
 
     def _match(self, t: float, units: list[Unit]) -> None:
         """帧间最近邻 + 贪心匹配(先按距离排序, 短的先配)。"""
@@ -714,7 +726,11 @@ class GlobalTracker:
             self._live.append(self._new_life(u, t, len(units)))
 
     def _touch(self, lv: _Live, u: Unit, t: float) -> None:
-        """一条线接上了这一帧: 更新位置, 到点就存一个带速度的采样点。"""
+        """一条线接上了这一帧: 更新位置, 该记就记。
+
+        **每一帧的信息都不会丢**(2026-10-23 改): 车在动就追加一个带速度的点,
+        车没动就只把末点的 `hold` 往后延 —— 静止段占 1 个点, 时间信息一点不少。
+        """
         lv.x, lv.y = u.x, u.y
         lv.last_seen = t
         lv.life.color = u.color
@@ -730,13 +746,20 @@ class GlobalTracker:
             lv.life.icon = u.icon
         moved = math.hypot(u.x - lv.last_x, u.y - lv.last_y)
         if moved < MIN_MOVE:
-            # 一动不动: 只保留偶尔的心跳点(“在这儿停了 5 分钟”也要留痕)
-            if (t - lv.last_store) >= HEARTBEAT:
-                lv.life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=0.0))
-                lv.last_store = t
+            # 一动不动: **不新增点**, 只把“停在这儿多久”累加到末点的 `hold` 上。
+            # 这样一棵不动的高炮蹲 20 分钟也只占 1 个点(坐标没变, 变的只有时间),
+            # 而线尾时刻依旧是真实的(见 `_close`)。
+            last = lv.life.points[-1]
+            if t > last.t:
+                last.hold = round(t - last.t, 2)
             return
         if (t - lv.last_store) >= self.interval:
-            speed = self._speed(lv.last_x, lv.last_y, u.x, u.y, t - lv.last_store)
+            # 速度要按“**静止段结束之后的**帧间隔”算: 停了 10 分钟才起步的那一帧,
+            # 若拿末点的时间当起点, 10 分钟的距离/10 分钟 = 0 km/h, 速度配色就废了。
+            last = lv.life.points[-1]
+            depart = last.t + float(getattr(last, "hold", 0.0) or 0.0)
+            dt = t - min(depart, t - self.interval)
+            speed = self._speed(lv.last_x, lv.last_y, u.x, u.y, dt)
             lv.life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=speed))
             lv.last_x, lv.last_y = u.x, u.y
             lv.last_store = t

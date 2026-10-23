@@ -57,12 +57,13 @@ MAX_ZONE_STATES = 4000
 ZONE_COLOR_STEP = 12
 
 # 全局录制期间多久抓一次 /hudmsg 的增量(秒)。
-# 依据(用户 2026-10-22): 8111 的 damage 缓冲区装得下上百条, 而里面大部分并不是
-# 击杀(引燃/嘉奖等)。16v16 的一局里, 第一轮交火往往在 40 秒之后, 就算双方同时
-# 全死也还要再等 40 秒才会再死一批 —— 15 秒内死亡超过 50 人的战局基本不存在。
-# 另: **停止录制时一定会再补取一次**(见 `_collect_kills`), 不会因为刚好卡在
-# 两次轮询之间而丢掉尾部几条。
-HUD_POLL_INTERVAL = 15.0
+# **这个值直接抄 8111 自己的网页**: 首页内联脚本里是 `setInterval(updateSlow, 500)`,
+# `/hudmsg` 就在 updateSlow 里, 即官方页面自己就是 **每 500 ms 取一次**。
+# 以前按“缓冲区很大”拍了 15 秒 —— 实测(2026-10-23 西奈半岛那局)一局只采到 11 条、
+# 全挤在最后 75 秒, 前 5 分钟的阵亡全被滚动窗口挤掉了: damage 缓冲区在交火期
+# (击毁 + 引燃 + 嘉奖 + 坠毁/弃车)每秒就是好几条, 装不下 15 秒的量。
+# 另: **停止录制时一定会再补取一次**(见 `_collect_kills`)。
+HUD_POLL_INTERVAL = 0.5
 
 # 轮询/采样间隔: 默认 40ms(≈25Hz)。
 # 实测 8111 陆战数据本身約每 40ms 更新一次(rpm 变化间隔 p50=40ms),
@@ -204,11 +205,14 @@ class RouteRecorder(QObject):
         # 全局录制: 已记进时间轴的战区状态(字母/坐标/归属/是否被占)
         self._zone_state_key: tuple | None = None
         # 全局录制开始时抓到的 /hudmsg 游标(录制期间据它取增量击毁消息)
+        # 两个游标都要, 和 8111 网页一致(`lastEvt` 是 events, `lastDmg` 是 damage):
+        # 网页每次请求都把它们一起发上去, 我们只关心 damage, 但发送方式照抄。
         self._hud_cursor = 0
-        # 下次读 /hudmsg 的时刻(monotonic)。为什么要**录制期间定期读**:
-        # `/hudmsg` 的 damage 是**有上限的环形缓冲区**(装上上百条), 只在结束时读一次
-        # 的话, 前几分钟的击杀已经被挤掉了(用户 2026-10-22 实测: 一位阵亡 3 次的
-        # 玩家只看到 2 条)。
+        self._hud_evt_cursor = 0
+        # 下次读 /hudmsg 的时刻(monotonic)。为什么要**录制期间每 0.5 秒读一次**:
+        # `/hudmsg` 的 damage 是**有上限的滚动窗口**, 只在结束时读一次的话前面的击杀
+        # 早被挤掉了(2026-10-22 实测: 一位阵亡 3 次的玩家只看到 2 条)。
+        # 间隔 0.5 秒是抄 8111 首页脚本的 `setInterval(updateSlow, 500)`。
         self._hud_read_at = 0.0
         # 最近 2 秒内的**实际采样时刻**: 叠加层要显示“每秒真的写入了几个轨迹点”
         # (它和 8111 轮询频率不是一回事 —— 采样还要过“采样间隔 + 最小位移”两道闸)
@@ -668,7 +672,11 @@ class RouteRecorder(QObject):
         self._global_created = created
         self._global_prev_lives = list(rec.lives(side))
         # 重生点传进去: 只用于**校验新建线路的起点像不像刚重生**(见 GlobalTracker.suspicious)
-        self._tracker = GlobalTracker(rec, side, map_size=self._map_size,
+        # `interval` 跟随**实际轮询间隔**(默认 40ms): “8111 报了多少帧就记多少帧”。
+        # 静止的车由 `TrackPoint.hold` 折叠成一个点, 所以体积不会被静止车拖爆
+        # (见 `global_record` 顶部关于 SAMPLE_INTERVAL 的说明)。
+        self._tracker = GlobalTracker(rec, side, interval=self.sample_interval,
+                                      map_size=self._map_size,
                                       spawns=list(self._spawns))
         self._global_waiting = True
         self._global_t0 = 0.0
@@ -676,6 +684,7 @@ class RouteRecorder(QObject):
         # 抓一次 /hudmsg 的游标: 录制期间每 HUD_POLL_INTERVAL 秒据它取一次增量,
         # 用来反推“摄像机挂着那位玩家”到底什么时候死的(见 `kill_timeline` 模块说明)。
         self._hud_cursor = kill_timeline.read_cursor(self.client)
+        self._hud_evt_cursor = 0         # events 我们不用, 但与网页一致地一起推进
         self._hud_read_at = 0.0          # 下一个 tick 立刻开始轮询
         log.info("全局录制: hudmsg 游标 = %d", self._hud_cursor)
         if created:
@@ -838,10 +847,11 @@ class RouteRecorder(QObject):
     def _poll_kills(self, rec) -> int:
         """把 `/hudmsg` 里比游标新的**阵亡**消息存进条目, 返回这次取到几条。
 
-        **录制期间每 `HUD_POLL_INTERVAL` 秒调一次** —— `/hudmsg` 的 damage 是环形
-        缓冲区, 只在结束时读一次会把前几分钟的击杀挤掉(用户 2026-10-22 实测:
-        一位阵亡 3 次的玩家只能看到 2 条)。取到后把游标推到最大 id, 下次只取增量。
-        停止录制时(`_collect_kills`)还会**再补取一次**, 不会只剩尾部几条没拿。
+        **录制期间每 `HUD_POLL_INTERVAL`(0.5 秒)调一次, 请求方式与 8111 网页
+        完全一致**: 网页是 `setInterval(updateSlow, 500)` 里发
+        `/hudmsg?lastEvt=<lastEvtMsgId>&lastDmg=<lastDmgMsgId>`, 回来之后
+        `lastDmgMsgId = 最后一条的 id`。我们照抄 —— 以前 15 秒一次, 交火期
+        damage 滚动窗口撑不住, 前几分钟的阵亡会整段丢失。
 
         “阵亡”包括两种文本(见 `kill_timeline.DEATH_MARKS`): 被别人`击毁了`,
         以及弃车/被淹死/坠毁时的`已被摧毁`。
@@ -850,30 +860,43 @@ class RouteRecorder(QObject):
         (见 `kill_timeline.merge_kills`)。
         """
         try:
-            rows = kill_timeline.read_damage(self.client, self._hud_cursor)
+            data = self.client.hudmsg(self._hud_evt_cursor, self._hud_cursor)
         except Exception as exc:  # noqa: BLE001 - 抓不到也不能影响录制/落盘
             log.warning("全局录制: 读取 hudmsg 增量失败: %s", exc)
             return 0
-        if not rows:
-            log.info("全局录制: hudmsg 本轮无新增(游标 %d)", self._hud_cursor)
+        if not data:
             return 0
+        # 游标推进: 与网页一致, 各取自己那份的**最后一条** id
+        try:
+            evts = data.get("events") or []
+            if evts:
+                self._hud_evt_cursor = max(
+                    self._hud_evt_cursor, int(evts[-1].get("id") or 0))
+        except (TypeError, ValueError, AttributeError):
+            pass
+        ids = []
+        for row in data.get("damage") or []:
+            try:
+                ids.append(int(row.get("id") or 0))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if ids:
+            newest = max(ids)
+            lo = min(ids)
+            if lo > self._hud_cursor + 60 and self._hud_cursor:
+                # 两次轮询之间就被挤掉了这么多条 —— 中间的阵亡会丢, 修正就少数据
+                log.warning("全局录制: hudmsg 的 id 跳跃 %d -> %d(中间 %d 条没拿到, "
+                            "滚动窗口已滚过)", self._hud_cursor, lo,
+                            lo - self._hud_cursor)
+            self._hud_cursor = max(self._hud_cursor, newest)
+        rows = kill_timeline.rows_of(data, 0)   # 过滤/清洗(游标已在上面推进)
         new = [r for r in rows if kill_timeline.is_death_msg(r["msg"])]
+        if not new:
+            return 0        # 0.5 秒一次: 没新增就什么都不写(否则日志会被刷爆)
         rec.kills.extend(new)
         rec.kills = kill_timeline.merge_kills(rec)
-        try:
-            ids = [int(r.get("id") or 0) for r in rows]
-            lo = min(ids)
-            if lo > self._hud_cursor + 60:
-                # 环形缓冲区在我们两次轮询之间滚掉了这么多条 —— 中间的阵亡会丢,
-                # 死亡时刻修正就少数据(2026-10-23 西奈半岛那局只采到 11 条就是这样)
-                log.warning("全局录制: hudmsg 的 id 跳跃 %d -> %d(中间 %d 条没拿到, "
-                            "环形缓冲区可能已滚动)", self._hud_cursor, lo,
-                            lo - self._hud_cursor)
-            log.info("全局录制: hudmsg 增量 %d 条(其中阵亡 %d 条), 游标 %d -> %d",
-                     len(rows), len(new), self._hud_cursor, max(ids))
-            self._hud_cursor = max(self._hud_cursor, max(ids))
-        except ValueError:
-            pass
+        log.info("全局录制: hudmsg 新增阵亡 %d 条(%d 条消息), 游标 -> %d",
+                 len(new), len(rows), self._hud_cursor)
         return len(new)
 
     def _collect_kills(self, rec) -> None:
