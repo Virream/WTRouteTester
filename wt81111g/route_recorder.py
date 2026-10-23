@@ -66,12 +66,17 @@ ZONE_COLOR_STEP = 12
 HUD_POLL_INTERVAL = 0.5
 
 # ---- “已回车库”的判据(用户 2026-10-23 定, 只认这三条)
-# ① **8111 断开连接** —— 最可靠的信号: 用户实测“从战局回到车库时 8111 会断一下”;
+# ① **8111 断开连接** —— 最可靠的信号: 实测“回到车库时 8111 会重启, 断一下”;
+#    信号就是主界面那个 `connected`(每帧请求 `/indicators`, 拿不到就变成
+#    “未连接到 8111”) —— 它很灵敏, 这里只是多留 `DISCONNECT_STOP` 秒确认,
+#    以免一次偶发超时就把整局停掉(实测单次超时 ~40~200ms)。
 # ② 地图图片变成占位 “?” 图 → 立刻停(车库专用图, 见 `PLACEHOLDER_MAP_SHA1`);
 # ③ **连续拿不到地图图片** → 停(8111 已退出/断开时 `/map.img` 会直接失败)。
 # ⚠ 绝不能用“场上没有可录单位”判停 —— 没车 ≠ 结束, 有重生点就能再出车。
-MAP_MISS_STOP = 5          # 连续几次拿不到 /map.img(map_interval=2s ⇒ 约 10s)
-DISCONNECT_STOP = 5.0      # /indicators 连续拿不到多久(秒)算“8111 已断开”
+MAP_MISS_STOP = 3          # 连续几次拿不到 /map.img(map_interval=2s ⇒ 约 6s)
+# 断开确认时长(秒): 用户实测“回车库时 8111 重启, 断开远小于 5 秒”,
+# 所以不要用 5 秒那样的大数 —— 0.4 秒(约 10 帧)足够区分“真断开”与“单次超时”。
+DISCONNECT_STOP = 0.4
 
 # 轮询/采样间隔: 默认 40ms(≈25Hz)。
 # 实测 8111 陆战数据本身約每 40ms 更新一次(rpm 变化间隔 p50=40ms),
@@ -471,17 +476,18 @@ class RouteRecorder(QObject):
         vehicle = str(ind.get("type") or "") if ind else ""
         speed = _to_float(ind.get("speed")) or 0.0
         # “已回车库”判据之一(也是最可靠的一款): **8111 断开**。
-        # 用户实测: 从战局回到车库时 8111 会断一下 —— 所以这里把“连续拿不到
-        # /indicators”当回库信号; 但要**连续**够久才算, 因为战局内换图/换局那
-        # 一两秒 8111 也会偶尔超时(实测 mission/hudmsg 要 1.7~2 秒)。
+        # 这里用的就是主界面显示“未连接到 8111”的那个 `connected` 信号
+        # (每帧请求 `/indicators`, 拿不到就是断)。用户实测: 回到车库时 8111 会重启,
+        # 断开很快就恢复 —— 所以确认时长只要 `DISCONNECT_STOP`(0.4s), 不要 5 秒。
+        # ⚠ “等待第一名玩家重生”期间不判(那是进局加载, 也会断一下)。
         if connected:
             self._disconnected_since = 0.0
-        elif self._global is not None:
+        elif self._global is not None and not self._global_waiting:
             if self._disconnected_since == 0.0:
                 self._disconnected_since = now
-                log.info("全局录制: 8111 暂时无响应(可能在换局 / 已回车库)")
+                log.info("全局录制: 8111 无响应(可能在换局 / 已回车库)")
             elif now - self._disconnected_since >= DISCONNECT_STOP:
-                log.info("全局录制: 8111 已连续 %.0fs 无响应(断开连接), "
+                log.info("全局录制: 8111 已断开 %.1fs(回到车库时 8111 会重启), "
                          "判为已回车库, 自动停止", DISCONNECT_STOP)
                 self._disconnected_since = 0.0
                 self._do_global_stop()
