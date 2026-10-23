@@ -85,13 +85,15 @@ DISCONNECT_STOP = 0.4
 DEFAULT_INTERVAL_MS = 40.0
 
 # 全局录制的轮询间隔(毫秒): **与单条录制分开设**(2026-10-23 用户要求)。
-# 默认同 40ms; 想省体积/减开销可以单独降到 100~200ms, 不影响单条轨迹。
-DEFAULT_GLOBAL_INTERVAL_MS = 40.0
+# 2026-10-24 用户把默认值改为 **100ms(10Hz)**: 全局路线只关心“大概怎么走的”,
+# 10Hz 足够, 而且能把/双倍减少 /map_obj 请求量(单条录制仍是 40ms)。
+DEFAULT_GLOBAL_INTERVAL_MS = 100.0
 
 # `/hudmsg` 的轮询间隔(毫秒): 独立的第三档。
-# 500ms 是 **8111 自己网页的频率**(`setInterval(updateSlow, 500)`);
-# 调大很危险: damage 是滚动窗口, 交火期几秒就能滚过一小批。
-DEFAULT_HUD_INTERVAL_MS = 500.0
+# 2026-10-24 用户把默认值改为 **2000ms**: 击毁消息只用于事后修正, 2 秒一次够用。
+# ⚠ 但这是**上限风险区**: damage 是滚动窗口, 交火密集时 2 秒的增量可能超过窗口
+# (实测 15 秒会大量丢失; 2 秒未测)。日志里出现“id 跳跃”警告时就该调小。
+DEFAULT_HUD_INTERVAL_MS = 2000.0
 DEFAULT_INTERVAL = DEFAULT_INTERVAL_MS / 1000.0
 DEFAULT_HZ = 1.0 / DEFAULT_INTERVAL
 _MIN_INTERVAL = 0.01          # 最快 100Hz(10ms)

@@ -93,6 +93,11 @@ INTERVAL_CHOICES_MS = (20, 25, 30, 40, 50, 75, 100)
 # (damage 是滚动窗口), 所以上限只给到 2 秒。
 HUD_CHOICES_MS = (200, 300, 500, 800, 1000, 2000)
 
+# 设置版本: **改了某一项的“默认值”就递增**。
+# QSettings 会记住用户上次选的值, 不重置的话新默认对老用户永远不生效。
+# 2 = 2026-10-24 全局轮询 40→100ms、hudmsg 500→2000ms
+SETTINGS_VERSION = 2
+
 
 def rate_choice_ms(ms, choices=INTERVAL_CHOICES_MS) -> int:
     """把任意毫秒值归一成选项里的一个(取最接近的), 默认取表里的 40。"""
@@ -168,6 +173,15 @@ class RouteTesterWindow(QMainWindow):
         # **三档分开**(2026-10-23 用户要求): 单条录制 / 全局录制 / hudmsg。
         # 入口在菜单「设置 → 轮询间隔」—— 主界面不再放这个下拉框(见上方常量注释)。
         self._settings = QSettings("WTBlackList", "RouteTester")
+        # 默认值改过(见 SETTINGS_VERSION) → 把老用户存的值清掉, 让新默认生效
+        try:
+            _ver = int(self._settings.value("settings_version", 1))
+        except (TypeError, ValueError):
+            _ver = 1
+        if _ver < SETTINGS_VERSION:
+            for _key in ("global_interval_ms", "hud_interval_ms"):
+                self._settings.remove(_key)
+            self._settings.setValue("settings_version", SETTINGS_VERSION)
 
         def _saved_int(key: str, default: float, choices) -> int:
             try:
@@ -718,7 +732,7 @@ class RouteTesterWindow(QMainWindow):
         self.btn_play.clicked.connect(self._toggle_playback)
         play_box.addWidget(self.btn_play)
 
-        self.btn_play_mark = QPushButton("⏭ 到下一标记暂停")
+        self.btn_play_mark = QPushButton("» 到下一标记暂停")
         self.btn_play_mark.setMinimumHeight(30)
         self.btn_play_mark.clicked.connect(self._play_to_next_mark)
         play_box.addWidget(self.btn_play_mark)
@@ -2539,7 +2553,9 @@ class RouteTesterWindow(QMainWindow):
                 f"回放 {fmt_time_ms(t)} / {fmt_time(self.player.end)}{n}")
 
     def _on_playback_state(self, playing: bool) -> None:
-        self.btn_play.setText("⏸ 暂停" if playing else "▶ 回放")
+        # 用文本符号而不是 emoji: ⏸/⏭ 在 Windows 上会被 Segoe UI Emoji 渲染成彩色
+        # 图标, 与旁边的 ▶/■ 风格不一致(用户 2026-10-24 提的)
+        self.btn_play.setText("‖ 暂停" if playing else "▶ 回放")
         self._update_buttons()
 
     def _on_playback_finished(self) -> None:
