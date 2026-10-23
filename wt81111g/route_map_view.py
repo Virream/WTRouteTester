@@ -53,8 +53,10 @@ COLOR_DIR_LINE = QColor("#f8fafc")   # 回放朝向线颜色(白, 与回放光�
 COLOR_HISTORY = QColor("#8fa6c8")
 # 回放时**尚未播放**的轨迹段: 半透明淡色 —— 半透明只用在这里
 COLOR_UNPLAYED = QColor(140, 160, 200, 120)
-# 回放中“这个玩家已经阵亡”的线路: **半透明纯灰**(不带蓝味, 与未播放的底衬区分开)
-COLOR_DEAD_ROUTE = QColor(170, 176, 188, 120)
+# 回放中“这个玩家已经阵亡”的线路: **半透明纯灰**(不带蓝味, 与未播放的底衬区分开)。
+# ⚠ alpha 从 120 提到 165(2026-10-23): 实测一条只有几十米长的短轨迹(比如原地待机
+# 的防空车)在深色底图上用 120 几乎看不见, 用户以为“线段突然消失了”。
+COLOR_DEAD_ROUTE = QColor(170, 176, 188, 165)
 # 阵亡位置的红叉: **细而小的两笔**, 平头端点(圆头看起来会发胖/像描边)
 # 颜色按“哪一队录的”区分: A 队 = 蓝(与 8111 的我方蓝一致), B 队 = 红
 COLOR_DEAD_MARK = QColor("#ff3b30")       # 默认/B 队: 红
@@ -1457,16 +1459,20 @@ class RouteMapView(QWidget):
 
         * 未阵亡: 只画已播放的彩色前缀(未播放部分完全不可见);
         * 已阵亡且勾了“被击毁后路线变暗”: 整条画成半透明纯灰;
-        * 已阵亡但没勾: 什么都不画(等于直接清除)。
+        * 已阵亡但**没勾**: 照常按速度配色画已播放部分。
+
+        ⚠ 第三条例以前写成了“什么都不画(等于直接清除)” —— 那不是“不变暗”,
+        而是整条线凭空消失(2026-10-23 用户实测: 一条短轨迹播到阵亡时刻就像没了)。
         """
         if self._show_spawns:
             self._draw_spawns(p)
         for rec in self._playback_recs:
-            if not self._dead_now(rec, self._playhead):
-                k, _mid = self._played_prefix(rec, self._playhead)
-                self._draw_play_prefix(p, rec, k)
-            elif self._dead_dim:
+            dead = self._dead_now(rec, self._playhead)
+            if dead and self._dead_dim:
                 self._draw_play_underlay(p, rec, COLOR_DEAD_ROUTE)
+                continue
+            k, _mid = self._played_prefix(rec, self._playhead)
+            self._draw_play_prefix(p, rec, k)
 
     def _play_prefix_geom(self, rec, k: int) -> _LiveGeom:
         """该线路“已播放前缀”的分桶几何(增量缓存, 供重复绘制用)。"""
@@ -1740,7 +1746,8 @@ class RouteMapView(QWidget):
         if len(rec.points) < 2 or not self._scaled(p):
             return
         try:
-            p.setPen(QPen(color or COLOR_UNPLAYED, 2.0 / self._px_scale()))
+            # 线宽与正常回放段一致 —— 阵亡线变细的话, 短轨迹几乎就看不见了
+            p.setPen(QPen(color or COLOR_UNPLAYED, PLAY_PEN / self._px_scale()))
             p.drawPolyline(self._px_line(rec))
         finally:
             p.restore()
@@ -1867,10 +1874,11 @@ class RouteMapView(QWidget):
         多条同时回放时: 每条各自按自己的 playhead 切分(时间轴相同),
         因此较短的那条会自然地“跑完停在终点”。
         """
-        if self._dead_now(rec, head):
-            if self._dead_dim:                      # 勾了“变暗”才留整条灰
-                self._draw_play_underlay(p, rec, COLOR_DEAD_ROUTE)
+        if self._dead_now(rec, head) and self._dead_dim:
+            # 阵亡且勾了“变暗”: 整条半透明灰
+            self._draw_play_underlay(p, rec, COLOR_DEAD_ROUTE)
         else:
+            # 活着, 或阵亡但**没勾变暗** → 照常按速度配色画已播放部分
             k, _mid = self._played_prefix(rec, head)
             self._extend_play(p, rec, 0, k)
         self._draw_play_marks(p, rec, head, labels=labels)

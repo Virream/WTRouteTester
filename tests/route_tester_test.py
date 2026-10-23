@@ -3142,12 +3142,14 @@ def test_dead_style(tmpdir: str):
               after.pixelColor(x, y))]
     assert xs and max(xs) - min(xs) + 1 <= 9, f"红叉太大了: {max(xs) - min(xs) + 1}px"
 
-    # ③ 关掉“变暗”: 整条线路清除(既不画灰也不画彩), 红叉仍在
+    # ③ 关掉“变暗”: 线路**照常按速度配色显示**(不是清除 —— 用户 2026-10-23:
+    #    一条短轨迹播到阵亡时刻就像凭空没了。取消“变暗”应该等于“不变暗”,
+    #    而不是“整条不画”)。红叉仍在。
     #    (速度配色本身就可能是红的, 所以红叉一律用“开关前后的差值”来断言)
     view.set_dead_style(dim=False)
     after2 = shot(12.0)
-    assert sat(at(after2, 0.20, 0.5)) < 30, \
-        f"关掉变暗后阵亡线路应被清除(取到底图色), 实际 {at(after2, 0.20, 0.5)}"
+    assert sat(at(after2, 0.20, 0.5)) > 60, \
+        "关掉变暗后阵亡线路应照常着色(饱和度>60), 实际 %s" % (at(after2, 0.20, 0.5),)
     view.set_dead_style(dim=False, mark=False)
     after2b = shot(12.0)
     assert red_pixels(after2, 0.55, 0.5) > red_pixels(after2b, 0.55, 0.5) + 3, \
