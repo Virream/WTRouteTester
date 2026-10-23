@@ -227,6 +227,27 @@ def test_no_units_does_not_stop(tmpdir: str):
     results.append("全局录制: 没车不停, 只有回车库(占位图/断链/拿不到地图)才停 OK")
 
 
+def test_tick_interval_follows_mode(tmpdir: str):
+    """主循环频率跟着**当前在录的那种**走(2026-10-23 用户实测):
+    全局设 10 Hz(100ms) 后, 叠加层/状态栏却仍显示 25 Hz —— 因为以前写成
+    `min(单条, 全局)`, 主循环一直在按单条的 40ms 跑, 用户设的 100ms 等于白设。
+    """
+    from wt81111g.route_recorder import RouteRecorder
+
+    store = RouteStore(os.path.join(tmpdir, "interval.json"))
+    rec = store.new_global("IV", "地图 I")
+    store.add_global(rec)
+    run = RouteRecorder(store)
+    run.set_interval_ms(40)             # 单条 25 Hz
+    run.set_global_interval_ms(100)     # 全局 10 Hz
+    assert abs(run._tick_interval() - 0.040) < 1e-6, run._tick_interval()
+    run._global = rec                   # 全局录制中
+    assert abs(run._tick_interval() - 0.100) < 1e-6, run._tick_interval()
+    run._global = None                  # 结束 → 回到单条录制频率
+    assert abs(run._tick_interval() - 0.040) < 1e-6, run._tick_interval()
+    results.append("主循环频率跟随当前录制的轮询率(全局 10Hz 就是 10Hz) OK")
+
+
 def test_air_view_never_stops():
     """处于“空中视角坐标系”时, **多长都没地面单位也不停**(真正的回库由地图占位图判)。
 
@@ -1662,6 +1683,7 @@ def main() -> int:
     test_slow_move_speed()
     test_air_view_keeps_recording()
     test_no_units_does_not_stop(tmpdir)
+    test_tick_interval_follows_mode(tmpdir)
     test_air_view_never_stops()
     test_tracker_dead_flag()
     test_timeline_note()

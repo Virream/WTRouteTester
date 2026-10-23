@@ -451,10 +451,8 @@ class RouteRecorder(QObject):
             except Exception as exc:  # noqa: BLE001 - 单次异常不应终止线程
                 log.exception("route recorder tick error: %s", exc)
             # 目标周期调度(而非“固定 sleep”), 否则请求耗时会被叠加, 实际频率远低于设定值。
-            # ⚠ 主循环速度 = **两者中更快的那个**: 单条录制与全局录制各有各的轮询率,
-            # 主循环必须能满足快的那一个, 慢的那个自己节流(见 `_tick`)。
-            with self._interval_lock:
-                interval = min(self.interval, self.global_interval)
+            # 主循环速度跟着**当前在录的那种**走(见 `_tick_interval`)。
+            interval = self._tick_interval()
             next_at += interval
             delay = next_at - time.monotonic()
             if delay <= 0.0:        # 跟不上(请求耗时过长)则重置, 避免累积滞后
@@ -462,6 +460,17 @@ class RouteRecorder(QObject):
                 delay = 0.0
             self._stop.wait(delay)
         log.info("route recorder stopped")
+
+    def _tick_interval(self) -> float:
+        """主循环该跑多快 —— 正在全局录制就用**全局录制轮询率**, 否则用单条录制的。
+
+        两者是互斥的, 所以不取 min: 以前写成 `min(单条, 全局)`, 结果把全局设成
+        10 Hz(100ms)时, 主循环仍然按单条的 25 Hz 在请求 —— 叠加层/状态栏显示的
+        也是 25 Hz, 用户设的 100ms 等于白设(2026-10-23 用户实测指出)。
+        """
+        with self._interval_lock:
+            return (self.global_interval if self._global is not None
+                    else self.interval)
 
     def _tick(self) -> None:
         now = time.monotonic()
