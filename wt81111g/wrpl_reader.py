@@ -55,6 +55,7 @@ OFF_SERVER_FLAG = 742
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 PACKET_MPI = 4
+PACKET_ECS = 6                  # Danet ECS：实体创建/销毁（载具身份的唯一权威来源）
 SIG_GROUND_CLIENT = 0xF073
 SIG_GROUND_SERVER = 0xF074
 SIG_SLOT = 0xF02D               # 玩家槽位（名字/军团/队伍）
@@ -577,6 +578,13 @@ class ReplayData:
     damages: int = 0
     # 飞机/直升机：uid → [(秒, x, y, z)]（**独立的 uid 空间**，与地面数值会重叠）
     air_units: dict[int, list[tuple[float, float, float, float]]] = field(default_factory=dict)
+    # ECS(ptype=6) 实体档案：每辆载具的 uid / 玩家 / 阵营 / 型号 / 出现与消失时刻。
+    # 见 wrpl_entities.py —— 这是「这辆车是谁的」的**权威来源**，比从击杀事件
+    # 反推可靠（击杀只能覆盖参战过的车，且 uid 复用时会张冠李戴）。
+    vehicles: list = field(default_factory=list)
+    ecs_templates: dict[int, int] = field(default_factory=dict)
+    ecs_group_size: int = 0         # 出生组每组人数 K（16v16 时 16）
+    ecs_uid_offset: int | None = None
     t_first: float = 0.0
     t_last: float = 0.0
 
@@ -715,8 +723,10 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
     nfiles = len(files)
     # 延迟导入：wrpl_events / wrpl_air 依赖本模块的 BitReader，模块级导入会循环
     from .wrpl_air import PACKET_FLIGHT_MODEL, parse_fm_packet          # noqa: PLC0415
+    from .wrpl_entities import EcsCollector                          # noqa: PLC0415
     from .wrpl_events import (                                       # noqa: PLC0415
         parse_damage_packet, parse_kill_packet, parse_slot_packet)
+    ecs = EcsCollector()
     hist: dict[int, DeltaHistory] = {}
     raw: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
     air: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
@@ -748,6 +758,13 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
                             air[auid].append((ms / 1000.0, pos[0], pos[1], pos[2]))
                 except (ValueError, EOFError, IndexError):
                     data.failed_packets += 1
+                continue
+            if ptype == PACKET_ECS:
+                if e > s:
+                    try:
+                        ecs.feed(payload, s, e, ms)
+                    except (ValueError, EOFError, IndexError):
+                        data.failed_packets += 1
                 continue
             if ptype != PACKET_MPI or e - s < 12:
                 continue
@@ -818,4 +835,16 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
         all_t = [rows[0][0] for rows in raw.values()] + [rows[-1][0] for rows in raw.values()]
         data.t_first, data.t_last = min(all_t), max(all_t)
     data.kills.sort(key=lambda k: k.t)
+    # ECS 实体档案 —— uid 偏移要用 MPI 的 uid 集合现场标定, 所以只能放在最后
+    note("解析实体档案 …", 1.0)
+    try:
+        res = ecs.build(known_uids=set(data.units), players=data.players,
+                        kills=data.kills, t_end=data.t_last)
+    except (ValueError, EOFError, IndexError, KeyError):
+        res = None
+    if res is not None:
+        data.vehicles = res.vehicles
+        data.ecs_templates = res.templates
+        data.ecs_group_size = res.group_size
+        data.ecs_uid_offset = res.uid_offset
     return data

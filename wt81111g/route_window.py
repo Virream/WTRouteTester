@@ -1017,6 +1017,33 @@ class RouteTesterWindow(QMainWindow):
         tooltip.append("右键可标记为 A/B 队录制目标、指定观战玩家或删除")
         item.setToolTip(_COL_NAME, "\n".join(tooltip))
         parent.addChild(item)
+
+        def _add_life_item(parent_item: QTreeWidgetItem, life, side_key: str) -> None:
+            """一辆车的线路行。"""
+            # 已经在玩家分组下面了，没必要再把玩家名重复一遍 -> 只留型号
+            title = life.label
+            if getattr(life, "player", "") and getattr(life, "vehicle_cls", ""):
+                title = f"{life.short_id}  {fmt_time(life.t0)}  {life.vehicle_cls}"
+            litem = QTreeWidgetItem(["", title, fmt_time(life.duration)])
+            litem.setData(0, _ROLE_KIND, "glife")
+            litem.setData(0, _ROLE_ID, life.life_id)
+            litem.setData(0, _ROLE_SIG, side_key)
+            litem.setData(0, _ROLE_KEY, g.route_id)
+            litem.setIcon(_COL_EYE, eye_icon(life.life_id in self._visible_lives))
+            litem.setToolTip(_COL_EYE, "点击显示 / 隐藏这条线路")
+            detail = f"线路 {life.short_id}（{side_key} 队）· {life.icon or life.obj_type}"
+            if life.player:
+                detail += f"\n玩家 {life.player}"
+            if life.vehicle_cls:
+                detail += f"\n型号 {life.vehicle_cls}"
+            detail += (f"\n出现 {fmt_time(life.t0)} → 消失 {fmt_time(life.t1)}"
+                       f"\n点数 {len(life.points)} · 最高速 "
+                       f"{fmt_speed(max((p.speed for p in life.points), default=0.0))} km/h")
+            detail += "\n（已阵亡）" if life.dead else "\n（到对局结束还在场上）"
+            detail += f"\n色标 {life.color or '-'}(8111 原始颜色, 仅参考)"
+            litem.setToolTip(_COL_NAME, detail)
+            parent_item.addChild(litem)
+
         for side in GLOBAL_SIDES:
             lives = g.lives(side)
             sitem = QTreeWidgetItem(["", GLOBAL_SIDE_LABELS[side], f"{len(lives)} 条"])
@@ -1032,23 +1059,60 @@ class RouteTesterWindow(QMainWindow):
                              "回放的 /map_obj.json 只给**观战那一方**的单位,\n"
                              "所以要分两次录制: 一次观战 A 方, 一次观战 B 方。")
             item.addChild(sitem)
-            # 组内按开始时间**正序**(越靠前时间越早) —— 与单条路线(倒序)刚好相反
+            # ---- 按**玩家**分组（回放导入才能拿到玩家名）--------------------------
+            # 同一个玩家一局里会死很多次、开过很多台车; 以前全平铺在一层里,
+            # 想跟一个人的完整轨迹得自己数。现在: 队 → 玩家 → 各台车,
+            # 玩家按首次出现时间排序, 载具按出场时间正序。
+            groups: dict[str, list] = {}
             for life in sorted(lives, key=lambda x: (x.t0, x.life_id)):
-                litem = QTreeWidgetItem(["", life.label, fmt_time(life.duration)])
-                litem.setData(0, _ROLE_KIND, "glife")
-                litem.setData(0, _ROLE_ID, life.life_id)
-                litem.setData(0, _ROLE_SIG, side)
-                litem.setData(0, _ROLE_KEY, g.route_id)
-                litem.setIcon(_COL_EYE, eye_icon(life.life_id in self._visible_lives))
-                litem.setToolTip(_COL_EYE, "点击显示 / 隐藏这条线路")
-                litem.setToolTip(_COL_NAME,
-                                 f"线路 {life.short_id}（{side} 队）· "
-                                 f"{life.icon or life.obj_type}\n"
-                                 f"出现 {fmt_time(life.t0)} → 消失 {fmt_time(life.t1)}\n"
-                                 f"点数 {len(life.points)} · 最高速 "
-                                 f"{fmt_speed(max((p.speed for p in life.points), default=0.0))} km/h\n"
-                                 f"色标 {life.color or '-'}(8111 原始颜色, 仅参考)")
-                sitem.addChild(litem)
+                groups.setdefault(getattr(life, "player", "") or "", []).append(life)
+            for player in sorted(groups, key=lambda p: (not p, groups[p][0].t0)):
+                glives = groups[player]
+                if not player:                   # 8111 录制的没有玩家名 -> 照旧平铺
+                    for life in glives:
+                        _add_life_item(sitem, life, side)
+                    continue
+                total = sum(l.duration for l in glives)
+                dead_n = sum(1 for l in glives if l.dead)
+                # 一辆车可能因为「隔太久没上报 / 一步瞬移」被切成多段，各自是独立
+                # 的线路（方便单独看/单独隐藏）。所以这里要分两种口径：
+                #   * 台数 = 去掉 `_N` 段号后的去重数（不然一辆车数成三辆）
+                #   * 存活 = 这些段的**区间并集**（直接求和会把重叠时间算两遍）
+                seen_cars: set[str] = set()
+                for l in glives:
+                    sid = l.short_id
+                    head, _, tail = sid.rpartition("_")
+                    seen_cars.add(head if (head and tail.isdigit()) else sid)
+                iv = sorted((l.t0, l.t1) for l in glives)
+                total = 0.0
+                if iv:
+                    a0, b0 = iv[0]
+                    for a, b in iv[1:]:
+                        if a <= b0:
+                            b0 = max(b0, b)
+                        else:
+                            total += b0 - a0
+                            a0, b0 = a, b
+                    total += b0 - a0
+                pitem = QTreeWidgetItem([
+                    "",
+                    f"{player} · {len(seen_cars)} 台 · 存活 {fmt_time(total)}",
+                    f"阵亡 {dead_n}"])
+                pitem.setData(0, _ROLE_KIND, "gplayer")
+                pitem.setData(0, _ROLE_ID, g.route_id)
+                pitem.setData(0, _ROLE_SIG, side)
+                pitem.setData(0, _ROLE_KEY, f"gplayer|{g.route_id}|{side}|{player}")
+                pitem.setFlags(GROUP_ITEM_FLAGS)
+                pitem.setIcon(_COL_EYE, eye_icon(any(
+                    l.life_id in self._visible_lives for l in glives)))
+                pitem.setToolTip(_COL_EYE, "点击显示 / 隐藏这位玩家的全部线路")
+                pitem.setToolTip(_COL_NAME,
+                                 f"{player}（{GLOBAL_SIDE_LABELS[side]}）\n"
+                                 f"载具 {len(seen_cars)} 台（{len(glives)} 段轨迹）· "
+                                 f"在场 {fmt_time(total)} · 阵亡 {dead_n} 段")
+                sitem.addChild(pitem)
+                for life in glives:
+                    _add_life_item(pitem, life, side)
 
     def _reload_tree(self) -> None:
         # 重建前先记住哪些分组是折叠的: 「地图管理」关掉、录完一条轨迹、改名或删除
@@ -1253,7 +1317,7 @@ class RouteTesterWindow(QMainWindow):
                 return
             route_id = item.data(0, _ROLE_ID)
             self._set_visible(item, route_id not in self._visible_ids)
-        elif kind in ("glife", "gside", "global"):
+        elif kind in ("glife", "gside", "global", "gplayer"):
             if self._in_playback():
                 self._set_status("回放中无法修改轨迹显示, 请先点「■ 结束播放」", sticky=2.0)
                 return
@@ -2101,7 +2165,7 @@ class RouteTesterWindow(QMainWindow):
             elif kind == "glife":
                 item.setIcon(_COL_EYE,
                              eye_icon(item.data(0, _ROLE_ID) in self._visible_lives))
-            elif kind in ("global", "gside"):
+            elif kind in ("global", "gside", "gplayer"):
                 ids = self._life_ids_of(item)
                 item.setIcon(_COL_EYE,
                              eye_icon(any(i in self._visible_lives for i in ids)))

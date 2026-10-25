@@ -51,6 +51,9 @@ class ImportStats:
     air_lives: int = 0         # 飞机生成的线路数
     damages: int = 0           # 严重伤害事件数（用来补 uid ↔ 玩家）
     deaths: int = 0            # 判定为“被击毁”的线路数
+    ecs_vehicles: int = 0      # ECS 解出的玩家载具数
+    ecs_bound: int = 0         # 其中成功绑定玩家/阵营的
+    ecs_group: int = 0         # 出生组每组人数 K（16v16 时为 16）
 
 
 def _robust_range(values: list[float]) -> tuple[float, float]:
@@ -141,6 +144,16 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         if ev.killer_uid != EXT_MASK_UID and ev.vehicle:
             vehicle_of.setdefault(ev.killer_uid, ev.vehicle)
 
+    # ---- 载具档案（ECS）--------------------------------------------------
+    # 这是「这辆车是谁的」的**权威来源**：出生组名 `tN_playerMM_K` 在构造块里是
+    # **明文**，而槽位公式（t1 -> NN-1, t2 -> NN-1+K）已用击杀事实 32/32 验证。
+    # 以前只能从击杀事件反推，覆盖不到 3 成，而且 uid 复用时会张冠李戴。
+    vans: dict[int, list] = {}
+    for v in getattr(data, "vehicles", ()):
+        vans.setdefault(v.uid, []).append(v)
+    for _lst in vans.values():
+        _lst.sort(key=lambda v: v.born_t)
+
     def _side(uid: int) -> str:
         pid = data.uid_pid.get(uid)
         return "B" if teams.get(pid) == 2 else "A"
@@ -152,6 +165,24 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         if who:
             return f"{who} · {car}" if car else who
         return car or f"uid{uid}"
+
+    def _split_jumps(rows: list) -> list[list]:
+        """把一段轨迹按「长时间无上报」或「一步瞬移」切开。"""
+        out: list[list] = []
+        cur: list = []
+        for item in rows:
+            if cur:
+                dt = item[0] - cur[-1][0]
+                d = ((item[1] - cur[-1][1]) ** 2
+                     + (item[3] - cur[-1][3]) ** 2) ** 0.5
+                if dt > GAP_SPLIT_SEC or (d > JUMP_MIN_M and dt > 0
+                                          and d / dt > JUMP_MAX_MPS):
+                    out.append(cur)
+                    cur = []
+            cur.append(item)
+        if cur:
+            out.append(cur)
+        return out
 
     # ---- 载具死亡时刻（来自 Kill 包）--------------------------------------
     # 服务器回放 24 Hz 全量上报，所以“uid 不再出现”本身就能看出车没了；但 kill 包
@@ -167,7 +198,25 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         _v.sort()
 
     for uid, rows in sorted(data.units.items()):
-        dl = deaths.get(uid, [])
+        # ECS 给出了这辆车的**存活窗口** [born, died]。窗口之外的采样点一定属于
+        # 别的东西(uid 被复用给微型侦察无人机 / 别的实体), 留着就会让同一玩家在
+        # 同一时刻"开着两台车"(2026-10-25 实测: A25_3 从 01:39 一直画到 16:30,
+        # 而这位玩家 01:42 已经换车了)。这里先按窗口硬裁, 再走下面的切段逻辑。
+        _win = vans.get(uid, ())
+        if _win:
+            _tol = 2.0
+            rows = [r for r in rows
+                    if any(v.born_t - _tol <= r[0]
+                           <= ((v.died_t + _tol) if v.died_t is not None else 1e9)
+                           for v in _win)]
+        # ECS 的「销毁时刻」也是切段点：uid 被复用后，前一辆车销毁的那一刻
+        # 就是分界（比“看不见了”精确，也比速度跳变检测稳）
+        dl = list(deaths.get(uid, ()))
+        for _v0 in vans.get(uid, ()):
+            # "end" = 到对局结束还在, 不是死亡
+            if _v0.died_t and _v0.died_by != "end":
+                dl.append(_v0.died_t)
+        dl.sort()
         di = 0
         segs: list[tuple[list[tuple[float, float, float, float]], float]] = []
         cur: list[tuple[float, float, float, float]] = []
@@ -194,6 +243,10 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
             cur.append(item)
         if cur:
             segs.append((cur, 0.0))
+        # 同一个 uid 的多段轨迹**共用一个基号**（A25_1 / A25_2 / A25_3）。
+        # 以前每段都重新取 `len(sides)+1`，一辆车被切成三段就变成 A25_1 / A26_2 /
+        # A27_3，侧栏按玩家分组时会把一辆车数成三辆、时长也重复累加。
+        _base: dict[str, int] = {}
         for si, (seg, death_at) in enumerate(segs, 1):
             # 太短/几乎没动的段直接丢弃: 以前只验点数 >= 3，结果那辆“只被看见 1.4 秒”
             # 的车留在地图上就是一个孤立小点（用户 2026-10-25: 两个角上有 A1/A11）
@@ -242,12 +295,35 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                                       speed=speed))
                 prev = (t, x, z)
             side = _side(uid)
-            if data.uid_pid.get(uid) is not None:
+            # 段的归属：用**段首时刻**在这段轨迹的 ECS 档案里查 —— 同一个 uid
+            # 被复用（死后重生 / 操作微型无人机）时，前后段可以属于不同玩家。
+            veh = None
+            _ts = seg[0][0]
+            for _cand in vans.get(uid, ()):
+                if _cand.born_t - 1.0 <= _ts <= (_cand.died_t + 1.0
+                                                 if _cand.died_t is not None else 1e9):
+                    veh = _cand
+                    break
+            if veh is not None and veh.team:
+                side = "B" if veh.team == 2 else "A"
+            if veh is not None and veh.player:
                 stats.mapped += 1
+            elif data.uid_pid.get(uid) is not None:
+                stats.mapped += 1
+            # 基号按**队**分配，但同一个 uid 在同一队里只占一个号
+            if side not in _base:
+                _base[side] = len(rec.sides[side]) + 1
+            # 归属兜底：ECS 档案没命中时，用 uid->pid 的名字让侧栏还能归组
+            # （这条只用于显示分组，`bind` 仍然是 none，不算“已解析出玩家”）。
+            _who = (veh.player if veh is not None and veh.player
+                    else (names.get(data.uid_pid.get(uid)) or ""))
             life = UnitLife(
-                life_id=f"{rec.route_id}:{side}{len(rec.sides[side]) + 1}"
+                life_id=f"{rec.route_id}:{side}{_base[side]}"
                         + (f"_{si}" if len(segs) > 1 else ""),
-                icon=_label(uid),
+                icon=veh.label if veh is not None else _label(uid),
+                player=_who,
+                vehicle_cls=(veh.short_cls if veh is not None
+                             else (vehicle_of.get(uid) or "")),
                 obj_type="ground_model",
                 color="#174DFF" if side == "A" else "#FF4D4D",
                 map_key=rec.map_key,
@@ -303,6 +379,10 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
             stats.air_lives += 1
 
     stats.air_units = len(data.air_units)
+    stats.ecs_vehicles = len(getattr(data, "vehicles", ()))
+    stats.ecs_bound = sum(1 for v in getattr(data, "vehicles", ())
+                          if v.team is not None)
+    stats.ecs_group = getattr(data, "ecs_group_size", 0)
     return rec, stats
 
 

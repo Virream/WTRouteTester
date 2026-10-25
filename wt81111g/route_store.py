@@ -268,6 +268,11 @@ class UnitLife:
     # 车的线 8111 给的是 `icon=SAM`、只有颜色是自己黄, 而 B 队整队一条 `icon=Player`
     # 都没有 —— 只按 icon 认会全漏)。
     watched: bool = False
+    # ---- 回放导入（ECS）专有：8111 录制时这两个字段为空 ----
+    # 玩家名。侧栏按它分组，所以要跟 `icon`（"玩家 · 型号"）分开存。
+    player: str = ""
+    # 内部型号名（如 `tankModels/cn_ztz_96b`），画图标/查类别可以用。
+    vehicle_cls: str = ""
 
     @property
     def route_id(self) -> str:
@@ -340,6 +345,11 @@ class UnitLife:
             out["death_t"] = round(self.death_t, 2)
         if self.watched:
             out["w"] = 1
+        # 回放导入才能拿到的玩家身份 —— 不写就重启后分组全没了
+        if self.player:
+            out["player"] = self.player
+        if self.vehicle_cls:
+            out["cls"] = self.vehicle_cls
         if self.trimmed:
             # 只存被截掉的尾巴 —— 未修正的线没有这个字段, 旧数据也不需要兼容
             out["trim"] = [_pack_point(p) for p in self.trimmed]
@@ -372,6 +382,8 @@ class UnitLife:
             death_t=death_t,
             trimmed=read_points(data.get("trim")),
             watched=bool(data.get("w")),
+            player=str(data.get("player") or ""),
+            vehicle_cls=str(data.get("cls") or ""),
         )
 
 
