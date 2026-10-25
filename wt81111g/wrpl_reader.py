@@ -42,6 +42,7 @@
 from __future__ import annotations
 
 import os
+import re
 import struct
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -439,6 +440,7 @@ class ReplayData:
     visibility: str = ""
     server: bool = False
     parts: int = 1
+    source: str = ""                # 第一个分片的路径（用来从文件名取录制时刻）
     packets: int = 0
     failed_packets: int = 0
     # uid -> [(秒, x 东, 高度, z 北)]，已按时间排序
@@ -456,45 +458,152 @@ def _level_stem(level: str) -> str:
     return base[:-4] if base.lower().endswith(".bin") else base
 
 
-def _list_parts(path: str) -> list[str]:
-    """服务器回放：目录下的 *.wrpl 按文件名排序（分片号在文件头里，见 parse_header）。"""
-    if os.path.isfile(path):
-        raise ValueError(
-            "服务器回放要选**分片所在的目录**，不能只选一个分片\n"
-            "（单个分片只含 1/N 的对局数据）")
-    names = [n for n in sorted(os.listdir(path)) if n.lower().endswith(".wrpl")]
+# 只读头这么多就够（settings 可能更长，见 read_header_file 的二次读取）
+HEADER_PROBE = 8192
+MAX_PARTS = 400                 # 一局回放不可能有这么多分片
+MAX_TOTAL_MB = 3072             # 误选大目录的硬上限（3 GB）
+
+
+def _natural_key(name: str):
+    """文件名自然排序: 让 `part2` 排在 `part10` 前面(纯字符串排序会反过来)。"""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def read_header_file(path: str) -> ReplayInfo:
+    """只读回放头的必要部分（不整份读进内存）。
+
+    扫描服务器回放目录时要把每个文件都过一遍 —— 整份读会在用户**误选大目录**时
+    瞬间吃满内存（2026-10-25 用户反馈：卡住 + 内存持续上升）。
+    """
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        head = fh.read(HEADER_PROBE)
+        if len(head) >= OFF_SETTINGS_SIZE + 4:
+            st = struct.unpack_from("<I", head, OFF_SETTINGS_SIZE)[0]
+            need = HEADER_SIZE + HEADER_PAD + min(st, 4 << 20) + 4096
+            if need > len(head) and need <= size:
+                fh.seek(0)
+                head = fh.read(need)
+    info = parse_header(head, path)
+    info.size = size            # parse_header 里的 size 是 len(buf)，这里换成真实大小
+    return info
+
+
+def _scan_parts(path: str, *, note=None,
+                expect_server: bool | None = None
+                ) -> tuple[list[str], list[ReplayInfo]]:
+    """列出一个文件夹里的全部 `.wrpl`（= 一局回放的各分片）。
+
+    **一个文件夹就是一局** —— 用户自己会把同一局的分片放在一起，所以这里不再
+    猜“这个目录里是几局”（以前只是 `sorted(listdir())`，把目录里所有回放都当
+    一局的分片**整份读进内存**，用户误选大目录时就卡死 + 内存爆满）。
+
+    现在只做两件事：① 只读文件头（不整份加载）；② 数量/总大小超限就拦住，
+    免得再把一个装满录像的大目录当成一局吞下去。
+    """
+    names = sorted((n for n in os.listdir(path) if n.lower().endswith(".wrpl")),
+                   key=_natural_key)
     if not names:
-        raise ValueError("这个目录里没有 .wrpl 分片")
-    return [os.path.join(path, n) for n in names]
+        raise ValueError("这个文件夹里没有 .wrpl 文件")
+    if len(names) > MAX_PARTS:
+        raise ValueError(
+            f"这个文件夹里有 {len(names)} 个 .wrpl（超过 {MAX_PARTS} 个）。\n\n"
+            "这不像是一局的录像分片 —— 请把**同一局**的录像单独放一个文件夹再选。")
+
+    files: list[str] = []
+    infos: list[ReplayInfo] = []
+    total = 0
+    for i, n in enumerate(names, 1):
+        fp = os.path.join(path, n)
+        if not os.path.isfile(fp):
+            continue
+        if note is not None and (i == 1 or i % 10 == 0 or i == len(names)):
+            note(f"检查分片 {i}/{len(names)} …", 0.0)
+        try:
+            info = read_header_file(fp)
+        except Exception as exc:                 # noqa: BLE001 - 转成用户能懂的话
+            raise ValueError(f"{n} 不是有效的回放文件：{exc}") from exc
+        files.append(fp)
+        infos.append(info)
+        total += info.size
+        if total > MAX_TOTAL_MB << 20:
+            raise ValueError(
+                f"这些文件加起来已经超过 {MAX_TOTAL_MB} MB —— 不像是一局的录像。\n\n"
+                "请把**同一局**的录像单独放一个文件夹再选。")
+    if not files:
+        raise ValueError("这个文件夹里没有可读的 .wrpl 文件")
+
+    # 服务器/本地标志必须与按钮相符（本地回放和服务器分片是两套读法）
+    is_server = infos[0].server
+    if expect_server is True and not is_server:
+        raise ValueError(
+            "这些是**本地**回放（游戏内「保存回放」得到的）。\n\n"
+            "请改用「从录像中获取路线(本地)」按钮。")
+    if expect_server is False and is_server:
+        raise ValueError(
+            "这些是**服务器**回放分片。\n\n"
+            "请改用「从录像中获取路线(服务器)」并选整个文件夹。")
+    return files, infos
 
 
-def load_replay(path: str, *, progress=None) -> ReplayData:
-    """读一个本地回放文件，或一个服务器回放分片目录。"""
+class ImportCancelled(Exception):
+    """用户主动取消（进度框点「取消」）。"""
 
-    def note(msg: str) -> None:
+
+def load_replay(path: str, *, progress=None, expect_server: bool | None = None
+                ) -> ReplayData:
+    """读一个本地回放文件，或一个服务器回放分片目录。
+
+    * `progress(msg, frac)` —— `frac` 是 0~1 的总进度（None 表示不确定）；
+    * `expect_server` —— True 要求服务器回放、False 要求本地回放、None 不限。
+    """
+
+    def note(msg: str, frac: float | None = None) -> None:
         if progress:
-            progress(msg)
+            progress(msg, frac)
 
-    files = _list_parts(path) if os.path.isdir(path) else [path]
+    if os.path.isdir(path):
+        files, infos = _scan_parts(path, note=note,
+                                   expect_server=expect_server)
+    else:
+        info = read_header_file(path)
+        if expect_server is True and not info.server:
+            raise ValueError(
+                "这是**本地**回放（游戏内「保存回放」得到的）。\n\n"
+                "请改用「从录像中获取路线(本地)」按钮。")
+        if expect_server is False and info.server:
+            raise ValueError(
+                "这是**服务器**回放的一个分片。\n\n"
+                "请改用「从录像中获取路线(服务器)」，并选分片所在的**文件夹**"
+                "（单个分片只含 1/N 的对局数据）。")
+        files, infos = [path], [info]
+
     data = ReplayData(parts=len(files))
+    data.source = files[0] if files else ""
+    nfiles = len(files)
     hist: dict[int, DeltaHistory] = {}
     raw: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
 
     for idx, fp in enumerate(files, 1):
+        note(f"读取分片 {idx}/{nfiles} …", (idx - 1) / nfiles)
         with open(fp, "rb") as fh:
             buf = fh.read()
-        info = parse_header(buf, fp)
+        info = infos[idx - 1]
         if idx == 1:
             data.level = _level_stem(info.level)
             data.battle_type = info.battle_type
             data.environment = info.environment
             data.visibility = info.visibility
             data.server = info.server
-        note(f"解析分片 {idx}/{len(files)} …")
         payload = decompress_stream(buf, info)
         packets, _used = parse_packets(payload)
         data.packets += len(packets)
-        for ptype, ms, s, e in packets:
+        total = len(packets)
+        step = max(1, total // 100)          # 每个分片最多报 100 次进度
+        for i, (ptype, ms, s, e) in enumerate(packets):
+            if i % step == 0:
+                note(f"解析分片 {idx}/{nfiles} · 包 {i:,}/{total:,}",
+                     ((idx - 1) + i / max(1, total)) / nfiles)
             if ptype != PACKET_MPI or e - s < 12:
                 continue
             mid = payload[s + 2] | (payload[s + 3] << 8)
@@ -508,6 +617,8 @@ def load_replay(path: str, *, progress=None) -> ReplayData:
             t = ms / 1000.0
             for uid, x, y, z in rows:
                 raw[uid].append((t, x, y, z))
+        # 逐个分片释放（单份服务器回放可能几百 MB，误选大目录时就是内存爆满）
+        del buf, payload, packets
 
     for uid, rows in raw.items():
         rows.sort()

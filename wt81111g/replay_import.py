@@ -66,6 +66,7 @@ def _time_from_name(path: str) -> str:
 
 def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord, ImportStats]:
     """`ReplayData` → `GlobalRecord`（全部单位先放 A 队；阵营待接 ECS）。"""
+    src = source_path or data.source
     stats = ImportStats(
         level=data.level, battle_type=data.battle_type, server=data.server,
         parts=data.parts, packets=data.packets,
@@ -92,7 +93,7 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         route_id="",                       # 由 store.new_global 之外的地方补; 这里直接给
         map_key=f"wrpl:{data.level or 'unknown'}",
         map_name=map_name,
-        created_at=_time_from_name(source_path) if source_path else
+        created_at=_time_from_name(src) if src else
                    time.strftime("%Y-%m-%dT%H:%M:%S"),
         zone_count=0,
         zone_signature="",
@@ -156,9 +157,18 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
     return rec, stats
 
 
-def import_replay(path: str, store, *, progress=None) -> tuple[GlobalRecord, ImportStats]:
-    """解析一个回放（文件或服务器分片目录）并**落盘**到 `store`。"""
-    data = load_replay(path, progress=progress)
-    rec, stats = build_record(data, path)
+def import_replay(path: str, store, *, progress=None,
+                  expect_server: bool | None = None
+                  ) -> tuple[GlobalRecord, ImportStats]:
+    """解析一个回放（本地文件 / 服务器分片目录）并**落盘**到 `store`。
+
+    一次调用 = 一局:
+    * **本地回放**：传单个 `.wrpl` 文件（一个文件就是完整一局）；
+    * **服务器回放**：传一个文件夹（里面的 `.wrpl` 全是这一局的分片）。
+
+    `progress(msg, frac)` / `expect_server` 含义见 `wrpl_reader.load_replay`。
+    """
+    data = load_replay(path, progress=progress, expect_server=expect_server)
+    rec, stats = build_record(data, path if os.path.isfile(path) else "")
     store.add_global(rec)
     return rec, stats

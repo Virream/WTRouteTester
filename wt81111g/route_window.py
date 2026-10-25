@@ -28,8 +28,9 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFrame, QGridLayout, QHeaderView, QHBoxLayout, QInputDialog, QLabel,
-    QMainWindow, QMenu, QMessageBox, QPushButton, QSizePolicy, QSplitter, QTextBrowser,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QListView, QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton,
+    QSizePolicy, QSplitter, QTextBrowser, QTreeView, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 from .global_hotkey import (
@@ -2160,63 +2161,146 @@ class RouteTesterWindow(QMainWindow):
 
     # ------------------------------------------------------------- 全局录制
     def _import_replay_local(self) -> None:
-        """「从录像中获取路线(本地)」: 选一个 `.wrpl` 文件。"""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择本地回放文件", "", "战争雷霆回放 (*.wrpl);;所有文件 (*)")
-        if path:
-            self._import_replay_path(path)
+        """「从录像中获取路线(本地)」: 可选**多个** `.wrpl` 文件, 逐个解析。"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择本地回放文件（可多选；每个文件生成一个条目）", "",
+            "战争雷霆回放 (*.wrpl);;所有文件 (*)")
+        if paths:
+            self._import_replay_many(paths, expect_server=False)
 
     def _import_replay_server(self) -> None:
-        """「从录像中获取路线(服务器)」: 选分片所在目录。"""
-        path = QFileDialog.getExistingDirectory(
-            self, "选择服务器回放分片所在目录(里面是一堆 .wrpl)")
-        if path:
-            self._import_replay_path(path)
+        """「从录像中获取路线(服务器)」: 可选**多个**分片文件夹, 逐个解析。"""
+        dirs = self._pick_directories(
+            "选择服务器回放分片所在文件夹（可多选；同一局的 .wrpl 放同一个文件夹）")
+        if dirs:
+            self._import_replay_many(dirs, expect_server=True)
 
-    def _import_replay_path(self, path: str) -> None:
-        """解析回放并落盘成一个全局条目(全部单位先放 A 队, 阵营待接 ECS)。"""
-        def progress(msg: str) -> None:
-            self._set_status(msg, sticky=30.0)
+    def _pick_directories(self, title: str) -> list[str]:
+        """多选文件夹。
+
+        `QFileDialog.getExistingDirectory` 一次只能选一个, 所以自己搭一个 **Qt 自带
+        (非原生)** 的对话框 —— Windows 的原生对话框不支持多选目录。
+        """
+        dlg = QFileDialog(self, title)
+        dlg.setFileMode(QFileDialog.FileMode.Directory)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        for view_name, view_type in (("listView", QListView), ("treeView", QTreeView)):
+            view = dlg.findChild(view_type, view_name)
+            if view is not None:     # Ctrl/Shift 点选多个目录
+                view.setSelectionMode(
+                    QAbstractItemView.SelectionMode.ExtendedSelection)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return []
+        return [p for p in dlg.selectedFiles() if os.path.isdir(p)]
+
+    def _import_replay_many(self, paths: list[str], *, expect_server: bool) -> None:
+        """逐个解析 `paths`（回放文件 / 分片文件夹），**每个生成一个全局条目**。
+
+        * 进度框常驻, 每解析一部分就刷新一次并 `processEvents` —— 不然界面会假死
+          (2026-10-25 用户反馈: 点服务器录像后卡住 + 内存一直涨);
+        * 「取消」随时可点: 抛 `ImportCancelled` 中止当前这局;
+        * 单局失败只跳过它, 不影响后面的。
+        """
+        from .wrpl_reader import ImportCancelled
+
+        n = len(paths)
+        dlg = QProgressDialog("准备解析回放…", "取消", 0, 1000, self)
+        dlg.setWindowTitle("从录像中获取路线")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setMinimumWidth(480)
+        dlg.show()
+        QApplication.processEvents()
+
+        state = {"i": 0}
+
+        def progress(msg: str, frac: float | None = None) -> None:
+            i = state["i"]
+            span = 1.0 / max(1, n)
+            v = i * span + span * (frac or 0.0)
+            dlg.setLabelText(f"[{i + 1}/{n}] {msg}")
+            dlg.setValue(int(max(0.0, min(1.0, v)) * 1000))
             QApplication.processEvents()
+            if dlg.wasCanceled():
+                raise ImportCancelled("用户取消")
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        done: list[tuple[object, object]] = []
+        failed: list[tuple[str, str]] = []
+        cancelled = False
         try:
-            self._set_status("正在解析回放…(大文件要几秒)", sticky=30.0)
-            QApplication.processEvents()
-            rec, stats = import_replay(path, self.store, progress=progress)
-        except Exception as exc:                       # noqa: BLE001 - 给用户看原因
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "从录像获取路线", f"解析失败：\n\n{exc}")
-            self._set_status("回放解析失败", sticky=4.0)
-            return
+            for i, path in enumerate(paths):
+                state["i"] = i
+                name = os.path.basename(path.rstrip("\\/")) or path
+                dlg.setLabelText(f"[{i + 1}/{n}] 准备解析 {name} …")
+                dlg.setValue(int(i / max(1, n) * 1000))
+                QApplication.processEvents()
+                try:
+                    rec, stats = import_replay(
+                        path, self.store, progress=progress,
+                        expect_server=expect_server)
+                except ImportCancelled:
+                    cancelled = True
+                    break
+                except Exception as exc:            # noqa: BLE001 - 逐个报错
+                    log.warning("回放导入失败 %s: %s", path, exc)
+                    failed.append((name, str(exc)))
+                    continue
+                done.append((rec, stats))
         finally:
-            QApplication.restoreOverrideCursor()
+            dlg.close()
 
-        self._reload_tree()
-        # 新导入的线路默认点亮(否则侧栏里有、地图上一片空, 会以为没导入成功)
-        self._visible_lives |= {lf.life_id for lf in rec.sides["A"]}
-        self._visible_lives |= {lf.life_id for lf in rec.sides["B"]}
-        self._refresh_eye_icons()
-        self._expand_item(f"global|{rec.route_id}")
-        # 底图: 有缓存就用; 回放推导出的地图键(wrpl:xxx)通常没有缓存底图,
-        # 而地图控件在“没有底图”时**根本不画线路** → 用一张网格占位图顶上
-        no_map = not self._show_cached_map(rec.map_key)
-        if no_map:
-            self.map_view.set_map_bytes(
-                self._placeholder_map_png(rec.map_name), key=rec.map_key)
-        self._refresh_map_tracks()
-        src = "服务器" if stats.server else "本地"
-        msg = (f"已从{src}录像导入: {stats.level or '?'}"
-               f"（{stats.battle_type or '未知模式'}）· "
-               f"{stats.lives} 条线路 / {stats.samples:,} 个位置样本 · "
-               f"用时 {fmt_time(stats.duration)}"
-               f"（{stats.parts} 个分片, {stats.packets:,} 个包"
-               f"{f', {stats.failed_packets} 个包解析失败' if stats.failed_packets else ''}）")
-        if stats.dropped:
-            msg += f", 另有 {stats.dropped} 段太短(不足 3 个点)已跳过"
-        if no_map:
-            msg += " · 该地图暂无底图, 已用空白网格代替"
-        self._set_status(msg, sticky=10.0)
+        if done:
+            self._reload_tree()
+            # 新导入的线路默认点亮(否则侧栏里有、地图上一片空, 会以为没导入成功)
+            for rec, _st in done:
+                self._visible_lives |= {lf.life_id for lf in rec.sides["A"]}
+                self._visible_lives |= {lf.life_id for lf in rec.sides["B"]}
+            self._refresh_eye_icons()
+            first = done[-1][0]
+            self._expand_item(f"global|{first.route_id}")
+            # 底图: 有缓存就用; 回放推导出的地图键(wrpl:xxx)通常没有缓存底图,
+            # 而地图控件在“没有底图”时**根本不画线路** → 用网格占位图顶上
+            no_map = not self._show_cached_map(first.map_key)
+            if no_map:
+                self.map_view.set_map_bytes(
+                    self._placeholder_map_png(first.map_name), key=first.map_key)
+            self._refresh_map_tracks()
+
+        self._report_import(done, failed, cancelled, n)
+
+    def _report_import(self, done: list, failed: list[tuple[str, str]],
+                       cancelled: bool, total: int) -> None:
+        """导入结束后汇总: 成功的写状态栏, 有失败/取消才弹框。"""
+        lines = []
+        for rec, st in done:
+            src = "服务器" if st.server else "本地"
+            one = (f"· {st.level or '?'}（{st.battle_type or '未知模式'}）"
+                   f"[{src}{f' {st.parts} 分片' if st.parts > 1 else ''}] "
+                   f"{st.lives} 条线路 / {st.samples:,} 样本 / "
+                   f"用时 {fmt_time(st.duration)}")
+            if st.failed_packets:
+                one += f" / {st.failed_packets} 个包解析失败"
+            if st.dropped:
+                one += f" / {st.dropped} 段太短已跳过"
+            lines.append(one)
+        head = f"共 {total} 个输入: 成功 {len(done)}"
+        if failed:
+            head += f", 失败 {len(failed)}"
+        if cancelled:
+            head += ", 已取消剩余"
+        tail = ("\n\n失败:\n"
+                + "\n".join(f"· {nm}\n  {why}" for nm, why in failed)) if failed else ""
+        if len(done) == 1 and not failed and not cancelled:
+            self._set_status(f"已导入: {lines[0].lstrip('· ')}", sticky=10.0)
+            return
+        body = "\n".join(lines) if lines else "(没有成功导入任何一局)"
+        QMessageBox.information(
+            self, "从录像中获取路线",
+            f"{head}\n\n{body}{tail}" if failed or cancelled else f"{head}\n\n{body}")
+        self._set_status(f"{head} (详情见弹窗)", sticky=10.0)
 
     def _placeholder_map_png(self, name: str) -> bytes:
         """没有底图时造一张带网格的深色图 —— 只为让线路能看见、能对着比例看。"""
