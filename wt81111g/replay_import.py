@@ -50,6 +50,7 @@ class ImportStats:
     air_units: int = 0         # 飞机/直升机数（ptype=2）
     air_lives: int = 0         # 飞机生成的线路数
     damages: int = 0           # 严重伤害事件数（用来补 uid ↔ 玩家）
+    deaths: int = 0            # 判定为“被击毁”的线路数
 
 
 def _robust_range(values: list[float]) -> tuple[float, float]:
@@ -152,10 +153,32 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
             return f"{who} · {car}" if car else who
         return car or f"uid{uid}"
 
+    # ---- 载具死亡时刻（来自 Kill 包）--------------------------------------
+    # 服务器回放 24 Hz 全量上报，所以“uid 不再出现”本身就能看出车没了；但 kill 包
+    # 里的 `VictimUid + 时间戳` 是**精确到包**的击毁时刻，而且能区分“死了”与
+    # “看不见”。两条信息一起用：
+    #   * 死亡时刻是切段点（uid 是槽位，死后可能被新车复用）；
+    #   * 落在段内的死亡时刻 → `dead=True` + `death_t`（地图上画红叉）。
+    deaths: dict[int, list[float]] = {}
+    for ev in data.kills:
+        if ev.victim_uid != EXT_MASK_UID and ev.t > 0:
+            deaths.setdefault(ev.victim_uid, []).append(ev.t)
+    for _v in deaths.values():
+        _v.sort()
+
     for uid, rows in sorted(data.units.items()):
-        segs: list[list[tuple[float, float, float, float]]] = []
+        dl = deaths.get(uid, [])
+        di = 0
+        segs: list[tuple[list[tuple[float, float, float, float]], float]] = []
         cur: list[tuple[float, float, float, float]] = []
         for item in rows:
+            t = item[0]
+            # 越过了某个击毁时刻 → 当前段到此为止，后面属于新载具
+            while di < len(dl) and dl[di] <= t:
+                if cur:
+                    segs.append((cur, dl[di]))
+                    cur = []
+                di += 1
             if cur:
                 dt = item[0] - cur[-1][0]
                 d = ((item[1] - cur[-1][1]) ** 2 + (item[3] - cur[-1][3]) ** 2) ** 0.5
@@ -166,12 +189,12 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                 #    (2026-10-25 用户反馈 A67)。地面车跑不到 720 km/h，所以
                 #    “一步 > 200 m 且 > 200 m/s” 一定是换了实体。
                 if dt > GAP_SPLIT_SEC or (d > JUMP_MIN_M and dt > 0 and d / dt > JUMP_MAX_MPS):
-                    segs.append(cur)
+                    segs.append((cur, 0.0))
                     cur = []
             cur.append(item)
         if cur:
-            segs.append(cur)
-        for si, seg in enumerate(segs, 1):
+            segs.append((cur, 0.0))
+        for si, (seg, death_at) in enumerate(segs, 1):
             # 太短/几乎没动的段直接丢弃: 以前只验点数 >= 3，结果那辆“只被看见 1.4 秒”
             # 的车留在地图上就是一个孤立小点（用户 2026-10-25: 两个角上有 A1/A11）
             if len(seg) < 3:
@@ -183,6 +206,17 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
             if _dur < 3.0 and _span < 50.0:
                 stats.dropped += 1
                 continue
+            # 死亡时刻没落在切段点上（例如它比最后一个采样点晚了 1~2 秒）
+            # 也算击毁 —— 但时间差要短，否则可能只是“没被看见”。
+            dead = bool(death_at)
+            if not dead and dl:
+                tail = seg[-1][0]
+                for d0 in dl:
+                    if tail <= d0 <= tail + 5.0:
+                        dead, death_at = True, d0
+                        break
+            if dead:
+                stats.deaths += 1
             pts: list[TrackPoint] = []
             prev = None
             last_speed = 0.0
@@ -219,7 +253,8 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                 map_key=rec.map_key,
                 points=pts,
                 side=side,
-                dead=False,
+                dead=dead,
+                death_t=max(0.0, death_at - t0) if dead else 0.0,
             )
             rec.sides[side].append(life)
             stats.lives += 1

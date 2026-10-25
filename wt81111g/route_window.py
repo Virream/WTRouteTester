@@ -2283,6 +2283,8 @@ class RouteTesterWindow(QMainWindow):
                    f"用时 {fmt_time(st.duration)}")
             if st.players:
                 one += f" / {st.players} 位玩家 / {st.kills} 次击杀"
+            if st.deaths:
+                one += f" / {st.deaths} 辆被击毁"
             if st.failed_packets:
                 one += f" / {st.failed_packets} 个包解析失败"
             if st.dropped:
