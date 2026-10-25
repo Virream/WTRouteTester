@@ -377,6 +377,32 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         _lst.sort(key=lambda v: v.born_t)
     _air_base: dict[int, int] = {}
 
+    # 机场群质心：AI 机场防空的任务对象名 `t1_`/`t2_` 与队伍编号**是反的**
+    # (`t1_` 属 team 2)。靠这个给「没有出生组名、也没有击杀证据」的飞机兜底定边 ——
+    # 典型就是**核弹机/killstreak 机**: 击杀包里它的 `victim_pid` 是 0(服务器不归属),
+    # 但它的起飞点就在自家机场上(实测 468 m), 离对面机场 28 km。
+    _afc: dict[int, list[tuple[float, float]]] = {1: [], 2: []}
+    for _v in getattr(data, "vehicles", ()):
+        _m = re.match(r"^t([12])_", _v.cls or "")
+        if not _m or "airfield" not in (_v.cls or "").lower():
+            continue
+        _rows = data.units.get(_v.uid)
+        if _rows:
+            _afc[int(_m.group(1))].append((_rows[0][1], _rows[0][3]))
+
+    def _team_by_takeoff(x: float, z: float) -> int | None:
+        """首点离哪个机场群近 -> 阵营。只信「真的很近」的情况(< 3 km 且明显更近),
+        否则返回 None —— 巡逻/攻击机常 10 km 外进场, 瞎猜会把颜色弄反。"""
+        if not _afc[1] or not _afc[2]:
+            return None
+        d = {p: min(((x - a) ** 2 + (z - b) ** 2) ** 0.5 for a, b in _afc[p])
+             for p in (1, 2)}
+        near = 1 if d[1] < d[2] else 2
+        far = d[2] if near == 1 else d[1]
+        if d[near] < 3000.0 and d[near] * 2.0 < far:
+            return 3 - near
+        return None
+
     for auid, rows in sorted(data.air_units.items()):
         _win = air_vans.get(auid, ())
         if _win:
@@ -423,12 +449,17 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                 stats.dropped += 1
                 continue
             veh = seg_veh[si - 1]
-            if veh is None or veh.team is None:
-                # 阵营解不出来的空中单位（无人侦察机，既没有出生组名也没有交战记录）
-                # **直接忽略** —— 宁可不要这条线，也不要把它硬塞进某一队（用户口径）。
+            _team = veh.team if veh is not None else None
+            if _team is None:
+                # 兜底：用起飞位置定边（核弹机/侦察机这类没有出生组名的）
+                _team = _team_by_takeoff(seg[0][1], seg[0][3])
+            if veh is None or _team is None:
+                # 阵营解不出来的空中单位（无人侦察机，既没有出生组名、没有交战记录、
+                # 起飞点也不在机场）**直接忽略** —— 宁可不要这条线，
+                # 也不要把它硬塞进某一队（用户口径）。
                 stats.dropped += 1
                 continue
-            side = "B" if veh.team == 2 else "A"
+            side = "B" if _team == 2 else "A"
             _k = id(veh) if veh is not None else -1
             if _k not in _air_base:
                 _air_base[_k] = len(rec.sides[side]) + 1

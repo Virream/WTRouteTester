@@ -38,6 +38,10 @@ UID_BITS = 0x7FF
 SPAWN_RE = re.compile(r"^t([12])_player(\d{2})_(\d+)$")
 GROUND_CLS_RE = re.compile(r"^tankModels/[\w/.\-]+$")
 AIR_CLS_RE = re.compile(r"^[a-z0-9][a-z0-9_.\-]{2,48}$")
+# AI 工事 / 机场防空的**任务对象名**, 形如 `t1_airfield_aaa_small_01` /
+# `t2_airfield_aaa_big_03`。这不是型号, 但它是这些 AI 单位**唯一**的阵营线索:
+# 前缀 `t1_` / `t2_` 就是边(玩家出生组名 `tN_playerMM_K` 的 tN 不是, 见模块 docstring)。
+MISSION_OBJ_RE = re.compile(r"^t([12])_[a-z0-9][a-z0-9_.\-]{2,48}$")
 
 # 模板名 -> 是否「玩家载具」。
 # tank+player_unit / tank+unit_aps+player_unit / tank+cloth_wind+player_unit 都是
@@ -351,7 +355,6 @@ class EcsCollector:
             return res
         res.uid_offset = rel
 
-        ground = not include_air
         for c in want:
             blk, vs = c.block, c.vstart
             o = vs + rel
@@ -360,6 +363,11 @@ class EcsCollector:
             uid = (blk[o] | (blk[o + 1] << 8)) & UID_BITS
             if uid == EXT_MASK_UID:
                 continue
+            # 型号的判定分支必须**按模板**而不是按全局开关：
+            # `include_air=True` 时以前的写法会让地面模板(工事/机场防空)也去走
+            # “机型词”分支，于是 `t1_airfield_aaa_small_01` 这种任务对象名
+            # 被当成型号写了进去。
+            is_air = "aircraft" in c.template
             cls = ""
             spawn = ""
             for _off, s in scanned_strings(blk, 3, 60):
@@ -371,7 +379,9 @@ class EcsCollector:
                 if not cls:
                     if GROUND_CLS_RE.match(s):
                         cls = s
-                    elif not ground and AIR_CLS_RE.match(s) and s != "dummy_plane" \
+                    elif not is_air and MISSION_OBJ_RE.match(s) and not SPAWN_RE.match(s):
+                        cls = s
+                    elif is_air and AIR_CLS_RE.match(s) and s != "dummy_plane" \
                             and "player" not in s and "aircraft" not in s:
                         cls = s
                 if spawn and cls:
@@ -488,6 +498,24 @@ class EcsCollector:
                 v.team = team_of.get(pid)
                 v.bind = "kill-uid"
                 break
+
+        # ---- 5. AI 工事 / 机场防空: 任务对象名里的 `t1_` / `t2_` 前缀
+        # (`t1_airfield_aaa_small_01` / `t2_airfield_aaa_big_03`)。这些是 AI 控制的
+        # 防空炮/工事, 没有出生组名也不会被击落。
+        #
+        # ⚠ 前缀与队伍编号是**反的**: `t1_` 属于 team 2, `t2_` 属于 team 1。
+        # 两条独立验证(2026-10-25, avg_finland):
+        #   * 机场出生的飞机: 已知 team1 的 12 架首点全部靠近 `t2_` 机群;
+        #   * 地面载具出生点: team1 的坦克 29/29 靠 `t2_`, team2 的 35/36 靠 `t1_`。
+        # 注: 玩家出生组名 `tN_playerMM_K` 的 tN **不是**阵营(见模块 docstring),
+        # 这里是另一套命名, 两者不要混。
+        for v in res.vehicles:
+            if v.team is not None:
+                continue
+            m = re.match(r"^t([12])_(?!player)", v.cls or "")
+            if m:
+                v.team = 3 - int(m.group(1))
+                v.bind = "name-prefix"
 
     @staticmethod
     def _fill_end_times(res: EcsResult, t_end: float | None) -> None:
