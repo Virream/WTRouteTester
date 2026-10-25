@@ -1,4 +1,4 @@
-"""不变量检查: 同一位玩家在同一时刻**不可能**开着两台车。
+﻿"""不变量检查: 同一位玩家在同一时刻**不可能**开着两台车。
 
 这是"线路挂错人"的最硬判据 —— 只要他把某人的两条线挂到一起, 时间就会重叠。
 逐玩家检查「同名线路的时间区间是否互斥」, 并列出违规。
@@ -29,8 +29,7 @@ class FakeStore:
 def main() -> None:
     path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT
     rec, st = import_replay(path, FakeStore())
-    print(f"线路 {rec.count()} 条 (A {len(rec.lives('A'))} / B {len(rec.lives('B'))})"
-          f"  残骸剔除 {st.ghosts} 点")
+    print(f"线路 {rec.count()} 条 (A {len(rec.lives('A'))} / B {len(rec.lives('B'))})")
 
     per: dict[str, list] = collections.defaultdict(list)
     for side in ("A", "B"):

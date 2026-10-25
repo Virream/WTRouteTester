@@ -1,4 +1,4 @@
-"""按玩家名列出导入结果里的全部线路(查"残骸/多出来的一条线")。
+﻿"""按玩家名列出导入结果里的全部线路(查"残骸/多出来的一条线")。
 
 用法: python tools\\wrpl\\probe_player_lives.py <回放路径> <玩家名片段>
 """
@@ -28,8 +28,7 @@ def main() -> None:
     path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT
     who = sys.argv[2] if len(sys.argv) > 2 else ""
     rec, st = import_replay(path, FakeStore())
-    print(f"线路 {rec.count()} 条 (A {len(rec.lives('A'))} / B {len(rec.lives('B'))})"
-          f"  剔除残骸采样 {st.ghosts} 点")
+    print(f"线路 {rec.count()} 条 (A {len(rec.lives('A'))} / B {len(rec.lives('B'))})")
 
     total = 0
     for side in ("A", "B"):
