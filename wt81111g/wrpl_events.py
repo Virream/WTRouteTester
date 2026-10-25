@@ -25,7 +25,8 @@ from .wrpl_reader import BitReader
 
 SIG_SLOT = 0xF02D
 SIG_KILL = 0xF058
-SIG_SEVERE_DAMAGE = 0xF057
+SIG_SEVERE_DAMAGE = 0xF157      # 严重伤害（同字段布局：载具 uid + 玩家槽位 + 型号）
+SIG_CRITICAL_DAMAGE = 0xF157    # 占位（待确认真实签名后用）
 
 INVALID_OID = 0xFFFF
 EXT_MASK = 0x7FF
@@ -76,6 +77,16 @@ class KillEvent:
     vehicle: str = ""
     weapon: str = ""
     destroyed: str = ""
+
+
+@dataclass
+class DamageEvent:
+    """一次严重/致命伤害：同样带「载具 uid + 玩家槽位 + 型号」三联。"""
+    t: float = 0.0
+    uid: int = 0
+    pid: int = 0
+    player_uid: int = 0
+    vehicle: str = ""
 
 
 # ---------------------------------------------------------- 字段表(变长)
@@ -261,5 +272,31 @@ def parse_kill_packet(payload: bytes, s: int, e: int, t: float = 0.0
     ev.weapon = _lenstr(got.get(K_WEAPON, b""))
     ev.destroyed = _lenstr(got.get(K_DESTROYED_WEAPON, b""))
     if ev.killer_pid == 0 and ev.victim_pid == 0 and not ev.vehicle:
+        return None
+    return ev
+
+
+def parse_damage_packet(payload: bytes, s: int, e: int, t: float = 0.0
+                        ) -> DamageEvent | None:
+    """解析一个严重伤害包（签名 `0xF157`）。
+
+    字段: 1=载具 uid(u16) 2=玩家槽位(u32) 3=型号(lenstr) 4=玩家 uid(u16) 5=unk(byte)
+
+    价值在于**参与战斗但没死的车**也会被打上标记 —— 实测这让「载具 ↔ 玩家」的
+    覆盖率从 73% 继续往上走（ECS 之前能做到的最便宜的一步）。
+    """
+    body = payload[s:e]
+    if len(body) < 6:
+        return None
+    got = read_fields_32(BitReader(body, 32), want=set(range(32)))
+    ev = DamageEvent(t=t)
+    if 1 in got and len(got[1]) >= 2:
+        ev.uid = struct.unpack_from("<H", got[1], 0)[0] & EXT_MASK
+    if 2 in got and len(got[2]) >= 4:
+        ev.pid = struct.unpack_from("<I", got[2], 0)[0]
+    ev.vehicle = _lenstr(got.get(3, b""))
+    if 4 in got and len(got[4]) >= 2:
+        ev.player_uid = struct.unpack_from("<H", got[4], 0)[0] & EXT_MASK
+    if not ev.pid and not ev.vehicle:
         return None
     return ev

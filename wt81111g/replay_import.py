@@ -49,6 +49,7 @@ class ImportStats:
     mapped: int = 0            # 能对应到玩家的载具数
     air_units: int = 0         # 飞机/直升机数（ptype=2）
     air_lives: int = 0         # 飞机生成的线路数
+    damages: int = 0           # 严重伤害事件数（用来补 uid ↔ 玩家）
 
 
 def _robust_range(values: list[float]) -> tuple[float, float]:
@@ -90,6 +91,7 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         parts=data.parts, packets=data.packets,
         failed_packets=data.failed_packets, samples=data.sample_count,
         units=len(data.units), players=len(data.players), kills=len(data.kills),
+        damages=data.damages,
     )
 
     xs, zs = [], []
@@ -133,7 +135,7 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
     # —— 实测服务器回放能覆盖 73%（69/94）。
     teams = {p.slot: p.team for p in data.players.values()}
     names = {p.slot: p.display for p in data.players.values()}
-    vehicle_of: dict[int, str] = {}
+    vehicle_of: dict[int, str] = dict(data.uid_vehicle)
     for ev in data.kills:
         if ev.killer_uid != EXT_MASK_UID and ev.vehicle:
             vehicle_of.setdefault(ev.killer_uid, ev.vehicle)

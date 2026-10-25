@@ -59,6 +59,7 @@ SIG_GROUND_CLIENT = 0xF073
 SIG_GROUND_SERVER = 0xF074
 SIG_SLOT = 0xF02D               # 玩家槽位（名字/军团/队伍）
 SIG_KILL = 0xF058               # 击杀事件
+SIG_SEVERE_DAMAGE = 0xF157      # 严重伤害（也带载具 uid + 玩家槽位 + 型号）
 EXT_MASK_UID = 0x7FF            # uid 字段里的“无效/无载具”标记
 GROUND_UID_MAX = 1 << 11
 DELTA_HISTORY = 32
@@ -568,8 +569,12 @@ class ReplayData:
     # 玩家槽位（0..255）→ PlayerSlot；击杀事件（按时间排序）
     players: dict[int, object] = field(default_factory=dict)
     kills: list = field(default_factory=list)
-    # 载具 uid → 玩家槽位（只能从 kill 事件里推，没参与击杀的车拿不到）
+    # 载具 uid → 玩家槽位（只能从 kill / 伤害事件里推，没参战的车拿不到）
     uid_pid: dict[int, int] = field(default_factory=dict)
+    # 载具 uid → 型号名（同样只能从事件里推）
+    uid_vehicle: dict[int, str] = field(default_factory=dict)
+    # 严重伤害事件数（仅用于报告）
+    damages: int = 0
     # 飞机/直升机：uid → [(秒, x, y, z)]（**独立的 uid 空间**，与地面数值会重叠）
     air_units: dict[int, list[tuple[float, float, float, float]]] = field(default_factory=dict)
     t_first: float = 0.0
@@ -710,7 +715,8 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
     nfiles = len(files)
     # 延迟导入：wrpl_events / wrpl_air 依赖本模块的 BitReader，模块级导入会循环
     from .wrpl_air import PACKET_FLIGHT_MODEL, parse_fm_packet          # noqa: PLC0415
-    from .wrpl_events import parse_kill_packet, parse_slot_packet   # noqa: PLC0415
+    from .wrpl_events import (                                       # noqa: PLC0415
+        parse_damage_packet, parse_kill_packet, parse_slot_packet)
     hist: dict[int, DeltaHistory] = {}
     raw: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
     air: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
@@ -772,8 +778,22 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
                     # KillerPid/VictimPid 是**玩家槽位号**，Uid 是载具槽位
                     if ev.killer_uid != EXT_MASK_UID and ev.killer_pid:
                         data.uid_pid.setdefault(ev.killer_uid, ev.killer_pid)
+                        if ev.vehicle:
+                            data.uid_vehicle.setdefault(ev.killer_uid, ev.vehicle)
                     if ev.victim_uid != EXT_MASK_UID and ev.victim_pid:
                         data.uid_pid.setdefault(ev.victim_uid, ev.victim_pid)
+                continue
+            if mid == SIG_SEVERE_DAMAGE:
+                try:
+                    dv = parse_damage_packet(payload, s, e, ms / 1000.0)
+                except (ValueError, EOFError, IndexError):
+                    dv = None
+                if dv is not None:
+                    data.damages += 1
+                    if dv.uid != EXT_MASK_UID and dv.pid:
+                        data.uid_pid.setdefault(dv.uid, dv.pid)
+                    if dv.uid != EXT_MASK_UID and dv.vehicle:
+                        data.uid_vehicle.setdefault(dv.uid, dv.vehicle)
                 continue
             if mid not in (SIG_GROUND_CLIENT, SIG_GROUND_SERVER):
                 continue
