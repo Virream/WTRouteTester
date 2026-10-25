@@ -41,12 +41,19 @@ class ImportStats:
 
 
 def _robust_range(values: list[float]) -> tuple[float, float]:
-    """用 1%~99% 分位当范围，避免远处 AI 把战场压小。"""
+    """用 **0.1%~99.9% 分位**当范围。
+
+    以前用 1%~99%：实测本地那局有 **1.88% 的点（2,848 个）落在框外**，而
+    `build_record` 又把归一化结果 `min/max` 夹到 0~1 → 玩家自己绕着重生点后方
+    走那一段就被夹成一条贴着地图边框的假直线（2026-10-25 用户反馈 A22/A49）。
+    换到 0.1%/99.9% 后同样的数据框外 0 点，范围与全量 min/max 一致，而真正的
+    离群值（远处机场 AI 防空，能到 ±20 km）仍然被挤掉。
+    """
     if not values:
         return 0.0, 1.0
     s = sorted(values)
     n = len(s)
-    lo, hi = s[int(n * 0.01)], s[min(n - 1, int(n * 0.99))]
+    lo, hi = s[int(n * 0.001)], s[min(n - 1, int(n * 0.999))]
     if hi - lo < 100.0:               # 分位太窄（几乎没动）→ 退回最小/最大
         lo, hi = s[0], s[-1]
     if hi - lo < 1e-6:
@@ -83,6 +90,11 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         raise ValueError("回放里没有解析到任何地面单位位置")
     minx, maxx = _robust_range(xs)
     minz, maxz = _robust_range(zs)
+    # 两侧各留 5% 余量：分位范围之外的那一点点（玩家绕到重生点后方、贴边绕圈）
+    # 不至于跑出画布 —— 地图控件是 x*w 直接换算，超出的部分会被裁掉、看起来像断线
+    padx, padz = (maxx - minx) * 0.05, (maxz - minz) * 0.05
+    minx, maxx = minx - padx, maxx + padx
+    minz, maxz = minz - padz, maxz + padz
     spanx, spanz = maxx - minx, maxz - minz
 
     map_name = data.level or "未知地图"
@@ -115,7 +127,15 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
             segs.append(cur)
 
         for si, seg in enumerate(segs, 1):
+            # 太短/几乎没动的段直接丢弃: 以前只验点数 >= 3，结果那辆“只被看见 1.4 秒”
+            # 的车留在地图上就是一个孤立小点（用户 2026-10-25: 两个角上有 A1/A11）
             if len(seg) < 3:
+                stats.dropped += 1
+                continue
+            _dur = seg[-1][0] - seg[0][0]
+            _span = max(max(q[1] for q in seg) - min(q[1] for q in seg),
+                        max(q[3] for q in seg) - min(q[3] for q in seg))
+            if _dur < 3.0 and _span < 50.0:
                 stats.dropped += 1
                 continue
             pts: list[TrackPoint] = []
@@ -136,8 +156,10 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                             if kmh <= 150.0:
                                 speed = last_speed = kmh
                 pts.append(TrackPoint(t=max(0.0, t - t0),
-                                      x=min(1.0, max(0.0, nx)),
-                                      y=min(1.0, max(0.0, ny)),
+                                      # **不夹到 0~1** —— 夹了会在边框上拉出一条假直线；
+                                      # 真超出范围的点就让它画到画布外（自然被裁掉）
+                                      x=nx,
+                                      y=ny,
                                       speed=speed))
                 prev = (t, x, z)
             life = UnitLife(

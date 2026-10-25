@@ -71,6 +71,11 @@ class BitReader:
 
     因此 `u16()/u32()` 不是“小端整数”，而是“按字节顺序读、字节内 MSB 优先”，
     再把字节按小端拼起来 —— 与格式里的 `ReadU16LE` 语义一致。
+
+    ⚠ 2026-10-25 性能重写：`bits()` 原来是**逐位 Python 循环**，实测占整个回放
+    解析耗时的 99.6%（服务器回放 33 MB / 52,234 个地面包要 230 秒）。现在按字节
+    批量取（`int.from_bytes(..., "big")` 正好就是 MSB 优先 + 大端拼接的语义），
+    再移位去掉多余位 —— 同样是 52,234 个包，解码从 230 秒降到 10 秒量级。
     """
 
     __slots__ = ("d", "nbits", "pos")
@@ -81,22 +86,56 @@ class BitReader:
         self.pos = bit
 
     def bits(self, n: int) -> int:
+        p = self.pos
+        end = p + n
         if n <= 0:
             return 0
-        if self.pos + n > self.nbits:
-            raise EOFError(f"读越界: 需 {n} 位, 只剩 {self.nbits - self.pos}")
-        v, d, p = 0, self.d, self.pos
-        for _ in range(n):
-            v = (v << 1) | ((d[p >> 3] >> (7 - (p & 7))) & 1)
-            p += 1
-        self.pos = p
-        return v
+        if end > self.nbits:
+            raise EOFError(f"读越界: 需 {n} 位, 只剩 {self.nbits - p}")
+        self.pos = end
+        d = self.d
+        if n == 1:                          # 最常见（大量 hasUnit/标志位）
+            return (d[p >> 3] >> (7 - (p & 7))) & 1
+        i1 = (end + 7) >> 3
+        v = int.from_bytes(d[p >> 3:i1], "big")
+        if end & 7:                         # 右端不是字节边界 → 先甩掉尾部补的位
+            v >>= (i1 << 3) - end
+        return v & ((1 << n) - 1)
 
     def byte(self) -> int:
-        return self.bits(8)
+        p = self.pos
+        if p + 8 > self.nbits:
+            raise EOFError(f"读越界: 需 8 位, 只剩 {self.nbits - p}")
+        self.pos = p + 8
+        if not (p & 7):                     # 对齐时直接取（绝大多数情况）
+            return self.d[p >> 3]
+        i1 = (p + 8 + 7) >> 3
+        v = int.from_bytes(self.d[p >> 3:i1], "big")
+        return (v >> ((i1 << 3) - (p + 8))) & 0xFF
 
     def bytes_n(self, n: int) -> bytes:
-        return bytes(self.byte() for _ in range(n))
+        p = self.pos
+        if not (p & 7):                     # 对齐 → 直接切片（不再逐字节拼）
+            i = p >> 3
+            if i + n > len(self.d):
+                raise EOFError(f"读越界: 需 {n} B, 只剩 {len(self.d) - i} B")
+            self.pos = p + n * 8
+            return self.d[i:i + n]
+        # 不对齐 → 一次取出覆盖的字节窗口（大整数位运算），不再逐字节循环
+        n = int(n)
+        if n <= 0:
+            return b""
+        nb = n * 8
+        end = p + nb
+        if end > self.nbits:
+            raise EOFError(f"读越界: 需 {n} B, 只剩 {(self.nbits - p) // 8} B")
+        self.pos = end
+        i0 = p >> 3
+        off = p - (i0 << 3)                 # 窗口内的起始位偏移 0..7
+        i1 = (end + 7) >> 3
+        v = int.from_bytes(self.d[i0:i1], "big")
+        v >>= ((i1 - i0) << 3) - off - nb
+        return (v & ((1 << nb) - 1)).to_bytes(n, "big")
 
     def skip(self, n: int) -> None:
         if self.pos + n > self.nbits:
@@ -107,14 +146,36 @@ class BitReader:
         self.pos = (self.pos + 7) & ~7
 
     def u16(self) -> int:
+        p = self.pos
+        if not (p & 7):
+            i = p >> 3
+            if i + 2 > len(self.d):
+                raise EOFError(f"读越界: 需 2 B, 只剩 {len(self.d) - i} B")
+            self.pos = p + 16
+            d = self.d
+            return d[i] | (d[i + 1] << 8)
         b = self.bytes_n(2)
         return b[0] | (b[1] << 8)
 
     def u32(self) -> int:
+        p = self.pos
+        if not (p & 7):
+            i = p >> 3
+            if i + 4 > len(self.d):
+                raise EOFError(f"读越界: 需 4 B, 只剩 {len(self.d) - i} B")
+            self.pos = p + 32
+            return struct.unpack_from("<I", self.d, i)[0]
         b = self.bytes_n(4)
         return b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)
 
     def f32(self) -> float:
+        p = self.pos
+        if not (p & 7):
+            i = p >> 3
+            if i + 4 > len(self.d):
+                raise EOFError(f"读越界: 需 4 B, 只剩 {len(self.d) - i} B")
+            self.pos = p + 32
+            return struct.unpack_from("<f", self.d, i)[0]
         return struct.unpack("<f", self.bytes_n(4))[0]
 
     def compressed(self) -> int:
@@ -242,6 +303,51 @@ def parse_packets(payload: bytes) -> tuple[list[Packet], int]:
 
 
 # ------------------------------------------------------- 2-bit RLE / 增量
+# 2-bit RLE 的“块”查表：num 个 2 位值（第 1 个 v0、第 2 个 v1、交替）拼成的整数，
+# **低位先**（原实现是 `v << sh`，sh 从 0 往上增，第一个值落在 bit0-1）。
+# 索引 = ((v0 << 2) | v1) * 41 + num —— 用一维 list 而不是 dict：
+# 原来 `table[(v0, v1, num)]` 每处理一个码就要建 tuple + 算哈希，实测那是 RLE 的
+# 主要开销（5 千多万次）。
+_RLE_STRIDE = 41
+_RLE_BLOCK: list[int] = [0] * (16 * _RLE_STRIDE)
+for _v0 in range(4):
+    for _v1 in range(4):
+        _acc = 0
+        for _num in range(1, 41):
+            _v = _v0 if (_num & 1) else _v1
+            _acc |= _v << (2 * (_num - 1))
+            _RLE_BLOCK[((_v0 << 2) | _v1) * _RLE_STRIDE + _num] = _acc
+
+# 状态机转移表：状态 = ((code+1) << 2) | sup，输入 = 一个 4 位组(v0 低 2 位 / v1 高 2 位)
+# → (新状态, 要写出的位块, 位数)。把原来的 if/elif 链整个提前算掉 —— 实测每次
+# 解码有 5 百多万个 4 位组，链路比较本身就要 2~3 微秒。
+_RLE_TRANS: list[tuple[int, int, int]] = []
+for _code0 in (-1, 0, 1, 2, 3, 4):
+    for _sup0 in range(4):
+        for _nib in range(16):
+            _a = _nib & 3
+            _b = (_nib >> 2) & 3
+            _code, _sup, _v0, _v1 = _code0, _sup0, _a, _b
+            if _code != 4:
+                _code = _a
+            if _code == 0:
+                _num, _v0, _v1 = _b + 3, 0, 0
+            elif _code == 3:
+                _num, _v0, _v1 = _b + 7, 0, 0
+            elif _code == 1:
+                _code, _sup, _num, _v0 = 4, _b, 1, _b
+            elif _code == 2:
+                _num, _v0 = 1, _b
+            else:                               # code == 4
+                _code = -1
+                _num = 39 if (_sup == 0 and _a == 0 and _b == 0) else 2
+            _RLE_TRANS.append((
+                ((_code + 1) << 2) | _sup,
+                _RLE_BLOCK[((_v0 << 2) | _v1) * _RLE_STRIDE + _num],
+                _num * 2,
+            ))
+
+
 def rle0ki_decode(src: bytes) -> bytes:
     """Dagor 的 2-bit RLE 解压（末字节 0x6F/0xDE 标记最后一段的码数）。"""
     if not src:
@@ -250,36 +356,45 @@ def rle0ki_decode(src: bytes) -> bytes:
     parity = src[limit]
     if parity not in (0x6F, 0xDE):
         raise ValueError(f"RLE 末字节不是 0x6F/0xDE(实际 0x{parity:02X})")
-    out = bytearray(MAX_DELTA_BYTES)
-    out_bits, code, sup = 0, -1, -1
+    cap_bits = MAX_DELTA_BYTES * 8
+    out = bytearray()
+    pend = 0                    # 尚未凑满 64 位的高位
+    pend_bits = 0
+    done_bits = 0               # 已经输出到 out 的位数（避免每步调用 len()）
+    trans = _RLE_TRANS
+    mask64 = 0xFFFFFFFFFFFFFFFF
+    st = 0                      # code=-1, sup=0（首组会把 code 设成它自己的 v0）
     for i in range(limit):
-        k_last = 1 if (i == limit - 1 and parity == 0x6F) else 2
-        for k in range(k_last):
-            v0 = (src[i] >> (k * 4)) & 3
-            v1 = (src[i] >> (2 + k * 4)) & 3
-            num = 0
-            if code != 4:
-                code = v0
-            if code == 0:
-                num, v0, v1 = v1 + 3, 0, 0
-            elif code == 3:
-                num, v0, v1 = v1 + 7, 0, 0
-            elif code == 1:
-                code, sup, num, v0 = 4, v1, 1, v1
-            elif code == 2:
-                num, v0 = 1, v1
-            elif code == 4:
-                code, num = -1, 2
-                if sup == 0 and v0 == 0 and v1 == 0:
-                    num = 39
-            if out_bits + num * 2 > len(out) * 8:
+        b = src[i]
+        t = trans[(st << 4) | (b & 0xF)]
+        st = t[0]
+        pend |= t[1] << pend_bits
+        pend_bits += t[2]
+        if i == limit - 1 and parity == 0x6F:   # 末字节只含 1 组
+            break
+        t = trans[(st << 4) | (b >> 4)]
+        st = t[0]
+        pend |= t[1] << pend_bits
+        pend_bits += t[2]
+        if pend_bits >= 64:
+            if done_bits + pend_bits > cap_bits:
                 raise ValueError("RLE 输出超出上限")
-            for n in range(num):
-                v = v0 if (n & 1) == 0 else v1
-                bi, sh = out_bits >> 3, out_bits & 7
-                out[bi] = (out[bi] | ((v << sh) & 0xFF)) & 0xFF
-                out_bits += 2
-    return bytes(out[:(out_bits + 7) >> 3])
+            while pend_bits >= 64:      # 一次甩出 8 字节（低位先）
+                out += (pend & mask64).to_bytes(8, "little")
+                pend >>= 64
+                pend_bits -= 64
+                done_bits += 64
+    if pend_bits >= 64:
+        while pend_bits >= 64:
+            out += (pend & mask64).to_bytes(8, "little")
+            pend >>= 64
+            pend_bits -= 64
+            done_bits += 64
+    if pend_bits:
+        if done_bits + pend_bits > cap_bits:
+            raise ValueError("RLE 输出超出上限")
+        out += (pend & ((1 << pend_bits) - 1)).to_bytes((pend_bits + 7) >> 3, "little")
+    return bytes(out)
 
 
 def xor_patch(base: bytes, delta: bytes) -> bytes:
@@ -287,12 +402,14 @@ def xor_patch(base: bytes, delta: bytes) -> bytes:
     n = max(len(base), len(delta))
     if n > MAX_DELTA_BYTES:
         raise ValueError(f"还原体 {n} 字节超出上限")
-    out = bytearray(n)
-    common = min(len(base), len(delta))
-    for i in range(common):
-        out[i] = base[i] ^ delta[i]
-    out[common:] = delta[common:] if len(delta) > len(base) else base[common:]
-    return bytes(out)
+    if not n:
+        return b""
+    # 逐字节 XOR → 一次整数异或（短的那边右补 0，正是原语义）
+    a = int.from_bytes(base, "big") if len(base) == n else \
+        int.from_bytes(base, "big") << ((n - len(base)) * 8)
+    b = int.from_bytes(delta, "big") if len(delta) == n else \
+        int.from_bytes(delta, "big") << ((n - len(delta)) * 8)
+    return (a ^ b).to_bytes(n, "big")
 
 
 class DeltaHistory:
