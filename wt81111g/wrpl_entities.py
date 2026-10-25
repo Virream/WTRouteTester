@@ -342,7 +342,10 @@ class EcsCollector:
             res.stats["no_vehicle_template"] += 1
             return res
 
-        rel = self._calibrate_uid(want, known_uids)
+        # uid 偏移只在**地面**模板上标定：`aircraft+player_unit` 里有一大批是
+        # 开局出生的占位实体(dummy_plane, 没有型号也没有 uid), 混进来会把标定带歪。
+        ground_want = [c for c in want if "aircraft" not in c.template]
+        rel = self._calibrate_uid(ground_want or want, known_uids)
         if rel is None:
             res.stats["uid_offset_failed"] += 1
             return res

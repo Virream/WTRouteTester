@@ -582,6 +582,10 @@ class ReplayData:
     # 见 wrpl_entities.py —— 这是「这辆车是谁的」的**权威来源**，比从击杀事件
     # 反推可靠（击杀只能覆盖参战过的车，且 uid 复用时会张冠李戴）。
     vehicles: list = field(default_factory=list)
+    # 飞机/直升机的 ECS 档案（与 `vehicles` 分开存）。ptype=2 的 uid 与地面共用
+    # 同一套 11 位编号，但**同一时刻不会重复**，所以可以用 uid 把空中航迹绑到
+    # 玩家与阵营上（实测 14/16 命中）。
+    air_vehicles: list = field(default_factory=list)
     ecs_templates: dict[int, int] = field(default_factory=dict)
     ecs_group_size: int = 0         # 出生组每组人数 K（16v16 时 16）
     ecs_uid_offset: int | None = None
@@ -839,11 +843,14 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
     note("解析实体档案 …", 1.0)
     try:
         res = ecs.build(known_uids=set(data.units), players=data.players,
-                        kills=data.kills, t_end=data.t_last)
+                        kills=data.kills, t_end=data.t_last,
+                        include_air=True)
     except (ValueError, EOFError, IndexError, KeyError):
         res = None
     if res is not None:
-        data.vehicles = res.vehicles
+        # 地面/空中分开存：地面那条线要用自己的窗口裁轨迹，飞机的窗口完全不同
+        data.vehicles = [v for v in res.vehicles if "aircraft" not in v.template]
+        data.air_vehicles = [v for v in res.vehicles if "aircraft" in v.template]
         data.ecs_templates = res.templates
         data.ecs_group_size = res.group_size
         data.ecs_uid_offset = res.uid_offset

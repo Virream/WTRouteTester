@@ -363,23 +363,71 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
             stats.lives += 1
     stats.duration = rec.duration
     # ---- 飞机 / 直升机 ------------------------------------------------------
-    # `ptype=2`（FlightModel，4 Hz）是**独立的 uid 空间**，数值会和地面 uid 重叠，
-    # 所以不能混进 `units`。位置归一化沿用**地面**算出来的范围 —— 飞机常飞到
-    # 20 km 外的机场，若把它算进范围会把战场压成一小块；超出的点自然画到画布外。
+    # `ptype=2`（FlightModel，4 Hz）。uid 与地面**共用同一套 11 位编号**（同一时刻
+    # 不会重复），所以可以拿 ECS 的 `aircraft+player_unit` 档案把空中航迹绑到玩家与
+    # 阵营上（实测 14/16 命中；剩下的 `ucav_recon_micro_flir` 侦察无人机本来就没有
+    # 出生组名，属正常）。以前这里硬编码 `side="A"`，于是所有飞机都被算到 A 队。
+    #
+    # 位置归一化沿用**地面**算出来的范围 —— 飞机常飞到 20 km 外的机场，若把它算进
+    # 范围会把战场压成一小块；超出的点自然画到画布外。
+    air_vans: dict[int, list] = {}
+    for _v in getattr(data, "air_vehicles", ()):
+        air_vans.setdefault(_v.uid, []).append(_v)
+    for _lst in air_vans.values():
+        _lst.sort(key=lambda v: v.born_t)
+    _air_base: dict[int, int] = {}
+
     for auid, rows in sorted(data.air_units.items()):
-        segs = []
+        _win = air_vans.get(auid, ())
+        if _win:
+            # 与地面同样的「越窗裁剪」：窗口外的采样属于别的实体
+            _tol = 2.0
+            rows = [r for r in rows
+                    if any(v.born_t - _tol <= r[0]
+                           <= ((v.died_t + _tol) if v.died_t is not None else 1e9)
+                           for v in _win)]
+        if not rows:
+            continue
+        # 切段点：长时间没上报 + 每架飞机的销毁时刻（击杀时刻不参与，理由同地面：
+        # 残骸还会被上报几秒，切了会多出一条假线路）
+        cuts = sorted(v.died_t for v in _win
+                      if v.died_t is not None and v.died_by != "end")
+        segs: list[list[tuple[float, float, float, float]]] = []
         cur: list[tuple[float, float, float, float]] = []
+        di = 0
         for item in rows:
+            while di < len(cuts) and cuts[di] <= item[0]:
+                if cur:
+                    segs.append(cur)
+                    cur = []
+                di += 1
             if cur and item[0] - cur[-1][0] > GAP_SPLIT_SEC:
                 segs.append(cur)
                 cur = []
             cur.append(item)
         if cur:
             segs.append(cur)
+        seg_veh: list = []
+        for seg in segs:
+            _ts = seg[0][0]
+            _veh = None
+            for _cand in _win:
+                if _cand.born_t - 2.0 <= _ts <= (
+                        (_cand.died_t + 2.0) if _cand.died_t is not None else 1e9):
+                    _veh = _cand
+                    break
+            seg_veh.append(_veh)
+        _segn: dict[int, int] = {}
         for si, seg in enumerate(segs, 1):
             if len(seg) < 3:
                 stats.dropped += 1
                 continue
+            veh = seg_veh[si - 1]
+            side = "B" if (veh is not None and veh.team == 2) else "A"
+            _k = id(veh) if veh is not None else -1
+            if _k not in _air_base:
+                _air_base[_k] = len(rec.sides[side]) + 1
+            _segn[_k] = _segn.get(_k, 0) + 1
             pts = [TrackPoint(t=max(0.0, t - t0),
                               x=(x - minx) / spanx,
                               y=(maxz - z) / spanz,
@@ -390,20 +438,31 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                 dt = b.t - a.t
                 if dt > 1e-6:
                     a.speed = ((b.x - a.x) ** 2 + (b.y - a.y) ** 2) ** 0.5 / dt * 3.6
+            _cls = veh.short_cls if veh is not None else ""
+            _who = veh.player if veh is not None else ""
+            _dead = bool(veh is not None and veh.died_by in ("ecs", "next"))
             life = UnitLife(
-                life_id=f"{rec.route_id}:A{len(rec.sides['A']) + 1}"
-                        + (f"_{si}" if len(segs) > 1 else ""),
-                icon=f"✈ uid{auid}",
+                life_id=f"{rec.route_id}:{side}{_air_base[_k]}"
+                        + (f"_{_segn[_k]}" if len(segs) > 1 else ""),
+                icon=veh.label if (veh is not None and (veh.player or _cls))
+                        else f"✈ uid{auid}",
+                player=_who,
+                vehicle_cls=_cls,
                 obj_type="air_model",
-                color="#174DFF",
+                color="#174DFF" if side == "A" else "#FF4D4D",
                 map_key=rec.map_key,
                 points=pts,
-                side="A",
-                dead=False,
+                side=side,
+                dead=_dead,
+                death_t=(max(0.0, veh.died_t - t0)
+                         if (_dead and veh is not None and veh.died_t is not None)
+                         else 0.0),
             )
-            rec.sides["A"].append(life)
+            rec.sides[side].append(life)
             stats.lives += 1
             stats.air_lives += 1
+            if _who:
+                stats.mapped += 1
 
     stats.air_units = len(data.air_units)
     stats.ecs_vehicles = len(getattr(data, "vehicles", ()))
