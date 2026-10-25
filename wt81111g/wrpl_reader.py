@@ -41,6 +41,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import struct
@@ -589,6 +590,7 @@ class ReplayData:
     ecs_templates: dict[int, int] = field(default_factory=dict)
     ecs_group_size: int = 0         # 出生组每组人数 K（16v16 时 16）
     ecs_uid_offset: int | None = None
+    ecs_uid_repaired: int = 0       # 按存活窗口重新对齐过 uid 的载具数
     t_first: float = 0.0
     t_last: float = 0.0
 
@@ -801,8 +803,12 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
                         data.uid_pid.setdefault(ev.killer_uid, ev.killer_pid)
                         if ev.vehicle:
                             data.uid_vehicle.setdefault(ev.killer_uid, ev.vehicle)
-                    if ev.victim_uid != EXT_MASK_UID and ev.victim_pid:
-                        data.uid_pid.setdefault(ev.victim_uid, ev.victim_pid)
+                    # ⚠ **不采信 `victim_pid`**: 拿 ECS 的出生组名当裁判核对过——
+                    #   88 条击杀里 `killer_pid` **65/65 全对**, 而 `victim_pid`
+                    #   **56/57 全错**(53 条的取值都是 14, 那根本不是槽位)。
+                    #   以前用它写 uid_pid, 结果 26 个 uid 全被算到同一个玩家名下
+                    #   (用户 2026-10-25: 一个人下面挂了 4 条线, 还有一条从敌方
+                    #   重生点开始)。受害者的主人交给 ECS 的出生组名(见下)。
                 continue
             if mid == SIG_SEVERE_DAMAGE:
                 try:
@@ -811,8 +817,8 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
                     dv = None
                 if dv is not None:
                     data.damages += 1
-                    if dv.uid != EXT_MASK_UID and dv.pid:
-                        data.uid_pid.setdefault(dv.uid, dv.pid)
+                    # ⚠ 同上: 伤害包的「玩家槽位」字段同样不可信(实测 2/2 都错),
+                    # 只拿它当「这台车参战过」的信号 + 型号名。
                     if dv.uid != EXT_MASK_UID and dv.vehicle:
                         data.uid_vehicle.setdefault(dv.uid, dv.vehicle)
                 continue
@@ -854,4 +860,41 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
         data.ecs_templates = res.templates
         data.ecs_group_size = res.group_size
         data.ecs_uid_offset = res.uid_offset
+        # ⚠ 不要在这里“按存活窗口猜 uid”: 真正的问题在 **创建包里 uid 的读取偏移**
+        #   (少数包的组件值布局差 1 字节), 已经在 `wrpl_entities` 里用「二次标定」
+        #   从源头修好了 —— 实测 83 台玩家载具 **全部**都能对到位置流的 uid 上。
+        _fill_uid_pid_from_ecs(data)
     return data
+
+
+def _fill_uid_pid_from_ecs(data: "ReplayData") -> int:
+    """用 ECS 档案(出生组名 → 槽位, 已验证 66/66)补 `uid_pid`。返回补了几个。
+
+    为什么要补: 击杀包只覆盖**参战过**的车(实测 54/94), 而 `victim_pid` 又不可信
+    (见 `load_replay` 里的注释), 不补的话一半以上的载具没有主人。
+    这里只收「这个 uid 上所有档案都给同一个槽位」的情况 —— 一个 uid 先后换过不同
+    玩家时不猜(那一段由 `replay_import` 按 ECS 的存活窗口逐段归属)。
+    """
+    slot_of = {}
+    for p in data.players.values():
+        name = getattr(p, "display", "") or getattr(p, "name", "")
+        if name:
+            slot_of[name] = p.slot
+    if not slot_of:
+        return 0
+    seen: dict[int, set] = {}
+    for v in list(data.vehicles) + list(data.air_vehicles):
+        slot = slot_of.get(v.player or "")
+        if slot is None:
+            continue
+        if v.uid not in data.units and v.uid not in data.air_units:
+            continue
+        seen.setdefault(v.uid, set()).add(slot)
+    added = 0
+    for uid, slots in seen.items():
+        if len(slots) != 1:
+            continue
+        if uid not in data.uid_pid:
+            data.uid_pid[uid] = next(iter(slots))
+            added += 1
+    return added

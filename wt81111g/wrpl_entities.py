@@ -1,4 +1,4 @@
-"""从 `ptype=6` ECS（Danet ECS）解析「实体档案」。
+﻿"""从 `ptype=6` ECS（Danet ECS）解析「实体档案」。
 
 这条线只解决一件事: **每个地面载具是谁的、什么型号、什么时候出现/消失**。
 不需要组件哈希表(ecshashes.json) —— 全部靠明文与自建模板表:
@@ -150,7 +150,12 @@ class Creation:
     eid: int
     template: str
     block: bytes
-    vstart: int             # 组件值起点(块内字节偏移)
+    vstart: int             # 组件值起点(块内字节偏移, **向下取整**)
+    # 组件值起点的**精确位偏移**。很多包的头部不是字节对齐的(实测占相当一部分),
+    # 只按 `vstart` 的字节偏移去读 uid 会**错位几 bit** —— 那就是「少数创建包读出来的
+    # uid 是垃圾(同一值上挤了 4~5 台不同玩家的车, 且该 uid 在位置流里没有采样)」的原因。
+    vbits: int = 0
+    ctrl: int = 0x24
 
 
 @dataclass
@@ -192,6 +197,7 @@ class EcsResult:
     templates: dict[int, int] = field(default_factory=dict)   # 模板名 -> 实例数
     group_size: int = 0                 # 每组人数 K(推断值; 0 = 没能推断)
     uid_offset: int | None = None       # 现场标定出的 uid 相对偏移
+    uid_offset2: int | None = None      # 少数布局不同的块用的第二个偏移
     stats: Counter = field(default_factory=Counter)
 
 
@@ -214,8 +220,8 @@ class EcsCollector:
             self._feed_destroy(payload, s, e, tick)
 
     def _feed_create(self, payload: bytes, s: int, e: int, tick: int) -> None:
-        ctrl = payload[s]
-        if ctrl == 0x25:
+        ctrl_lz4 = payload[s]
+        if ctrl_lz4 == 0x25:
             try:
                 body = lz4_block_decompress(payload[s + 1:e])
             except (ValueError, IndexError):
@@ -238,7 +244,7 @@ class EcsCollector:
                 self.stats["outer_eof"] += 1
                 return
             try:
-                c = self._parse_block(tick, eid, block)
+                c = self._parse_block(tick, eid, block, ctrl_lz4)
             except EOFError:
                 self.stats["block_eof"] += 1
                 break
@@ -246,7 +252,8 @@ class EcsCollector:
                 self._creations.append(c)
         self.stats["create_pkts"] += 1
 
-    def _parse_block(self, tick: int, eid: int, block: bytes) -> Creation | None:
+    def _parse_block(self, tick: int, eid: int, block: bytes,
+                     ctrl: int = 0x24) -> Creation | None:
         """只读到「组件值起点」为止 —— 组件值一个都不解析(那才需要哈希表)。"""
         br = BitReader(block)
         tid = br.compressed()
@@ -267,9 +274,9 @@ class EcsCollector:
         tcc = len(t["comps"])
         br.byte() if tcc < 256 else br.compressed()   # componentCount
         br.compressed()                              # 值区长度/标志(未解, 只需跳过)
-        vstart = br.pos // 8
+        vbits = br.pos
         return Creation(tick=tick, eid=eid, template=t["name"],
-                        block=block, vstart=vstart)
+                        block=block, vstart=vbits // 8, vbits=vbits, ctrl=ctrl)
 
     def _feed_destroy(self, payload: bytes, s: int, e: int, tick: int) -> None:
         try:
@@ -298,6 +305,32 @@ class EcsCollector:
 
     # ---- 现场标定 uid 偏移 ----------------------------------------------
     @staticmethod
+    def _uid_at(c: Creation, rel: int) -> int | None:
+        """在「组件值起点 + rel 字节」处取 16 位(**小端**, 字段内低字节在前), &0x7FF。
+
+        用 `vbits`(精确位偏移) 而不是 `vstart`(字节, 向下取整), 这样包头部
+        不是字节对齐时也不会错位。
+        """
+        bit = c.vbits + rel * 8
+        byte = bit >> 3
+        sh = bit & 7
+        blk = c.block
+        if byte + 1 >= len(blk):
+            return None
+        v = blk[byte] | (blk[byte + 1] << 8)
+        if byte + 2 < len(blk):
+            v |= blk[byte + 2] << 16
+        return (v >> sh) & UID_BITS
+
+    @staticmethod
+    def _spawn_of(c: Creation) -> str:
+        """块里的**出生组名**(`tN_playerMM_K`); 没有就返回空串 —— 有它就是玩家载具。"""
+        for _off, s in scanned_strings(c.block, 3, 60):
+            if SPAWN_RE.match(s):
+                return s
+        return ""
+
+    @staticmethod
     def _calibrate_uid(creations: list[Creation], known: set[int]) -> int | None:
         """哪个相对偏移上的 u16 低 11 位最像 uid。
 
@@ -308,14 +341,15 @@ class EcsCollector:
         """
         best: tuple[tuple[int, int], int] | None = None
         for rel in range(0, 400):
-            vals: list[int] | None = []
+            vals: list[int] = []
+            ok = True
             for c in creations:
-                o = c.vstart + rel
-                if o + 2 > len(c.block):
-                    vals = None
+                v = EcsCollector._uid_at(c, rel)
+                if v is None:
+                    ok = False
                     break
-                vals.append((c.block[o] | (c.block[o + 1] << 8)) & UID_BITS)
-            if not vals:
+                vals.append(v)
+            if not ok or not vals:
                 break
             uniq = len(set(vals))
             if uniq < len(vals) * 0.5:
@@ -355,14 +389,27 @@ class EcsCollector:
             return res
         res.uid_offset = rel
 
+        # ⚠ 实测: 75 个 `tank+player_unit` 里总有 18 个在 `rel` 上读出垃圾
+        #   (同一值上挤 4~5 台车、且该 uid 在位置流里没有采样)。它们的组件值布局
+        #   比主流多 1 个字节, 所以 uid 实际在 `rel+1`。办法不是猜, 而是**把这批
+        #   挑出来再标定一次** —— 同一个“命中已知 uid + 互异性”规则在子集上会给出
+        #   `rel+1`(实测 18/18 命中、17 个互异), 而常量字段(如 +27 恒为 56)被
+        #   互异性门槛挡掉。
+        rel2: int | None = None
+        if known_uids:
+            off = [c for c in (ground_want or want)
+                   if self._uid_at(c, rel) not in known_uids
+                   and self._spawn_of(c)]
+            if len(off) >= 3:
+                rel2 = self._calibrate_uid(off, known_uids)
+                if rel2 == rel:
+                    rel2 = None
+                else:
+                    res.uid_offset2 = rel2
+                    res.stats["uid_offset2"] = len(off)
+
         for c in want:
             blk, vs = c.block, c.vstart
-            o = vs + rel
-            if o + 2 > len(blk):
-                continue
-            uid = (blk[o] | (blk[o + 1] << 8)) & UID_BITS
-            if uid == EXT_MASK_UID:
-                continue
             # 型号的判定分支必须**按模板**而不是按全局开关：
             # `include_air=True` 时以前的写法会让地面模板(工事/机场防空)也去走
             # “机型词”分支，于是 `t1_airfield_aaa_small_01` 这种任务对象名
@@ -386,6 +433,18 @@ class EcsCollector:
                         cls = s
                 if spawn and cls:
                     break
+            # uid 最后取: 在 `rel` 上不合法就试 `rel2`(只对**玩家载具** ——
+            # 工事/AI 本来就不在位置流里, 不要让它们借道子集偏移).
+            uid = self._uid_at(c, rel)
+            if (uid is None or uid == EXT_MASK_UID
+                    or (known_uids and uid not in known_uids)):
+                if rel2 is not None and spawn:
+                    alt = self._uid_at(c, rel2)
+                    if alt is not None and alt != EXT_MASK_UID \
+                            and (not known_uids or alt in known_uids):
+                        uid = alt
+            if uid is None or uid == EXT_MASK_UID:
+                continue
             died = self._died_at(c.eid, c.tick)
             res.vehicles.append(Vehicle(
                 uid=uid, eid=c.eid, born_t=c.tick / 1000.0,
@@ -474,23 +533,24 @@ class EcsCollector:
             v.team = team_of.get(slot)
 
         # ---- 4. 没有出生组名的(无人侦察机 UCAV 等): 用击杀事实定主人
-        # UCAV 是玩家放出去的, 但它的构造块里**没有** `tN_playerMM_K`。它能被击落,
-        # 而击杀包的 `victim_pid` 就是**受害者**的玩家槽位 —— 正好是放飞它的那个人;
-        # 反过来它自己击杀别人时 `killer_pid` 同理。
-        # 只在**事件时刻落在存活窗口内**才采信: uid 会复用, 时间不对就会张冠李戴
-        # (实测 uid=120 的伤害事件给 pid 9、击杀事件给 pid 10, 就是不同时刻的两位主人)。
+        # UCAV 是玩家放出去的, 但它的构造块里**没有** `tN_playerMM_K`。
+        # 只用**它自己击杀别人**这条:`killer_uid == 该 uid` 时的 `killer_pid` 就是主人。
+        #
+        # ⚠ **不能反向用 `victim_pid`**(它被击落时): 那个字段解出来的是垃圾 ——
+        #   拿 ECS 的出生组名当裁判核对 88 条击杀, `killer_pid` **65/65 全对**,
+        #   而 `victim_pid` **56/57 全错**(53 条的"victim_pid"都是 14, 根本不是槽位)。
+        #   以前用它给 UCAV 定主人, 结果把 26 个 uid 全算到同一个玩家名下。
+        # 事件时刻要落在存活窗口内: uid 会复用, 时间不对就会张冠李戴。
         for v in res.vehicles:
             if v.slot is not None:
                 continue
             for k in kills:
-                ku = getattr(k, "killer_uid", EXT_MASK_UID)
-                vu = getattr(k, "victim_uid", EXT_MASK_UID)
-                if ku != v.uid and vu != v.uid:
+                if getattr(k, "killer_uid", EXT_MASK_UID) != v.uid:
                     continue
                 if not (v.born_t - 1.0 <= k.t
                         <= ((v.died_t + 1.0) if v.died_t is not None else 1e9)):
                     continue
-                pid = getattr(k, "killer_pid" if ku == v.uid else "victim_pid", 0)
+                pid = getattr(k, "killer_pid", 0)
                 if not pid or pid not in name_of:
                     continue
                 v.slot = pid

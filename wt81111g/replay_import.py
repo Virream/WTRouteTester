@@ -413,11 +413,13 @@ def build_record(data: ReplayData, source_path: str = "",
                 continue
             # 死亡时刻没落在切段点上（例如它比最后一个采样点晚了 1~2 秒）
             # 也算击毁 —— 但时间差要短，否则可能只是“没被看见”。
+            # 窗口放到 20 秒: 残骸被 `strip_corpses` 剔掉后, 最后一个采样就落在**击杀
+            # 那一刻**, 而 ECS 的销毁时刻还要再晚 10 秒左右(残骸在被销毁前一直上报)。
             dead = bool(death_at)
             if not dead and dl:
                 tail = seg[-1][0]
                 for d0 in dl:
-                    if tail <= d0 <= tail + 5.0:
+                    if tail <= d0 <= tail + 20.0:
                         dead, death_at = True, d0
                         break
             if dead:
