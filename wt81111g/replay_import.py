@@ -22,6 +22,12 @@ from .wrpl_reader import ReplayData, load_replay
 
 # 归一化后仍超出 [0,1] 的点按边界截断（远处 AI 会落在框外）
 GAP_SPLIT_SEC = 45.0        # 相邻采样超过这么久 → 认为是两段（死了/长时间无上报）
+JUMP_MIN_M = 200.0          # 一步至少跳这么远
+JUMP_MAX_MPS = 60.0         # 且折算速度超过这个（216 km/h）→ 判定为换了实体
+# 实测依据（2026-10-25，avg_finland 服务器回放）: uid=142 在 t=404.6s 一步跳了
+# 370.9 m / 3.52 s = 105 m/s(380 km/h) —— 地面车最快也就 150 km/h(42 m/s)，
+# 那就是“玩家在车里操作微型侦察无人机 / 死后重生”造成的 uid 复用。阈值取
+# 60 m/s: 正常行驶要在 200 m 内平均 216 km/h 才会误判，实际不可能。
 
 
 @dataclass
@@ -119,13 +125,21 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         segs: list[list[tuple[float, float, float, float]]] = []
         cur: list[tuple[float, float, float, float]] = []
         for item in rows:
-            if cur and item[0] - cur[-1][0] > GAP_SPLIT_SEC:
-                segs.append(cur)
-                cur = []
+            if cur:
+                dt = item[0] - cur[-1][0]
+                d = ((item[1] - cur[-1][1]) ** 2 + (item[3] - cur[-1][3]) ** 2) ** 0.5
+                # ① 隔了很久没上报（阵亡/重生）
+                # ② **uid 被复用**: 回放的 uid 是“场上槽位”而不是唯一实体 —— 玩家在车里
+                #    操作微型侦察无人机、或者死后重生，同一个 uid 前后是两台不同的东西，
+                #    时间上却是连续的 → 不切开就会在图上拉出一条瞬移直线
+                #    (2026-10-25 用户反馈 A67)。地面车跑不到 720 km/h，所以
+                #    “一步 > 200 m 且 > 200 m/s” 一定是换了实体。
+                if dt > GAP_SPLIT_SEC or (d > JUMP_MIN_M and dt > 0 and d / dt > JUMP_MAX_MPS):
+                    segs.append(cur)
+                    cur = []
             cur.append(item)
         if cur:
             segs.append(cur)
-
         for si, seg in enumerate(segs, 1):
             # 太短/几乎没动的段直接丢弃: 以前只验点数 >= 3，结果那辆“只被看见 1.4 秒”
             # 的车留在地图上就是一个孤立小点（用户 2026-10-25: 两个角上有 A1/A11）
