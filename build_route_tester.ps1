@@ -53,6 +53,14 @@ if (Test-Path (Join-Path $root ".venv\Lib\site-packages\pygfx")) {
                 "--collect-all", "rendercanvas", "--collect-all", "pylinalg")
     Write-Host "   (已启用 GPU 依赖收集)"
 }
+# 预置地图校准(assets\map_calib\<关卡名>.json): 回放导入的线路要靠它才能
+# 对齐到底图像素。目录不存在就跳过 —— 用户也可以自己在地图管理里导入。
+$calibArgs = @()
+if (Test-Path (Join-Path $root "assets\map_calib")) {
+    $calibArgs = @("--add-data", "assets\map_calib;assets\map_calib")
+    $n = (Get-ChildItem (Join-Path $root "assets\map_calib") -Filter *.json).Count
+    Write-Host "   (已带上 $n 份预置地图校准)"
+}
 & $py -m PyInstaller `
     --noconfirm `
     --clean `
@@ -63,6 +71,7 @@ if (Test-Path (Join-Path $root ".venv\Lib\site-packages\pygfx")) {
     --version-file version_info_route.txt `
     --add-data "assets\icons;assets\icons" `
     --add-data "icon\icon_512X512_WTRouteTester.png;icon" `
+    @calibArgs `
     @glArgs `
     route_tester.py
 
@@ -80,6 +89,7 @@ if ($OneFile) {
         --version-file version_info_route.txt `
         --add-data "assets\icons;assets\icons" `
         --add-data "icon\icon_512X512_WTRouteTester.png;icon" `
+        @calibArgs `
         @glArgs `
         route_tester.py
 }

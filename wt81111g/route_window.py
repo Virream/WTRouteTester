@@ -633,6 +633,17 @@ class RouteTesterWindow(QMainWindow):
         dlg = MapManagerDialog(self.store, self.map_cache, self)
         dlg.exec()
         self._reload_tree()
+        if dlg.calib_changed:
+            # 校准/底图变了 → 当前这张图立刻重画一次(否则还挂着旧图或空白网格)
+            key = self.map_view.map_key
+            data = self.map_cache.load(key) if key else None
+            if data is not None:
+                self.map_view.set_map_bytes(data, key=key)
+                self._refresh_map_tracks()
+            self._set_status(
+                f"已更新 {dlg.calib_changed} 处地图校准(回放导入的线路已按新比例对齐)",
+                sticky=4.0)
+            return
         hidden = sum(1 for k in self.store.ordered_map_keys()
                      if self.store.is_map_hidden(k))
         tail = f", 已隐藏 {hidden} 张" if hidden else ""
@@ -2325,7 +2336,7 @@ class RouteTesterWindow(QMainWindow):
             self._refresh_eye_icons()
             first = done[-1][0]
             self._expand_item(f"global|{first.route_id}")
-            # 底图: 有缓存就用; 回放推导出的地图键(wrpl:xxx)通常没有缓存底图,
+            # 底图: 有缓存就用; 回放推导出的地图键(`wrpl_xxx`)通常没有缓存底图,
             # 而地图控件在“没有底图”时**根本不画线路** → 用网格占位图顶上
             no_map = not self._show_cached_map(first.map_key)
             if no_map:
@@ -2339,6 +2350,7 @@ class RouteTesterWindow(QMainWindow):
                        cancelled: bool, total: int) -> None:
         """导入结束后汇总: 成功的写状态栏, 有失败/取消才弹框。"""
         lines = []
+        uncalibrated: list[str] = []
         for rec, st in done:
             src = "服务器" if st.server else "本地"
             one = (f"· {st.level or '?'}（{st.battle_type or '未知模式'}）"
@@ -2353,6 +2365,13 @@ class RouteTesterWindow(QMainWindow):
                 one += f" / {st.failed_packets} 个包解析失败"
             if st.dropped:
                 one += f" / {st.dropped} 段太短已跳过"
+            # 位置准不准取决于有没有 8111 的地图校准(世界米 → 底图像素)
+            if st.calibrated:
+                one += f" / 已按 8111 校准对齐（{st.calib_note}）"
+            else:
+                one += " / ⚠ 本图未校准, 位置是按本局观测范围估算的"
+                if st.level and st.level not in uncalibrated:
+                    uncalibrated.append(st.level)
             lines.append(one)
         head = f"共 {total} 个输入: 成功 {len(done)}"
         if failed:
@@ -2361,13 +2380,20 @@ class RouteTesterWindow(QMainWindow):
             head += ", 已取消剩余"
         tail = ("\n\n失败:\n"
                 + "\n".join(f"· {nm}\n  {why}" for nm, why in failed)) if failed else ""
-        if len(done) == 1 and not failed and not cancelled:
+        if uncalibrated:
+            tail += ("\n\n⚠ 这些地图还没有校准, 线路位置/比例是估算的:\n"
+                     + "\n".join(f"· {lv}" for lv in uncalibrated)
+                     + "\n解决办法: 进一局这张图, 用 tools/wrpl/capture_8111.py 抓一次 "
+                       "8111 数据, 再在菜单「地图管理」里给这张图导入校准 — "
+                       "校准与底图一起装进去, 以后同一张图的回放都准了。")
+        if len(done) == 1 and not failed and not cancelled and not uncalibrated:
             self._set_status(f"已导入: {lines[0].lstrip('· ')}", sticky=10.0)
             return
         body = "\n".join(lines) if lines else "(没有成功导入任何一局)"
         QMessageBox.information(
             self, "从录像中获取路线",
-            f"{head}\n\n{body}{tail}" if failed or cancelled else f"{head}\n\n{body}")
+            f"{head}\n\n{body}{tail}" if (failed or cancelled or uncalibrated)
+            else f"{head}\n\n{body}")
         self._set_status(f"{head} (详情见弹窗)", sticky=10.0)
 
     def _placeholder_map_png(self, name: str) -> bytes:

@@ -13,6 +13,13 @@
 名称改在窗口顶部固定的「地图名称」输入框里 —— 表格内部**完全禁止编辑**。
 之前用“双击单元格就地编辑”, 编辑器会落在图片所在的那一格里被缩略图盖住
 (只看得到左右各一条竖线), 所以改成结构上不可能出错的方案。
+
+**8111 校准**: 回放导入出来的地图(`wrpl_<关卡名>`)**没有底图也没有比例**
+—— 8111 只给正在打的那张图。所以这里多了一个「导入 8111 校准…」:
+选 `tools/wrpl/capture_8111.py` 抓出来的文件夹, 就把
+① 世界矩形(`map_min`/`map_max`)与 ② 当时的地图图片一起装到选中的地图键上。
+装完之后该图回放线路就与底图像素一一对应(实测 finland: 1 像素 = 1 米),
+而且不用在游戏里再进一次这张图。
 """
 from __future__ import annotations
 
@@ -24,12 +31,13 @@ import sys
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QBrush, QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
+    QAbstractItemView, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout,
 )
 
 from .map_cache import MapCache, MapEntry
+from .map_calib import MAP_KEY_PREFIX, load_from_capture, load_image, save_to_capture
 from .route_store import RouteStore
 
 log = logging.getLogger("map_manager")
@@ -38,7 +46,7 @@ _THUMB = 84          # 预览缩略图边长(px)
 _NAME_COL_W = 300    # “名称”列宽度(必须给足, 否则编辑框会压在预览图上)
 
 # 列号
-COL_PREVIEW, COL_NAME, COL_HIDDEN, COL_SIZE, COL_COUNT, COL_WHEN = range(6)
+COL_PREVIEW, COL_NAME, COL_HIDDEN, COL_SIZE, COL_COUNT, COL_CALIB, COL_WHEN = range(7)
 
 
 class MapManagerDialog(QDialog):
@@ -49,6 +57,7 @@ class MapManagerDialog(QDialog):
         self.store = store
         self.cache = cache
         self.renamed = 0
+        self.calib_changed = 0      # 导入/清除了几次校准(关窗后要重载底图)
         self.setWindowTitle("地图管理")
         self.resize(940, 560)
 
@@ -63,7 +72,9 @@ class MapManagerDialog(QDialog):
             "勾上「隐藏」= 这张地图不在左侧列表里显示(只用得到的地图就看得到了): "
             "轨迹、名称、缓存图片都不会被删, 随时取消勾选就能恢复。\n"
             "名称会显示在左侧列表, 也会写进已录制的轨迹记录; 缓存图片在 data/maps 下,"
-            "同一张图只存一份; 删除图片不会删除轨迹记录。")
+            "同一张图只存一份; 删除图片不会删除轨迹记录。\n"
+            "回放导入的地图(`wrpl_` 开头)没有底图也没有比例 —— 选中它再点"
+            "「导入 8111 校准…」, 选 capture_8111.py 抓出来的文件夹即可")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#94a3b8;")
         root.addWidget(tip)
@@ -87,9 +98,9 @@ class MapManagerDialog(QDialog):
         name_row.addWidget(self.btn_apply)
         root.addLayout(name_row)
 
-        self.table = QTableWidget(0, 6, self)
+        self.table = QTableWidget(0, 7, self)
         self.table.setHorizontalHeaderLabels(
-            ["预览", "名称", "隐藏", "图片", "轨迹", "首次缓存"])
+            ["预览", "名称", "隐藏", "回放校准", "图片", "轨迹", "首次缓存"])
         self.table.verticalHeader().setVisible(False)
         self.table.setIconSize(QSize(_THUMB, _THUMB))
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -108,7 +119,7 @@ class MapManagerDialog(QDialog):
         head.setSectionResizeMode(COL_PREVIEW, QHeaderView.ResizeMode.Fixed)
         head.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
         head.setSectionResizeMode(COL_HIDDEN, QHeaderView.ResizeMode.Fixed)
-        for col in (COL_SIZE, COL_COUNT, COL_WHEN):
+        for col in (COL_CALIB, COL_SIZE, COL_COUNT, COL_WHEN):
             head.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setColumnWidth(COL_PREVIEW, _THUMB + 16)
         self.table.setColumnWidth(COL_HIDDEN, 60)
@@ -130,6 +141,17 @@ class MapManagerDialog(QDialog):
         self.btn_remove = QPushButton("删除选中的缓存图片")
         self.btn_remove.clicked.connect(self._remove_current)
         row.addWidget(self.btn_remove)
+        self.btn_calib = QPushButton("导入 8111 校准…")
+        self.btn_calib.setToolTip(
+            "选 capture_8111.py 抓出来的文件夹\n"
+            "→ 把地图外框(世界米)与该图图片一起装到选中的地图上\n"
+            "→ 回放导入的线路就能与底图像素一一对应")
+        self.btn_calib.clicked.connect(self._import_calib)
+        row.addWidget(self.btn_calib)
+        self.btn_calib_clear = QPushButton("清除校准")
+        self.btn_calib_clear.setToolTip("只删校准数据(底图与轨迹都不动)")
+        self.btn_calib_clear.clicked.connect(self._clear_calib)
+        row.addWidget(self.btn_calib_clear)
         row.addStretch(1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
@@ -142,19 +164,40 @@ class MapManagerDialog(QDialog):
 
     # ------------------------------------------------------------------ 列表
     def reload(self) -> None:
-        """重建列表(按首次缓存时间倒序)。"""
+        """重建列表(有底图的按首次缓存时间倒序, 没底图的排后面)。"""
+        keep = self._current_key()          # 导入/清除校准后会 reload, 别丢选中
         self._loading = True
         try:
             entries = self.cache.entries()
             self.table.setRowCount(0)
+            cached = set()
             for entry in entries:
                 self._add_row(entry)
+                cached.add(entry.key)
+            # 只有轨迹/校准、**没有底图**的地图也要列出来 —— 否则给回放导入的地图
+            # (`wrpl_xxx`)根本选不中, 就没法给它导入校准。
+            for key in self.store.ordered_map_keys():
+                if key and key not in cached:
+                    self._add_row(MapEntry(key=key, path="", saved_at=0.0, size=0))
         finally:
             self._loading = False
         self._update_summary()
-        if self.table.rowCount() and self.table.currentRow() < 0:
-            self.table.setCurrentCell(0, 0)      # 默认选中第一张, 输入框直接可用
+        row = self._row_of_key(keep) if keep else -1
+        if row < 0 and self.table.rowCount():
+            row = 0                          # 默认选中第一张, 输入框直接可用
+        if row >= 0:
+            self.table.setCurrentCell(row, 0)
         self._on_selection_changed()
+
+    def _row_of_key(self, key: str | None) -> int:
+        """地图键 → 行号(找不到返回 -1)。"""
+        if not key:
+            return -1
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, COL_PREVIEW)
+            if it is not None and it.data(Qt.ItemDataRole.UserRole) == key:
+                return r
+        return -1
 
     def _update_summary(self) -> None:
         """底部汇总: 缓存张数 + 占用 + 隐藏了几张。"""
@@ -163,8 +206,8 @@ class MapManagerDialog(QDialog):
         hidden = sum(1 for e in entries if self.store.is_map_hidden(e.key))
         extra = ""
         if missing:
-            extra += (f"    另有 {len(missing)} 张地图只有轨迹、没有缓存图片"
-                      f"(未在游戏里再进过该图时无法显示底图)")
+            extra += (f"    另有 {len(missing)} 张地图没有底图"
+                      f"(已列在最后, 选中后可「导入 8111 校准…」装底图+校准)")
         if hidden:
             extra += f"    已隐藏 {hidden} 张(不在左侧列表显示)"
         self.lbl_summary.setText(
@@ -178,12 +221,17 @@ class MapManagerDialog(QDialog):
 
         # 预览(不可编辑: 否则双击图片会把输入框开在图片格里)
         thumb = QTableWidgetItem()
-        pm = QPixmap(entry.path)
-        if pm.isNull():
-            thumb.setText("无法预览")
+        if not entry.path:                  # 只有轨迹/校准, 还没有底图
+            thumb.setText("无底图")
+            thumb.setToolTip("这张图还没有底图: 选中它再点「导入 8111 校准…」")
         else:
-            thumb.setIcon(QIcon(pm.scaled(_THUMB, _THUMB, Qt.AspectRatioMode.KeepAspectRatio,
-                                          Qt.TransformationMode.SmoothTransformation)))
+            pm = QPixmap(entry.path)
+            if pm.isNull():
+                thumb.setText("无法预览")
+            else:
+                thumb.setIcon(QIcon(pm.scaled(
+                    _THUMB, _THUMB, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)))
         thumb.setData(Qt.ItemDataRole.UserRole, entry.key)
         thumb.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         self.table.setItem(row, COL_PREVIEW, thumb)
@@ -204,7 +252,8 @@ class MapManagerDialog(QDialog):
                         "轨迹/名称/缓存图片都不会删, 取消勾选就回来")
         self.table.setItem(row, COL_HIDDEN, hide)
 
-        size = QTableWidgetItem(f"{entry.size_text}  {_image_size_text(entry.path)}")
+        size = QTableWidgetItem(f"{entry.size_text}  {_image_size_text(entry.path)}"
+                                if entry.path else "—")
         size.setFlags(Qt.ItemFlag.ItemIsEnabled)
         self.table.setItem(row, COL_SIZE, size)
 
@@ -213,10 +262,38 @@ class MapManagerDialog(QDialog):
         count.setFlags(Qt.ItemFlag.ItemIsEnabled)
         self.table.setItem(row, COL_COUNT, count)
 
-        when = QTableWidgetItem(entry.saved_at_text)
+        calib = QTableWidgetItem(self._calib_text(entry.key))
+        calib.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        calib.setToolTip(self._calib_tip(entry.key))
+        calib.setForeground(QBrush(Qt.GlobalColor.gray)
+                            if self.store.calib_of(entry.key) is None else QBrush())
+        self.table.setItem(row, COL_CALIB, calib)
+
+        when = QTableWidgetItem(entry.saved_at_text if entry.saved_at else "—")
         when.setFlags(Qt.ItemFlag.ItemIsEnabled)
         when.setToolTip(f"地图键: {entry.key}")
         self.table.setItem(row, COL_WHEN, when)
+
+    def _calib_text(self, key: str) -> str:
+        """「校准」列的显示文本。"""
+        calib = self.store.calib_of(key)
+        if calib is None:
+            return "未校准" if key.startswith(MAP_KEY_PREFIX) else "—"
+        return f"✓ {calib.span_x:.0f}×{calib.span_z:.0f} m"
+
+    def _calib_tip(self, key: str) -> str:
+        calib = self.store.calib_of(key)
+        if calib is None:
+            return ("这张图没有 8111 校准 —— 回放导入的线路只能按本局观测范围\n"
+                    "估算比例, 位置不会与底图对齐。\n"
+                    "选中这一行, 再点「导入 8111 校准…」即可。")
+        tip = (f"已校准: {calib.describe()}\n"
+               f"来源: {calib.source or '?'}"
+               + (f" ({calib.captured_at})" if calib.captured_at else ""))
+        if calib.zones:
+            tip += "\n战区: " + ", ".join(
+                f"{z.get('label')}({z.get('x')}, {z.get('z')})" for z in calib.zones)
+        return tip
 
     def _update_name_cell(self, key: str) -> None:
         """把「名称」列刷新成当前真实值(没名字显示灰色“未命名”, 隐藏的加个标记)。"""
@@ -297,6 +374,80 @@ class MapManagerDialog(QDialog):
         item = self.table.item(row, COL_PREVIEW)
         return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
 
+    def _import_calib(self) -> None:
+        """把 `capture_8111.py` 抓出来的文件夹装到选中的地图上(校准 + 底图)。"""
+        self._apply_name()
+        key = self._current_key()
+        if key is None:
+            QMessageBox.information(self, "导入 8111 校准", "请先选中一行(要导入到哪张地图)")
+            return
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "选择 capture_8111.py 抓取的文件夹(里面有 map_info.json)")
+        if not dir_path:
+            return
+        try:
+            calib = load_from_capture(dir_path)
+        except (ValueError, OSError, KeyError) as exc:
+            QMessageBox.warning(self, "导入 8111 校准", f"这个文件夹用不了:\n\n{exc}")
+            return
+
+        # 底图一起装上: 回放导入的地图本来没有图片, 没图就什么都画不出来
+        img_note = "（文件夹里没有地图图片, 只装了校准）"
+        img = load_image(dir_path)
+        if img:
+            if self.cache.put(key, img):
+                img_note = f"底图已装入 {calib.img_w}×{calib.img_h}"
+            else:
+                img_note = "底图已存在且不更清晰, 保留原图"
+
+        self.store.set_calib(key, calib)
+        self.calib_changed += 1
+        # 旧记录(按以前的估算范围归一的)跟着重算一次 —— 不用让用户重新导入回放
+        renum = 0
+        try:
+            from .replay_import import renormalize_map_records   # 懒导入: 它带 zstandard
+            renum = renormalize_map_records(self.store, key, calib)
+        except Exception as exc:                        # noqa: BLE001 - 不影响导入校准
+            log.warning("重算回放记录坐标失败: %s", exc)
+        # 顺手在抓取目录里留一份 calib.json —— 以后要分发预置校准时直接拿这个文件
+        try:
+            save_to_capture(dir_path, calib)
+        except OSError as exc:
+            log.warning("写 calib.json 失败 %s: %s", dir_path, exc)
+
+        shown = self.store.display_name(key)
+        self.reload()
+        extra = f"\n已按新校准重算了 {renum} 条回放记录的位置。" if renum else ""
+        QMessageBox.information(
+            self, "导入 8111 校准",
+            f"已把校准装到「{shown}」\n\n"
+            f"{calib.describe()}\n{img_note}{extra}\n\n"
+            f"以后这张图的所有回放线路都会与底图像素一一对应"
+            f"（1 像素 = {calib.span_x / max(1, calib.img_w):.2f} 米）。")
+        log.info("地图管理: 导入校准 %s <- %s (%s)", key, dir_path, calib.describe())
+
+    def _clear_calib(self) -> None:
+        """删掉选中地图的校准(底图与轨迹都不动)。"""
+        self._apply_name()
+        key = self._current_key()
+        if key is None:
+            QMessageBox.information(self, "清除校准", "请先选中一行")
+            return
+        if self.store.calib_of(key) is None:
+            QMessageBox.information(self, "清除校准",
+                                    f"「{self.store.display_name(key)}」本来就没有校准")
+            return
+        ok = QMessageBox.question(
+            self, "清除校准",
+            f"清除「{self.store.display_name(key)}」的 8111 校准吗?\n\n"
+            f"底图图片、轨迹记录都不会动, 只是回放导入时不再按它对齐\n"
+            f"(改回按本局观测范围估算)。")
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        if self.store.clear_calib(key):
+            self.calib_changed += 1
+            self.reload()
+
     def _open_dir(self) -> None:
         path = self.cache.dir
         try:
@@ -312,6 +463,12 @@ class MapManagerDialog(QDialog):
         key = self._current_key()
         if key is None:
             QMessageBox.information(self, "删除缓存图片", "请先选中一行")
+            return
+        if not self.cache.has(key):
+            QMessageBox.information(
+                self, "删除缓存图片",
+                f"「{self.store.display_name(key)}」现在没有底图可删。\n"
+                f"(校准数据若要清理, 用旁边的「清除校准」)")
             return
         used = sum(1 for r in self.store.routes if r.map_key == key)
         ok = QMessageBox.question(

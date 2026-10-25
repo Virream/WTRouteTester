@@ -30,9 +30,14 @@
   "map_zones": {"<地图指纹>": [{"sig": .., "count": .., "mode": ..,
                                "zones": [{"label": .., "x": .., "y": ..}],
                                "seen_at": ..}, ...]},
+  "map_calib": {"<地图键>": {MapCalib 的字典(世界矩形 + 图片尺寸)}},
   "routes": [ {路线记录}, ... ],
   "globals": [ {全局录制条目}, ... ]
 }
+
+`map_calib` 是「回放里的世界米 → 底图像素」的变换(见 `map_calib.py`)。
+**只有回放导入的线路需要它** —— 战局内录的轨迹本来就是 8111 的归一化坐标,
+而回放给的是米制世界坐标, 没有这个矩形就只能拿“本局观测范围”去凑比例。
 
 `globals` 是「全局录制」条目(整局所有玩家的线路, 分 A/B 两队), 与 `routes`
 是两类记录: 前者挂在侧栏**存放路线的那一级**, 但不可当单条轨迹回放。
@@ -53,6 +58,7 @@ from dataclasses import asdict, dataclass, field
 
 from .config import data_dir
 from .garage import GARAGE_MAP_SHA1
+from .map_calib import MapCalib
 from .zones import layout_spread
 from .zones import mode_name as zone_mode_name
 from .zones import signature as zones_signature
@@ -424,6 +430,11 @@ class GlobalRecord:
     # 死亡时刻是否已经确认过。`False` 时侧栏条目上会显示一个黄色感叹号
     # (点它就打开修正界面); 重录任何一队都会重置成 `False`。
     fixed: bool = False
+    # 本条目**归一化时用的世界矩形** `[min_x, max_x, min_z, max_z]`(米), 只对回放
+    # 导入的记录有意义: `points` 里存的是 0~1, 有了这个矩形就能反推出世界米 ——
+    # 于是“地图管理里换了/补了校准”以后可以把旧记录**重新对齐**, 不用重新导入。
+    # 旧数据/8111 录制的记录没有这个字段(空) → 不参与重算。
+    norm_rect: list = field(default_factory=list)
 
     def zone_state_entry(self, t: float, side: str = "") -> dict | None:
         """取回放时刻 `t` 的战区快照**整条**(`{"t","side","zones"}`); 没有返回 None。
@@ -481,6 +492,15 @@ class GlobalRecord:
     @property
     def mode_label(self) -> str:
         return self.mode_name or zone_mode_name(self.zone_count)
+
+    @property
+    def is_replay(self) -> bool:
+        """是不是「从录像导入」的条目(地图键 `wrpl_<level>`)。
+
+        录像导入的坐标是米制世界坐标归一化来的, 与 8111 实时录制不同 ——
+        只有它们受地图校准(`map_calib`)影响。
+        """
+        return (self.map_key or "").startswith("wrpl_")
 
     @property
     def mark_label(self) -> str:
@@ -541,6 +561,7 @@ class GlobalRecord:
             "kills": self.kills,
             "watchers": dict(self.watchers),
             "fixed": 1 if self.fixed else 0,
+            "norm_rect": list(self.norm_rect or []),
             "sides": {side: [life.to_json() for life in self.lives(side)]
                       for side in GLOBAL_SIDES},
         }
@@ -566,6 +587,12 @@ class GlobalRecord:
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("跳过损坏的全局录制记录: %s", exc)
             return None
+        try:
+            rect = [float(v) for v in (data.get("norm_rect") or [])]
+            if len(rect) == 4 and rect[1] > rect[0] and rect[3] > rect[2]:
+                rec.norm_rect = rect
+        except (TypeError, ValueError):
+            rec.norm_rect = []
         for row in data.get("zone_states") or []:
             if not isinstance(row, dict):
                 continue
@@ -776,6 +803,9 @@ class RouteStore:
         # 见过的战区布局: {地图键: [布局, ...]}(新的在前, 每种模式一条),
         # 存下来才能在战局结束后依旧把 A/B/C 画在地图上
         self.map_zones: dict[str, list[dict]] = {}
+        # 地图校准(世界米 → 底图像素): {地图键: MapCalib.to_dict()}
+        # 回放导入的线路是**米制世界坐标**, 必须有这个矩形才能准确落到 2048² 底图上
+        self.map_calib: dict[str, dict] = {}
         self.routes: list[RouteRecord] = []
         # 全局录制条目(整局所有玩家的线路, 分 A/B 两队)
         self.globals: list[GlobalRecord] = []
@@ -808,6 +838,11 @@ class RouteStore:
                 for key, layouts in mz.items():
                     if isinstance(layouts, list):
                         self.map_zones[str(key)] = [x for x in layouts if isinstance(x, dict)]
+            mc = data.get("map_calib")
+            if isinstance(mc, dict):
+                for key, calib in mc.items():
+                    if isinstance(calib, dict):
+                        self.map_calib[str(key)] = calib
             for item in data.get("routes") or []:
                 try:
                     pts = [RoutePoint(**p) for p in item.get("points") or []]
@@ -836,7 +871,43 @@ class RouteStore:
                         self.globals.append(rec)
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("读取线路数据失败: %s", exc)
+        self._migrate_replay_keys()
         self._recover_layouts()
+
+    def _migrate_replay_keys(self) -> bool:
+        """旧回放地图键 `wrpl:<level>` → `wrpl_<level>`(不写盘, 下次正常保存时落回)。
+
+        为什么要改: 底图缓存按 `<地图键>.<ext>` 存文件, 键里的冒号在 Windows 上是
+        **非法字符**, 于是回放导入的地图永远装不上底图。新键用下划线。
+        不迁移的话, 同一张图会在侧栏里出现两条(`wrpl:avg_finland` / `wrpl_avg_finland`)。
+        """
+        old_prefix = "wrpl:"
+        changed = False
+        for rec in self.globals:
+            key = rec.map_key or ""
+            if key.startswith(old_prefix):
+                new = "wrpl_" + key[len(old_prefix):]
+                rec.map_key = new
+                for side in GLOBAL_SIDES:
+                    for life in rec.lives(side):
+                        if (life.map_key or "").startswith(old_prefix):
+                            life.map_key = new
+                changed = True
+        if changed:
+            self.known_maps = ["wrpl_" + k[len(old_prefix):]
+                               if k.startswith(old_prefix) else k
+                               for k in self.known_maps]
+            for attr in ("map_names", "map_calib", "layout_names"):
+                src = getattr(self, attr)
+                for k in [k for k in src if k.startswith(old_prefix)]:
+                    src.setdefault("wrpl_" + k[len(old_prefix):], src[k])
+                    src.pop(k, None)
+            for k in [k for k in self.map_zones if k.startswith(old_prefix)]:
+                self.map_zones.setdefault("wrpl_" + k[len(old_prefix):], self.map_zones[k])
+                self.map_zones.pop(k, None)
+            log.info("已把旧的 `wrpl:` 地图键迁移成 `wrpl_`(共 %d 条回放记录)",
+                     sum(1 for r in self.globals if r.is_replay))
+        return changed
 
     def _recover_layouts(self) -> bool:
         """轨迹里有战区指纹、但 `map_zones` 没存过对应布局 → 从指纹还原出来。
@@ -883,6 +954,7 @@ class RouteStore:
                 "layout_names": self.layout_names,
                 "known_maps": self.ordered_map_keys(),
                 "map_zones": self.map_zones,
+                "map_calib": self.map_calib,
                 "routes": [
                     {
                         **{k: v for k, v in asdict(r).items()
@@ -1227,6 +1299,10 @@ class RouteStore:
                     tgt.setdefault(sig, name)
             if not self.layout_names.get(keep):
                 self.layout_names.pop(keep, None)
+            # 地图校准: keep 没有就用 drop 的(同一张图, 矩形是一样的)
+            drop_calib = self.map_calib.pop(drop, None)
+            if drop_calib and not self.map_calib.get(keep):
+                self.map_calib[keep] = drop_calib
         self.save()
         log.info("已合并地图条目: %s ← %s (%d 条轨迹)", keep, drop, len(moved))
         return True
@@ -1256,6 +1332,43 @@ class RouteStore:
         return out
 
     # ------------------------------------------------------------------ 战区/模式
+    # ------------------------------------------------------------------ 地图校准
+    def calib_of(self, map_key: str) -> MapCalib | None:
+        """取这张图的校准(没有/无效返回 None)。"""
+        if not map_key:
+            return None
+        with self._lock:
+            raw = self.map_calib.get(map_key)
+        if not isinstance(raw, dict):
+            return None
+        calib = MapCalib.from_dict(raw)
+        return calib if calib.valid else None
+
+    def set_calib(self, map_key: str, calib: MapCalib) -> bool:
+        """记下这张图的校准并写盘。返回是否真的变了。"""
+        if not map_key or calib is None or not calib.valid:
+            return False
+        data = calib.to_dict()
+        with self._lock:
+            if self.map_calib.get(map_key) == data:
+                return False
+            self.map_calib[map_key] = data
+            if map_key not in self.known_maps:      # 让它出现在侧栏/地图管理里
+                self.known_maps.append(map_key)
+        self.save()
+        log.info("地图校准: %s <- %s (%s)", map_key, calib.source or "?", calib.describe())
+        return True
+
+    def clear_calib(self, map_key: str) -> bool:
+        """删掉这张图的校准(底图/轨迹都不动)。"""
+        with self._lock:
+            if map_key not in self.map_calib:
+                return False
+            self.map_calib.pop(map_key, None)
+        self.save()
+        log.info("已清除地图校准: %s", map_key)
+        return True
+
     def remember_zones(self, map_key: str, zones, spawns=None) -> bool:
         """记下某地图的战区布局 + **重生位置**(按坐标串去重)。返回是否是新布局。
 

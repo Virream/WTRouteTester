@@ -436,6 +436,55 @@ class MapCache:
                  info.width if info else "?", info.height if info else "?")
         return (key, True)
 
+    def put(self, key: str, data: bytes | None) -> bool:
+        """把图片**按指定地图键**存进缓存。返回是否写入了新图。
+
+        与 `save()` 的区别: 不按内容算哈希、也不做相似合并 —— 用户/预置文件已经
+        明确指名这张图属于哪个地图键(回放导入的地图键 `wrpl_<level>` 拿不到 8111
+        的图片, 底图要靠用户在「地图管理」里导入)。已有同名文件时只在**新图更
+        清晰**时替换。
+        """
+        if not data or not key:
+            return False
+        info = image_info(data)
+        if info is None:
+            log.warning("导入的地图图片无法解码, 忽略: %s", key)
+            return False
+        old = self.path_of(key)
+        if old is not None:
+            entry = self._index.get(key) or {}
+            old_px = int(entry.get("w") or 0) * int(entry.get("h") or 0)
+            if not old_px:
+                try:
+                    with open(old, "rb") as fh:
+                        w, h = image_size(fh.read(65536))
+                    old_px = w * h
+                except OSError:
+                    old_px = 0
+            if old_px and info.pixels <= old_px:
+                log.info("已有更清晰的底图(%s), 不覆盖: %s", os.path.basename(old), key)
+                return False
+            try:
+                os.remove(old)          # 扩展名可能不同(jpg → png), 先删旧的
+            except OSError:
+                pass
+        ext = detect_ext(data)
+        out = os.path.join(self.dir, f"{key}.{ext}")
+        tmp = out + ".tmp"
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, out)
+        except OSError as exc:  # noqa: BLE001
+            log.warning("写入地图底图失败 %s: %s", out, exc)
+            return False
+        with self._lock:
+            self._remember(key, info, len(data))
+            self._save_index()
+        log.info("已按指定地图键存入底图: %s (%dx%d)",
+                 os.path.basename(out), info.width, info.height)
+        return True
+
     def _upgrade_image(self, key: str, data: bytes, info: MapImageInfo | None) -> None:
         """同一张地图又见到一份图: 只保留**分辨率更高**的那份(键不变)。"""
         if info is None:

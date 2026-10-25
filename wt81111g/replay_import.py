@@ -7,8 +7,11 @@
 `UnitLife.points` —— 与 8111 录制的那套归一化坐标同构，所以绘制/回放/悬停
 全部可以复用，不需要改渲染。
 
-归一化的范围用**所有样本的 1%~99% 分位**（回放里有远处机场 AI 防空，坐标能到
-±20 km，直接用 min/max 会把战场压成一小块）。
+归一化的范围: **优先用 8111 的地图校准**(`map_min`/`map_max`, 见 `map_calib.py`),
+这样回放坐标与底图像素**一一对应**(实测 finland: 1 像素 = 1 米)。
+没有校准的图退回**所有样本的 0.1%~99.9% 分位**估算(回放里有远处机场 AI 防空,
+坐标能到 ±20 km, 直接用 min/max 会把战场压成一小块)—— 那种情况比例与偏移都不准,
+界面上会提示用户去「地图管理」导入校准。
 """
 from __future__ import annotations
 
@@ -17,6 +20,7 @@ import re
 import time
 from dataclasses import dataclass
 
+from .map_calib import MAP_KEY_PREFIX, MapCalib, level_of, load_bundled
 from .route_store import GlobalRecord, TrackPoint, UnitLife
 from .wrpl_reader import EXT_MASK_UID, ReplayData, load_replay
 
@@ -54,6 +58,8 @@ class ImportStats:
     ecs_vehicles: int = 0      # ECS 解出的玩家载具数
     ecs_bound: int = 0         # 其中成功绑定玩家/阵营的
     ecs_group: int = 0         # 出生组每组人数 K（16v16 时为 16）
+    calibrated: bool = False   # 是否用了 8111 地图校准(世界米 → 底图像素)
+    calib_note: str = ""       # 校准来源/尺寸描述(给导入报告用)
 
 
 def _robust_range(values: list[float]) -> tuple[float, float]:
@@ -77,6 +83,31 @@ def _robust_range(values: list[float]) -> tuple[float, float]:
     return lo, hi
 
 
+def replay_map_key(level: str) -> str:
+    """关卡名 → 地图键。用 `wrpl_<level>` 而**不是** `wrpl:<level>` ——
+    底图缓存以 `<地图键>.<ext>` 存盘, 冒号在 Windows 上是非法文件名字符。
+    """
+    return f"{MAP_KEY_PREFIX}{level or 'unknown'}"
+
+
+def resolve_calib(store, level: str) -> tuple[MapCalib | None, str]:
+    """找这张图的校准: 用户导入的(store) 优先, 其次随软件预置的。
+
+    返回 `(校准, 来源说明)`; 都没有时返回 `(None, "")`。
+    """
+    key = replay_map_key(level)
+    try:
+        calib = store.calib_of(key) if store is not None else None
+    except AttributeError:
+        calib = None
+    if calib is not None:
+        return calib, "地图管理里导入的校准"
+    calib = load_bundled(level_of(key))
+    if calib is not None:
+        return calib, "随软件预置的校准"
+    return None, ""
+
+
 def _time_from_name(path: str) -> str:
     """从 `#2026.10.24 22.45.13.wrpl` 这类文件名里取录制时刻；取不到用当前时间。"""
     m = re.search(r"(\d{4})[.\-](\d{2})[.\-](\d{2})[ _](\d{2})[.\-:](\d{2})[.\-:](\d{2})",
@@ -87,8 +118,15 @@ def _time_from_name(path: str) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord, ImportStats]:
-    """`ReplayData` → `GlobalRecord`（全部单位先放 A 队；阵营待接 ECS）。"""
+def build_record(data: ReplayData, source_path: str = "",
+                 calib=None) -> tuple[GlobalRecord, ImportStats]:
+    """`ReplayData` → `GlobalRecord`。
+
+    `calib` 是这张图的地图校准(`MapCalib`, 见 `map_calib.py`)。回放里的坐标是
+    **米制世界坐标**, 而地图控件要的是 0~1 归一化: 只有拿到 8111 的
+    `map_min`/`map_max` 才能准确落到 2048² 底图上。没有校准时退回老办法
+    ——用本局观测到的 0.1%/99.9% 分位范围估算, 比例/偏移都不准。
+    """
     src = source_path or data.source
     stats = ImportStats(
         level=data.level, battle_type=data.battle_type, server=data.server,
@@ -98,21 +136,31 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         damages=data.damages,
     )
 
-    xs, zs = [], []
-    for rows in data.units.values():
-        for _t, x, _y, z in rows:
-            xs.append(x)
-            zs.append(z)
-    if not xs:
-        raise ValueError("回放里没有解析到任何地面单位位置")
-    minx, maxx = _robust_range(xs)
-    minz, maxz = _robust_range(zs)
-    # 两侧各留 5% 余量：分位范围之外的那一点点（玩家绕到重生点后方、贴边绕圈）
-    # 不至于跑出画布 —— 地图控件是 x*w 直接换算，超出的部分会被裁掉、看起来像断线
-    padx, padz = (maxx - minx) * 0.05, (maxz - minz) * 0.05
-    minx, maxx = minx - padx, maxx + padx
-    minz, maxz = minz - padz, maxz + padz
+    calibrated = bool(calib is not None and getattr(calib, "valid", False))
+    if calibrated:
+        # 用 8111 的地图外框: 直接就是底图覆盖的世界矩形, 不需要任何估算
+        minx, maxx = float(calib.min_x), float(calib.max_x)
+        minz, maxz = float(calib.min_z), float(calib.max_z)
+        stats.calibrated = True
+        stats.calib_note = calib.describe()
+    else:
+        xs, zs = [], []
+        for rows in data.units.values():
+            for _t, x, _y, z in rows:
+                xs.append(x)
+                zs.append(z)
+        if not xs:
+            raise ValueError("回放里没有解析到任何地面单位位置")
+        minx, maxx = _robust_range(xs)
+        minz, maxz = _robust_range(zs)
+        # 两侧各留 5% 余量：分位范围之外的那一点点（玩家绕到重生点后方、贴边绕圈）
+        # 不至于跑出画布 —— 地图控件是 x*w 直接换算，超出的部分会被裁掉、看起来像断线
+        padx, padz = (maxx - minx) * 0.05, (maxz - minz) * 0.05
+        minx, maxx = minx - padx, maxx + padx
+        minz, maxz = minz - padz, maxz + padz
     spanx, spanz = maxx - minx, maxz - minz
+    if spanx <= 0 or spanz <= 0:
+        raise ValueError("地图范围无效(宽/高为 0) —— 回放里没有可用坐标")
 
     map_name = data.level or "未知地图"
     if data.battle_type:
@@ -120,7 +168,7 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
 
     rec = GlobalRecord(
         route_id="",                       # 由 store.new_global 之外的地方补; 这里直接给
-        map_key=f"wrpl:{data.level or 'unknown'}",
+        map_key=replay_map_key(data.level),
         map_name=map_name,
         created_at=_time_from_name(src) if src else
                    time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -130,6 +178,9 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         duration=max(0.0, data.t_last - data.t_first),
     )
     rec.route_id = f"wrpl{int(time.time() * 1000) % 10 ** 10:010d}"
+    # 记住归一化用的世界矩形: 以后这图补上/换了校准, 可以**原地重算**坐标
+    # (见 `renormalize_map_records`), 不用让用户重新导入回放。
+    rec.norm_rect = [minx, maxx, minz, maxz]
 
     t0 = data.t_first
     # ---- 玩家身份与真实分队 ------------------------------------------------
@@ -508,6 +559,49 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
     return rec, stats
 
 
+def renormalize_map_records(store, map_key: str, calib) -> int:
+    """把已经导入的记录**重新归一化**到新校准上。返回改了几条记录。
+
+    为什么需要: `points` 里存的是 0~1, 归一化用的范围在导入那一刻就定死了。
+    用户在「地图管理」里补上/换掉 8111 校准以后, 旧记录的位置还是按当初的估算
+    范围算的 —— 不重算就永远歪着。有了 `norm_rect`(导入时用的世界矩形)就能
+    反推出世界米, 再用新校准换算一遍, 不用重新导入回放。
+
+    只处理 `norm_rect` 完整、且属于这张图的记录; 8111 实时录制的不受影响
+    (它们本来就是 8111 的归一化坐标)。
+    """
+    if calib is None or not getattr(calib, "valid", False):
+        return 0
+    new_rect = [float(calib.min_x), float(calib.max_x),
+                float(calib.min_z), float(calib.max_z)]
+    nspanx, nspanz = new_rect[1] - new_rect[0], new_rect[3] - new_rect[2]
+    changed = 0
+    for rec in getattr(store, "globals", ()):
+        if getattr(rec, "map_key", "") != map_key:
+            continue
+        old = getattr(rec, "norm_rect", None) or []
+        if len(old) != 4:
+            continue
+        if [round(v, 3) for v in old] == [round(v, 3) for v in new_rect]:
+            continue
+        spanx, spanz = old[1] - old[0], old[3] - old[2]
+        if spanx <= 0 or spanz <= 0:
+            continue
+        for side in ("A", "B"):
+            for life in rec.lives(side):
+                for pt in life.points:
+                    wx = old[0] + pt.x * spanx
+                    wz = old[3] - pt.y * spanz
+                    pt.x = (wx - new_rect[0]) / nspanx
+                    pt.y = (new_rect[3] - wz) / nspanz
+        rec.norm_rect = new_rect
+        changed += 1
+    if changed:
+        store.save()
+        log.info("按新校准重算了 %d 条回放记录的位置: %s", changed, map_key)
+    return changed
+
+
 def import_replay(path: str, store, *, progress=None,
                   expect_server: bool | None = None
                   ) -> tuple[GlobalRecord, ImportStats]:
@@ -520,6 +614,7 @@ def import_replay(path: str, store, *, progress=None,
     `progress(msg, frac)` / `expect_server` 含义见 `wrpl_reader.load_replay`。
     """
     data = load_replay(path, progress=progress, expect_server=expect_server)
-    rec, stats = build_record(data, path if os.path.isfile(path) else "")
+    calib, _src = resolve_calib(store, data.level)
+    rec, stats = build_record(data, path if os.path.isfile(path) else "", calib=calib)
     store.add_global(rec)
     return rec, stats
