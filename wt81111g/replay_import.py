@@ -423,7 +423,12 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                 stats.dropped += 1
                 continue
             veh = seg_veh[si - 1]
-            side = "B" if (veh is not None and veh.team == 2) else "A"
+            if veh is None or veh.team is None:
+                # 阵营解不出来的空中单位（无人侦察机，既没有出生组名也没有交战记录）
+                # **直接忽略** —— 宁可不要这条线，也不要把它硬塞进某一队（用户口径）。
+                stats.dropped += 1
+                continue
+            side = "B" if veh.team == 2 else "A"
             _k = id(veh) if veh is not None else -1
             if _k not in _air_base:
                 _air_base[_k] = len(rec.sides[side]) + 1

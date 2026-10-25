@@ -463,6 +463,32 @@ class EcsCollector:
             v.player = name_of.get(slot, "")
             v.team = team_of.get(slot)
 
+        # ---- 4. 没有出生组名的(无人侦察机 UCAV 等): 用击杀事实定主人
+        # UCAV 是玩家放出去的, 但它的构造块里**没有** `tN_playerMM_K`。它能被击落,
+        # 而击杀包的 `victim_pid` 就是**受害者**的玩家槽位 —— 正好是放飞它的那个人;
+        # 反过来它自己击杀别人时 `killer_pid` 同理。
+        # 只在**事件时刻落在存活窗口内**才采信: uid 会复用, 时间不对就会张冠李戴
+        # (实测 uid=120 的伤害事件给 pid 9、击杀事件给 pid 10, 就是不同时刻的两位主人)。
+        for v in res.vehicles:
+            if v.slot is not None:
+                continue
+            for k in kills:
+                ku = getattr(k, "killer_uid", EXT_MASK_UID)
+                vu = getattr(k, "victim_uid", EXT_MASK_UID)
+                if ku != v.uid and vu != v.uid:
+                    continue
+                if not (v.born_t - 1.0 <= k.t
+                        <= ((v.died_t + 1.0) if v.died_t is not None else 1e9)):
+                    continue
+                pid = getattr(k, "killer_pid" if ku == v.uid else "victim_pid", 0)
+                if not pid or pid not in name_of:
+                    continue
+                v.slot = pid
+                v.player = name_of.get(pid, "")
+                v.team = team_of.get(pid)
+                v.bind = "kill-uid"
+                break
+
     @staticmethod
     def _fill_end_times(res: EcsResult, t_end: float | None) -> None:
         """把「什么时候消失」补全。
@@ -470,10 +496,14 @@ class EcsCollector:
         残骸会留在场上, ECS 不一定对所有载具发 0x26 —— 但**玩家同一时刻只能开
         一台车**, 所以下一台出现的那一刻, 上一台就结束了。这条规则把所有换车
         都切得干净, 而且不依赖击杀包(击杀只能覆盖被打死的)。
+
+        ⚠ **只对「有出生组名」的实体生效**。无人侦察机(UCAV)是玩家放出去的,
+        它会和玩家的坦克**并行存在**, 把它算进链条就会把坦克截成零点几秒
+        (实测 `GHOST40044` 的 `ussr_t_90m_arena_m` 被自己的 UCAV 顶掉)。
         """
         by_slot: dict[int, list[Vehicle]] = defaultdict(list)
         for v in res.vehicles:
-            if v.slot is not None:
+            if v.slot is not None and v.spawn:
                 by_slot[v.slot].append(v)
         for lst in by_slot.values():
             lst.sort(key=lambda v: v.born_t)
