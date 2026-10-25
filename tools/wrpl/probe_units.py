@@ -36,7 +36,9 @@ from wt81111g import wrpl_reader as W                             # noqa: E402
 MID_DEF = 0xD039                    # 0x00025839 = 单位定义
 NAME_RE = re.compile(r"^[A-Za-z0-9_./@+\-]{3,64}$")
 # 上游的 RUNWAY_MARKERS 是 `t1_airfield_top[_reload]`; 本局名字更短, 所以按前缀认
-WANT = re.compile(r"^(t[12]_(airfield|helipad|tankSpawn)|missions/|capture_zone)", re.I)
+WANT = re.compile(r"^(t[12]_(airfield|helipad|tankSpawn|player\d|players_squad)|"
+                  r"missions/|capture_zone|cz_circle|"
+                  r"dom_t[12]_tank_spawn|streak_aircraft|sq_streak)", re.I)
 TAIL = 300
 
 
@@ -181,7 +183,11 @@ def main(path: str) -> None:
                     print(f"    hex: {pl[j:j + 120].hex()}")
                     print(f"    txt: {''.join(chr(c) if 32 <= c < 127 else '.' for c in pl[j:j + 120])}")
                 if name in ("t1_airfield", "t2_airfield", "t1_helipad",
-                            "capture_zone_circle") and name not in dumped:
+                            "cz_circle_01", "cz_circle_02", "cz_circle_03",
+                            "dom_t1_tank_spawn_01_arcade",
+                            "t1_tankSpawn01_zone01",
+                            "streak_aircraft01_0",
+                            "t1_player01_0") and name not in dumped:
                     dumped.add(name)
                     print(f"\n  [{name}] 名字后 {TAIL} 字节:")
                     print(f"    hex: {tail[:96].hex()}")
