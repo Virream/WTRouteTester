@@ -47,6 +47,9 @@ from .record_overlay import (
     ANCHORS, COLOR_TEXT, COLOR_TITLE, RecordOverlay, RecordOverlaySettings,
 )
 from .record_overlay_dialog import RecordOverlayDialog
+# 回放(.wrpl)导入: 放顶层 —— 打包时缺 zstandard 之类会在**启动**就暴露,
+# 而不是等用户点「从录像中获取路线」才报错(打包版没控制台, 那种错极难查)
+from .replay_import import import_replay
 from .route_recorder import (DEFAULT_GLOBAL_INTERVAL_MS, DEFAULT_HUD_INTERVAL_MS,
                              DEFAULT_INTERVAL_MS, RouteRecorder)
 from .route_store import (
@@ -2172,8 +2175,6 @@ class RouteTesterWindow(QMainWindow):
 
     def _import_replay_path(self, path: str) -> None:
         """解析回放并落盘成一个全局条目(全部单位先放 A 队, 阵营待接 ECS)。"""
-        from .replay_import import import_replay
-
         def progress(msg: str) -> None:
             self._set_status(msg, sticky=30.0)
             QApplication.processEvents()
