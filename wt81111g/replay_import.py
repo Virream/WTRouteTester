@@ -1,0 +1,164 @@
+"""把 `.wrpl` 回放导入成路线测试器的「全局条目」。
+
+分工（2026-10-25 定）：**整局复盘读回放**（一次就有两队全部单位、不用 A/B 两次录制、
+不用对轴、文件头直接给地图名），**单条路线测量继续读 8111**（25 Hz 实时）。
+
+坐标：回放给的是**米**（x 东 / z 北 / 高度），本模块把它归一化到 0~1 存进
+`UnitLife.points` —— 与 8111 录制的那套归一化坐标同构，所以绘制/回放/悬停
+全部可以复用，不需要改渲染。
+
+归一化的范围用**所有样本的 1%~99% 分位**（回放里有远处机场 AI 防空，坐标能到
+±20 km，直接用 min/max 会把战场压成一小块）。
+"""
+from __future__ import annotations
+
+import os
+import re
+import time
+from dataclasses import dataclass
+
+from .route_store import GlobalRecord, TrackPoint, UnitLife
+from .wrpl_reader import ReplayData, load_replay
+
+# 归一化后仍超出 [0,1] 的点按边界截断（远处 AI 会落在框外）
+GAP_SPLIT_SEC = 45.0        # 相邻采样超过这么久 → 认为是两段（死了/长时间无上报）
+
+
+@dataclass
+class ImportStats:
+    """导入结果摘要（给状态栏/对话框显示）。"""
+    level: str = ""
+    battle_type: str = ""
+    server: bool = False
+    parts: int = 1
+    packets: int = 0
+    failed_packets: int = 0
+    samples: int = 0
+    units: int = 0
+    lives: int = 0
+    duration: float = 0.0
+    dropped: int = 0           # 太短的线路（< 3 个点）丢弃数
+
+
+def _robust_range(values: list[float]) -> tuple[float, float]:
+    """用 1%~99% 分位当范围，避免远处 AI 把战场压小。"""
+    if not values:
+        return 0.0, 1.0
+    s = sorted(values)
+    n = len(s)
+    lo, hi = s[int(n * 0.01)], s[min(n - 1, int(n * 0.99))]
+    if hi - lo < 100.0:               # 分位太窄（几乎没动）→ 退回最小/最大
+        lo, hi = s[0], s[-1]
+    if hi - lo < 1e-6:
+        hi = lo + 1.0
+    return lo, hi
+
+
+def _time_from_name(path: str) -> str:
+    """从 `#2026.10.24 22.45.13.wrpl` 这类文件名里取录制时刻；取不到用当前时间。"""
+    m = re.search(r"(\d{4})[.\-](\d{2})[.\-](\d{2})[ _](\d{2})[.\-:](\d{2})[.\-:](\d{2})",
+                  os.path.basename(path))
+    if m:
+        y, mo, d, h, mi, se = m.groups()
+        return f"{y}-{mo}-{d}T{h}:{mi}:{se}"
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord, ImportStats]:
+    """`ReplayData` → `GlobalRecord`（全部单位先放 A 队；阵营待接 ECS）。"""
+    stats = ImportStats(
+        level=data.level, battle_type=data.battle_type, server=data.server,
+        parts=data.parts, packets=data.packets,
+        failed_packets=data.failed_packets, samples=data.sample_count,
+        units=len(data.units),
+    )
+
+    xs, zs = [], []
+    for rows in data.units.values():
+        for _t, x, _y, z in rows:
+            xs.append(x)
+            zs.append(z)
+    if not xs:
+        raise ValueError("回放里没有解析到任何地面单位位置")
+    minx, maxx = _robust_range(xs)
+    minz, maxz = _robust_range(zs)
+    spanx, spanz = maxx - minx, maxz - minz
+
+    map_name = data.level or "未知地图"
+    if data.battle_type:
+        map_name = f"{map_name}  ({data.battle_type})"
+
+    rec = GlobalRecord(
+        route_id="",                       # 由 store.new_global 之外的地方补; 这里直接给
+        map_key=f"wrpl:{data.level or 'unknown'}",
+        map_name=map_name,
+        created_at=_time_from_name(source_path) if source_path else
+                   time.strftime("%Y-%m-%dT%H:%M:%S"),
+        zone_count=0,
+        zone_signature="",
+        mode_name=data.battle_type,
+        duration=max(0.0, data.t_last - data.t_first),
+    )
+    rec.route_id = f"wrpl{int(time.time() * 1000) % 10 ** 10:010d}"
+
+    t0 = data.t_first
+    for uid, rows in sorted(data.units.items()):
+        segs: list[list[tuple[float, float, float, float]]] = []
+        cur: list[tuple[float, float, float, float]] = []
+        for item in rows:
+            if cur and item[0] - cur[-1][0] > GAP_SPLIT_SEC:
+                segs.append(cur)
+                cur = []
+            cur.append(item)
+        if cur:
+            segs.append(cur)
+
+        for si, seg in enumerate(segs, 1):
+            if len(seg) < 3:
+                stats.dropped += 1
+                continue
+            pts: list[TrackPoint] = []
+            prev = None
+            last_speed = 0.0
+            for t, x, y, z in seg:
+                nx = (x - minx) / spanx
+                ny = (maxz - z) / spanz          # 北 = 图上方（与 8111 的归一化同向）
+                speed = last_speed
+                if prev is not None:
+                    dt = t - prev[0]
+                    if dt > 1e-6:
+                        d = ((x - prev[1]) ** 2 + (z - prev[2]) ** 2) ** 0.5
+                        if d < 2000.0:           # 跳变（换了 uid/传送）不计速度
+                            kmh = d / dt * 3.6
+                            # 地面单位跑不到 150 km/h: 超过就是坐标抖动(高频通道的
+                            # 亚米级噪声 / uid 复用), 沿用上一个有效值而不是造尖峰
+                            if kmh <= 150.0:
+                                speed = last_speed = kmh
+                pts.append(TrackPoint(t=max(0.0, t - t0),
+                                      x=min(1.0, max(0.0, nx)),
+                                      y=min(1.0, max(0.0, ny)),
+                                      speed=speed))
+                prev = (t, x, z)
+            life = UnitLife(
+                life_id=f"{rec.route_id}:A{len(rec.sides['A']) + 1}"
+                        + (f"_{si}" if len(segs) > 1 else ""),
+                icon=f"uid{uid}",
+                obj_type="ground_model",
+                color="#174DFF",
+                map_key=rec.map_key,
+                points=pts,
+                side="A",
+                dead=False,
+            )
+            rec.sides["A"].append(life)
+            stats.lives += 1
+    stats.duration = rec.duration
+    return rec, stats
+
+
+def import_replay(path: str, store, *, progress=None) -> tuple[GlobalRecord, ImportStats]:
+    """解析一个回放（文件或服务器分片目录）并**落盘**到 `store`。"""
+    data = load_replay(path, progress=progress)
+    rec, stats = build_record(data, path)
+    store.add_global(rec)
+    return rec, stats

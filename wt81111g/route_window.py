@@ -26,10 +26,10 @@ from PyQt6.QtGui import (
     QAction, QActionGroup, QBrush, QCloseEvent, QColor, QFont, QIcon, QPalette,
 )
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame,
-    QGridLayout, QHeaderView, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu,
-    QMessageBox, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFrame, QGridLayout, QHeaderView, QHBoxLayout, QInputDialog, QLabel,
+    QMainWindow, QMenu, QMessageBox, QPushButton, QSizePolicy, QSplitter, QTextBrowser,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .global_hotkey import (
@@ -857,26 +857,25 @@ class RouteTesterWindow(QMainWindow):
         btns.addWidget(sep)
         btns.addSpacing(10)
 
-        self.btn_rec_a = QPushButton("A 队录制")
-        self.btn_rec_b = QPushButton("B 队录制")
-        self.btn_rec_stop = QPushButton("停止 A/B 队录制")
-        self.btn_rec_a.setToolTip(
-            "全局录制(整局): 把**所有玩家**的线路录到这个条目的 A 队里。\n"
-            "点之前请先回到**刚开局的等待部署**阶段 —— 此时 8111 还没有玩家数据,\n"
-            "软件会挂着等第一名玩家重生, 那一刻才算 0 秒。\n"
-            "⚠ 时间按**真实时钟**计: A/B 两次录制请都从同一个位置开始、保持 1× 播放、\n"
-            "不要暂停, 否则两队的时间轴会对不上(回放时会不同步)。\n"
-            "回到车库(demo 播完)或点「停止 A/B 队录制」时结束。\n"
-            "规则: 侧栏里**有 A 队标记**的全局条目 → 录到它; 没有任何标记 → 新建一条。")
-        self.btn_rec_b.setToolTip("与「A 队录制」相同, 录到 B 队(回放里换成观战另一方再录一次)。")
-        self.btn_rec_stop.setToolTip("结束当前全局录制并存盘(没有录到线路则丢弃本条)。")
-        self.btn_rec_a.clicked.connect(lambda: self._start_global("A"))
-        self.btn_rec_b.clicked.connect(lambda: self._start_global("B"))
-        self.btn_rec_stop.clicked.connect(self._stop_global)
-        for b in (self.btn_rec_a, self.btn_rec_b, self.btn_rec_stop):
+        self.btn_imp_local = QPushButton("从录像中获取路线(本地)")
+        self.btn_imp_server = QPushButton("从录像中获取路线(服务器)")
+        self.btn_imp_local.setToolTip(
+            "选一个**本地回放文件**(`.wrpl`, 游戏内「保存回放」得到的那个)。\n"
+            "一次就能拿到这局**两队全部地面单位**的轨迹(不用分 A/B 两次录)、\n"
+            "也不用对轴 —— 回放本身就是同一条时间轴。\n"
+            "地图名直接取自回放头(`levels/avg_xxx.bin`)。\n"
+            "⚠ 本地回放对「没被看见的单位」只会低频记录(约 2 Hz),"
+            "想要精确的逐帧轨迹请用服务器回放。")
+        self.btn_imp_server.setToolTip(
+            "选**服务器回放分片所在的目录**(官网下载的那一堆 `.wrpl` 放同一个文件夹)。\n"
+            "服务器回放的采样率是 24 Hz(本地约 2 Hz), 路面细节更完整。\n"
+            "不要只选一个分片 —— 单个分片只有 1/N 的对局数据。")
+        self.btn_imp_local.clicked.connect(self._import_replay_local)
+        self.btn_imp_server.clicked.connect(self._import_replay_server)
+        for b in (self.btn_imp_local, self.btn_imp_server):
             b.setMinimumHeight(34)
             btns.addWidget(b)
-        self.btn_rec_a.setStyleSheet("font-weight:bold;")
+        self.btn_imp_local.setStyleSheet("font-weight:bold;")
         grid.addLayout(btns, 4, 0, 1, 4)
 
         grid.setColumnStretch(0, 0)
@@ -2157,6 +2156,96 @@ class RouteTesterWindow(QMainWindow):
         self._set_status(f"已把该版本命名为「{shown}」", sticky=3.0)
 
     # ------------------------------------------------------------- 全局录制
+    def _import_replay_local(self) -> None:
+        """「从录像中获取路线(本地)」: 选一个 `.wrpl` 文件。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择本地回放文件", "", "战争雷霆回放 (*.wrpl);;所有文件 (*)")
+        if path:
+            self._import_replay_path(path)
+
+    def _import_replay_server(self) -> None:
+        """「从录像中获取路线(服务器)」: 选分片所在目录。"""
+        path = QFileDialog.getExistingDirectory(
+            self, "选择服务器回放分片所在目录(里面是一堆 .wrpl)")
+        if path:
+            self._import_replay_path(path)
+
+    def _import_replay_path(self, path: str) -> None:
+        """解析回放并落盘成一个全局条目(全部单位先放 A 队, 阵营待接 ECS)。"""
+        from .replay_import import import_replay
+
+        def progress(msg: str) -> None:
+            self._set_status(msg, sticky=30.0)
+            QApplication.processEvents()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._set_status("正在解析回放…(大文件要几秒)", sticky=30.0)
+            QApplication.processEvents()
+            rec, stats = import_replay(path, self.store, progress=progress)
+        except Exception as exc:                       # noqa: BLE001 - 给用户看原因
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "从录像获取路线", f"解析失败：\n\n{exc}")
+            self._set_status("回放解析失败", sticky=4.0)
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._reload_tree()
+        # 新导入的线路默认点亮(否则侧栏里有、地图上一片空, 会以为没导入成功)
+        self._visible_lives |= {lf.life_id for lf in rec.sides["A"]}
+        self._visible_lives |= {lf.life_id for lf in rec.sides["B"]}
+        self._refresh_eye_icons()
+        self._expand_item(f"global|{rec.route_id}")
+        # 底图: 有缓存就用; 回放推导出的地图键(wrpl:xxx)通常没有缓存底图,
+        # 而地图控件在“没有底图”时**根本不画线路** → 用一张网格占位图顶上
+        no_map = not self._show_cached_map(rec.map_key)
+        if no_map:
+            self.map_view.set_map_bytes(
+                self._placeholder_map_png(rec.map_name), key=rec.map_key)
+        self._refresh_map_tracks()
+        src = "服务器" if stats.server else "本地"
+        msg = (f"已从{src}录像导入: {stats.level or '?'}"
+               f"（{stats.battle_type or '未知模式'}）· "
+               f"{stats.lives} 条线路 / {stats.samples:,} 个位置样本 · "
+               f"用时 {fmt_time(stats.duration)}"
+               f"（{stats.parts} 个分片, {stats.packets:,} 个包"
+               f"{f', {stats.failed_packets} 个包解析失败' if stats.failed_packets else ''}）")
+        if stats.dropped:
+            msg += f", 另有 {stats.dropped} 段太短(不足 3 个点)已跳过"
+        if no_map:
+            msg += " · 该地图暂无底图, 已用空白网格代替"
+        self._set_status(msg, sticky=10.0)
+
+    def _placeholder_map_png(self, name: str) -> bytes:
+        """没有底图时造一张带网格的深色图 —— 只为让线路能看见、能对着比例看。"""
+        from PyQt6.QtCore import QBuffer, QRectF
+        from PyQt6.QtGui import QImage, QPainter
+
+        side = 1024
+        img = QImage(side, side, QImage.Format.Format_RGB32)
+        img.fill(QColor("#1b2430"))
+        p = QPainter(img)
+        try:
+            for i in range(0, side + 1, 64):
+                p.setPen(QColor("#3d5068") if i % 256 == 0 else QColor("#2c3a4d"))
+                p.drawLine(i, 0, i, side)
+                p.drawLine(0, i, side, i)
+            p.setPen(QColor("#8fa3bd"))
+            p.setFont(QFont("Microsoft YaHei", 26))
+            p.drawText(QRectF(0, side / 2 - 40, side, 80),
+                       Qt.AlignmentFlag.AlignCenter, name or "回放地图")
+            p.setPen(QColor("#64748b"))
+            p.setFont(QFont("Microsoft YaHei", 12))
+            p.drawText(QRectF(0, side - 56, side, 40), Qt.AlignmentFlag.AlignCenter,
+                       "暂无底图（空白网格）· 坐标由回放推导，比例仅供参考")
+        finally:
+            p.end()
+        buf = QBuffer()
+        buf.open(QBuffer.OpenModeFlag.WriteOnly)
+        img.save(buf, "PNG")
+        return bytes(buf.data())
+
     def _start_global(self, side: str) -> None:
         """点「A 队录制 / B 队录制」。
 
@@ -2435,11 +2524,9 @@ class RouteTesterWindow(QMainWindow):
                     + list(getattr(self, "_rate_hud_actions", ()))):
             act.setEnabled(not busy and not in_play)
         self.tree.setEnabled(not in_play and not busy)   # 含眼睛点击与右键菜单
-        # 全局录制按钮: 自己录制中时两个“录制”按钮禁用, 只留“停止”
-        self.btn_rec_a.setEnabled(not busy and not in_play)
-        self.btn_rec_b.setEnabled(not busy and not in_play)
-        self.btn_rec_stop.setEnabled(g_rec)
-        self.btn_rec_stop.setStyleSheet("font-weight:bold;" if g_rec else "")
+        # 从录像导入: 录制/回放期间不允许(会抢主界面)
+        self.btn_imp_local.setEnabled(not busy and not in_play)
+        self.btn_imp_server.setEnabled(not busy and not in_play)
         # 录制期间屏蔽会改变“显示/底图”的入口, 避免与录制抢主界面
         self.act_manage.setEnabled(not busy)
         self.act_refresh.setEnabled(not busy)

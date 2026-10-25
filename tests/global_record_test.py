@@ -985,7 +985,7 @@ def test_window(tmpdir: str):
 
 
 def test_buttons_and_map_lock(tmpdir: str):
-    """按钮分区: 单条录制 3 键 + 全局录制 3 键; 全局录制期间锁定地面底图。"""
+    """按钮分区: 单条录制 3 键 + 从录像导入 2 键; 导入按钮在占用期间禁用。"""
     app = QApplication.instance()
     win = make_window(tmpdir, "globals_btn.json")
     win.recorder.stop()
@@ -993,26 +993,26 @@ def test_buttons_and_map_lock(tmpdir: str):
     win.sys_hotkeys.stop()
     win.show()
     app.processEvents()
-    assert win.btn_rec_a.text() == "A 队录制"
-    assert win.btn_rec_b.text() == "B 队录制"
-    assert win.btn_rec_stop.text() == "停止 A/B 队录制"
-    # 平时: 全局录制两个按钮可用, 停止不可用
-    assert win.btn_rec_a.isEnabled() and not win.btn_rec_stop.isEnabled()
-    # 模拟“正在全局录制”: 录音按钮禁用、停止可用、单条录制按钮也禁用
+    assert win.btn_imp_local.text() == "从录像中获取路线(本地)"
+    assert win.btn_imp_server.text() == "从录像中获取路线(服务器)"
+    # 平时: 两个导入按钮都可用
+    assert win.btn_imp_local.isEnabled() and win.btn_imp_server.isEnabled()
+    # A/B 队录制入口已从界面撤掉(能力保留在 recorder 里当技术储备)
+    assert not hasattr(win, "btn_rec_a") and not hasattr(win, "btn_rec_stop")
+    # 模拟“正在全局录制”: 导入按钮禁用、单条录制按钮也禁用
     win.recorder._global = GlobalRecord(route_id="x", map_key="M",
                                         map_name="地图", created_at="")
     win.recorder._global_side = "A"
     win.recorder._global_waiting = True
     win._update_buttons()
-    assert not win.btn_rec_a.isEnabled() and not win.btn_rec_b.isEnabled()
-    assert win.btn_rec_stop.isEnabled()
+    assert not win.btn_imp_local.isEnabled() and not win.btn_imp_server.isEnabled()
     assert not win.btn_start.isEnabled() and not win.chk_start_on_move.isEnabled()
     assert not win.tree.isEnabled(), "录制期间侧栏也应锁定"
     win.recorder._global = None
     win.recorder._global_waiting = False
     win._update_buttons()
-    assert win.btn_rec_a.isEnabled() and not win.btn_rec_stop.isEnabled()
-    results.append("全局录制按钮: 分区/互斥启用状态 OK")
+    assert win.btn_imp_local.isEnabled()
+    results.append("按钮分区: 单条录制 3 键 + 从录像导入 2 键 + 互斥启用状态 OK")
 
 
 def test_map_paint():
