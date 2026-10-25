@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import time
@@ -58,6 +59,7 @@ class ImportStats:
     ecs_vehicles: int = 0      # ECS 解出的玩家载具数
     ecs_bound: int = 0         # 其中成功绑定玩家/阵营的
     ecs_group: int = 0         # 出生组每组人数 K（16v16 时为 16）
+    ghosts: int = 0            # 剔除的“阵亡后残骸”采样点数
     calibrated: bool = False   # 是否用了 8111 地图校准(世界米 → 底图像素)
     calib_note: str = ""       # 校准来源/尺寸描述(给导入报告用)
 
@@ -106,6 +108,66 @@ def resolve_calib(store, level: str) -> tuple[MapCalib | None, str]:
     if calib is not None:
         return calib, "随软件预置的校准"
     return None, ""
+
+
+# 残骸判定: 车被击毁后位置流**还会继续上报它**, 而且坐标一动不动
+# (实测 uid 35: 击毁 147.7s, 之后 12,641 个点全在 (981,1070), 一直报到对局结束)。
+# 玩家看到的“多出来的一条线”(如 A26_2) 就是这堆残骸 —— 它从死亡时刻开始、
+# 从头到尾同一个坐标、永远不结阵亡。
+GHOST_MOVE_M = 20.0     # 离死亡点这么近就算“没动”(残骸抖动量级 < 1 m)
+
+
+def strip_corpses(rows: list, kill_ts: list,
+                  borns: tuple | list = ()) -> tuple[list, int]:
+    """去掉「被击毁之后位置不再变化」的采样点。返回 (保留的采样, 丢掉几个点)。
+
+    为什么不靠 ECS 窗口: ECS 创建包里读出的 uid 对一部分实体不准
+    (实测 142 台地面档案里有 42 台的 uid 在位置流里**一个采样都没有**),
+    拿这种窗口去裁剪会漏掉残骸。而“死亡时刻(击杀包) + 位置不再变化(位置流)”
+    这两条信号都不依赖 ECS。
+
+    算法: 走到某个击杀时刻之后, 往后找一个“明显位移”的点 —— 那才是玩家重生的
+    新车; 中间的点全部丢弃。找不到就一直丢到末尾(车真的死了, 线路就此结束)。
+    `borns` 是这个 uid 上各台 ECS 档案的出生时刻: 只要有**新车在死亡之后出生**,
+    就从它出生的那一刻接着算 —— 免得玩家正好死在重生点旁边、新车原地不动时
+    把新车的前半段也当成残骸丢掉。
+    """
+    if not rows or not kill_ts:
+        return rows, 0
+    keep: list = []
+    dropped = 0
+    ki = 0
+    dead = False
+    kill_at = 0.0
+    i, n = 0, len(rows)
+    while i < n:
+        t = rows[i][0]
+        while ki < len(kill_ts) and kill_ts[ki] <= t:
+            dead = True
+            kill_at = kill_ts[ki]
+            ki += 1
+        if not dead:
+            keep.append(rows[i])
+            i += 1
+            continue
+        base = keep[-1] if keep else rows[i]
+        resume = min((b for b in borns if b > kill_at), default=None)
+        j = i
+        moved = False
+        while j < n:
+            if resume is not None and rows[j][0] >= resume - 1.0:
+                moved = True
+                break
+            if math.hypot(rows[j][1] - base[1], rows[j][3] - base[3]) > GHOST_MOVE_M:
+                moved = True
+                break
+            j += 1
+        dropped += j - i
+        if not moved:
+            break
+        dead = False              # 跳到了新车的第一点
+        i = j
+    return keep, dropped
 
 
 def _time_from_name(path: str) -> str:
@@ -249,10 +311,17 @@ def build_record(data: ReplayData, source_path: str = "",
         _v.sort()
 
     for uid, rows in sorted(data.units.items()):
-        # ECS 给出了这辆车的**存活窗口** [born, died]。窗口之外的采样点一定属于
-        # 别的东西(uid 被复用给微型侦察无人机 / 别的实体), 留着就会让同一玩家在
-        # 同一时刻"开着两台车"(2026-10-25 实测: A25_3 从 01:39 一直画到 16:30,
-        # 而这位玩家 01:42 已经换车了)。这里先按窗口硬裁, 再走下面的切段逻辑。
+        # ① 先剔掉「阵亡后残骸继续上报」的采样 —— 这一步只看击杀包 + 位置流,
+        #    不依赖 ECS。用户 2026-10-25 反馈的 A26_2 就是它:
+        #    t-72b3 在 481.8s 被击毁, 之后 4837 个点全在同一个坐标、一直报到 990s,
+        #    被切成独立一条线, 而且永远不显示阵亡(玩家本人 670s 已经换了铠甲-S1)。
+        rows, _g = strip_corpses(rows, deaths.get(uid, ()),
+                                 tuple(v.born_t for v in vans.get(uid, ())))
+        stats.ghosts += _g
+        # ② ECS 给出了这辆车的**存活窗口** [born, died]。窗口之外的采样点一定属于
+        #    别的东西(uid 被复用给微型侦察无人机 / 别的实体), 留着就会让同一玩家在
+        #    同一时刻"开着两台车"(2026-10-25 实测: A25_3 从 01:39 一直画到 16:30,
+        #    而这位玩家 01:42 已经换车了)。这里按窗口硬裁, 再走下面的切段逻辑。
         _win = vans.get(uid, ())
         if _win:
             _tol = 2.0
@@ -455,6 +524,10 @@ def build_record(data: ReplayData, source_path: str = "",
         return None
 
     for auid, rows in sorted(data.air_units.items()):
+        # 残骸同样处理(飞机坠毁后位置也可能停在那不动一直上报)
+        rows, _g = strip_corpses(rows, deaths.get(auid, ()),
+                                 tuple(v.born_t for v in air_vans.get(auid, ())))
+        stats.ghosts += _g
         _win = air_vans.get(auid, ())
         if _win:
             # 与地面同样的「越窗裁剪」：窗口外的采样属于别的实体

@@ -36,8 +36,10 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout,
 )
 
+from .calib_capture import CalibCaptureDialog
 from .map_cache import MapCache, MapEntry
-from .map_calib import MAP_KEY_PREFIX, load_from_capture, load_image, save_to_capture
+from .map_calib import (MAP_KEY_PREFIX, export_level, level_of, load_from_capture,
+                        load_image, save_to_capture)
 from .route_store import RouteStore
 
 log = logging.getLogger("map_manager")
@@ -73,8 +75,10 @@ class MapManagerDialog(QDialog):
             "轨迹、名称、缓存图片都不会被删, 随时取消勾选就能恢复。\n"
             "名称会显示在左侧列表, 也会写进已录制的轨迹记录; 缓存图片在 data/maps 下,"
             "同一张图只存一份; 删除图片不会删除轨迹记录。\n"
-            "回放导入的地图(`wrpl_` 开头)没有底图也没有比例 —— 选中它再点"
-            "「导入 8111 校准…」, 选 capture_8111.py 抓出来的文件夹即可")
+            "回放导入的地图(`wrpl_` 开头)没有底图也没有比例 —— 那一行的「回放校准」\n"
+            "格子里有个**补全信息**按钮: 点它, 然后进一局这张图(任意模式),\n"
+            "程序会自动抓 8111 的地图图片与世界外框并装好。**一张图补一次就够**\n"
+            "(同一张图的各子模式共用同一套世界坐标)。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#94a3b8;")
         root.addWidget(tip)
@@ -268,6 +272,19 @@ class MapManagerDialog(QDialog):
         calib.setForeground(QBrush(Qt.GlobalColor.gray)
                             if self.store.calib_of(entry.key) is None else QBrush())
         self.table.setItem(row, COL_CALIB, calib)
+        # 回放导入的地图(`wrpl_<关卡名>`)还没有校准 → 在**这一行**放一个「补全信息」
+        # 按钮: 点它弹出等待窗, 用户进一局这张图后自动抓 8111 的图片与外框。
+        # (一张图补一次就够 —— 各子模式共用同一套世界坐标, 见 map_calib 模块说明)
+        if entry.key.startswith(MAP_KEY_PREFIX) \
+                and self.store.calib_of(entry.key) is None:
+            btn = QPushButton("补全信息")
+            btn.setToolTip(
+                "点它 → 弹窗提示你进一局这张图(任意模式)\n"
+                "→ 程序检测到战局后自动抓地图图片与世界外框\n"
+                "→ 抓完自动关闭, 以后这张图的回放就对齐了")
+            btn.clicked.connect(
+                lambda _=False, k=entry.key: self._fill_calib(k))
+            self.table.setCellWidget(row, COL_CALIB, btn)
 
         when = QTableWidgetItem(entry.saved_at_text if entry.saved_at else "—")
         when.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -425,6 +442,44 @@ class MapManagerDialog(QDialog):
             f"以后这张图的所有回放线路都会与底图像素一一对应"
             f"（1 像素 = {calib.span_x / max(1, calib.img_w):.2f} 米）。")
         log.info("地图管理: 导入校准 %s <- %s (%s)", key, dir_path, calib.describe())
+
+    def _fill_calib(self, key: str) -> None:
+        """「补全信息」: 等用户进战局 → 自动抓 8111 的图片 + 外框 → 装上校准。"""
+        # 先把这个字落到「地图名称」上(用户可能刚改过还没回车)
+        self._apply_name()
+        level = level_of(key) or key
+        name = self.store.display_name(key)
+        dlg = CalibCaptureDialog(key, f"{name}（{level}）", self)
+        result = dlg.start()
+        if result != QDialog.DialogCode.Accepted or dlg.calib is None:
+            self.lbl_summary.setText(
+                f"「{name}」还没有补全 —— 想补的时候再点一次「补全信息」即可")
+            return
+        calib = dlg.calib
+        img_note = "底图已装入"
+        if dlg.image and not self.cache.put(key, dlg.image):
+            img_note = "底图已存在且不更清晰, 保留原图"
+        self.store.set_calib(key, calib)
+        self.calib_changed += 1
+        # 旧记录(按以前的估算范围归一的)跟着重算一次 —— 不用重新导入回放
+        renum = 0
+        try:
+            from .replay_import import renormalize_map_records   # 懒导入: 它带 zstandard
+            renum = renormalize_map_records(self.store, key, calib)
+        except Exception as exc:                        # noqa: BLE001
+            log.warning("重算回放记录坐标失败: %s", exc)
+        # 另存一份 data/map_calib/<关卡>.json —— 以后可直接打包分发给别人
+        saved = export_level(level, calib)
+        self.reload()
+        extra = f"\n已按新校准重算了 {renum} 条回放记录的位置。" if renum else ""
+        more = f"\n已另存一份: {saved}" if saved else ""
+        QMessageBox.information(
+            self, "补全信息",
+            f"「{name}」补全成功\n\n"
+            f"{calib.describe()}\n{img_note}{extra}{more}\n\n"
+            f"以后这张图的所有回放线路都会与底图像素一一对应"
+            f"（1 像素 = {calib.span_x / max(1, calib.img_w):.2f} 米）。")
+        log.info("地图管理: 补全信息 %s (%s)", key, calib.describe())
 
     def _clear_calib(self) -> None:
         """删掉选中地图的校准(底图与轨迹都不动)。"""

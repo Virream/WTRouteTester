@@ -1,4 +1,4 @@
-"""跑图线路记录持久化。
+﻿"""跑图线路记录持久化。
 
 8111 **不提供地图名称**(只有几何数据与地图图片), 因此用地图图片内容的
 指纹(sha1 前 12 位)作为地图唯一键; 显示名默认自动编号, 支持用户重命名。
@@ -63,7 +63,6 @@ from .zones import layout_spread
 from .zones import mode_name as zone_mode_name
 from .zones import signature as zones_signature
 from .zones import spawns_to_json, zones_from_signature, zones_to_json
-from . import kill_timeline
 
 log = logging.getLogger("route_store")
 
@@ -261,13 +260,9 @@ class UnitLife:
     # 一次只能开一台载具, 想换固定翼必先阵亡; 退局后载具停在原地、
     # 8111 过一会儿不再上报, 也算击毁。实现上只看“线断那一刻场上还有没有别人”。
     dead: bool = False
-    # **已修正的死亡时刻**(录制时间轴的秒数; 0 = 未修正)。
-    # 只对“摄像机挂着的那位玩家”有意义: 他阵亡后 8111 依旧上报残骸, 线尾其实是
-    # 录制结束, 所以由用户指定观战昵称、用 hudmsg 的击毁时刻反推真实死亡时刻。
-    # 修正时会把 `points` 截断到这个时刻(末尾补一个合成点), 原始点存在 `trimmed` 里。
+    # **阵亡时刻**(录制/回放时间轴的秒数; 0 = 没有阵亡信息)。
+    # 回放导入时由 ECS 销毁时刻或击杀时刻给出, 播过这一刻就在图上画红叉。
     death_t: float = 0.0
-    # 修正前的**原始点序列**(便于改主意时重新指定观战玩家); 未修正时为空。
-    trimmed: list[TrackPoint] = field(default_factory=list)
     # 这条线**曾经是摄像机挂着的那辆车**(至少有1帧 icon == Player 或颜色是自己黄)。
     # 为什么要记这个布尔值而不是直接看 `color`: `color` 每帧都被覆盖, 摄像机离开后
     # 就变回普通蓝色了; 而“观战对象”这个事实必须留下来(2026-10-22 实测: 他第三辆
@@ -356,9 +351,6 @@ class UnitLife:
             out["player"] = self.player
         if self.vehicle_cls:
             out["cls"] = self.vehicle_cls
-        if self.trimmed:
-            # 只存被截掉的尾巴 —— 未修正的线没有这个字段, 旧数据也不需要兼容
-            out["trim"] = [_pack_point(p) for p in self.trimmed]
         return out
 
     @classmethod
@@ -386,7 +378,6 @@ class UnitLife:
             side=str(data.get("side") or ""),
             dead=bool(data.get("dead")),
             death_t=death_t,
-            trimmed=read_points(data.get("trim")),
             watched=bool(data.get("w")),
             player=str(data.get("player") or ""),
             vehicle_cls=str(data.get("cls") or ""),
@@ -424,11 +415,9 @@ class GlobalRecord:
     # 摄像机挂着的那个玩家 icon 不会消失(实测), 他的死亡时刻只能靠这个反推。
     kills: list[dict] = field(default_factory=list)
     # **录制时镜头挂在谁身上**: `{"A": "killflik", "B": "jjh67"}`(昵称)。
-    # 8111 不告诉我们这件事, 而它正是“反推那位玩家死亡时刻”的唯一钥匙 ——
-    # 由用户在修正界面里从本局击毁名单中点选(见 `RouteStore.set_watchers`)。
+    # 现已废弃 —— 「修正死亡时刻」功能已删除, 仅为兼容旧数据保留存放位。
     watchers: dict[str, str] = field(default_factory=dict)
-    # 死亡时刻是否已经确认过。`False` 时侧栏条目上会显示一个黄色感叹号
-    # (点它就打开修正界面); 重录任何一队都会重置成 `False`。
+    # 曾经是“死亡时刻待修正”标记(侧栏黄色感叹号)。功能已删, 仅为兼容旧数据保留。
     fixed: bool = False
     # 本条目**归一化时用的世界矩形** `[min_x, max_x, min_z, max_z]`(米), 只对回放
     # 导入的记录有意义: `points` 里存的是 0~1, 有了这个矩形就能反推出世界米 ——
@@ -1095,84 +1084,6 @@ class RouteStore:
             target = self.get_global(gid)
             if target is not None:
                 target.marks.clear()
-
-    def set_fixed(self, gid: str, value: bool) -> None:
-        """改“死亡时刻是否已确认” —— `False` 时侧栏条目上会挂一个黄色感叹号。"""
-        with self._lock:
-            target = self.get_global(gid)
-            if target is not None:
-                target.fixed = bool(value)
-        self.save()
-
-    @staticmethod
-    def _apply_death(life: UnitLife, death_t: float) -> None:
-        """把一条线截断到 `death_t` 并补一个合成点, 记下原始点以便回退。
-
-        为什么要补合成点: 静止的车被折叠成“点 + hold”, 而死亡时刻往往落在移动
-        结束之后(实测有一位停稳 9.8 秒才被打死)。不补的话线尾会落在“开始停住”
-        那一刻(现在 hold 会被夹到死亡时刻), 地图上的阵亡叉与“用时”都会少算。
-        """
-        if not life.trimmed:
-            life.trimmed = list(life.points)
-        pts = [p for p in life.trimmed if p.t < float(death_t)]
-        if not pts:                       # 死亡时刻早于第一个点(不应该发生) → 不动
-            life.points = list(life.trimmed)
-            return
-        last = pts[-1]
-        # 末点的静止持续时长不能超过死亡时刻(否则回放会“死了还在原地待到 hold 结束”)
-        keep = max(0.0, round(float(death_t) - last.t, 2))
-        pts[-1] = TrackPoint(x=last.x, y=last.y, t=last.t, speed=last.speed,
-                             dx=last.dx, dy=last.dy,
-                             hold=min(float(getattr(last, "hold", 0.0) or 0.0), keep))
-        pts.append(TrackPoint(x=last.x, y=last.y, t=round(float(death_t), 2),
-                              speed=0.0))
-        life.points = pts
-        life.death_t = round(float(death_t), 2)
-        life.dead = True
-
-    @staticmethod
-    def _reset_death(life: UnitLife) -> None:
-        """撤销修正: 把原始点还回去。"""
-        if life.trimmed:
-            life.points = list(life.trimmed)
-        life.trimmed = []
-        life.death_t = 0.0
-
-    def set_watchers(self, gid: str, watchers: dict[str, str]) -> dict[str, dict]:
-        """指定“录制时镜头挂在谁身上”, 并按 hudmsg 的击毁时刻修正死亡时刻。
-
-        `watchers` 形如 `{"A": "killflik", "B": "jjh67"}`; 某一队留空表示“这一队
-        不用修正”(他活到录制结束)。返回 `kill_timeline.resolve_deaths` 的结果。
-
-        **逐条 Player 线处理**: 他每死一次重生就会开一条新线, 所以同一队可能有好几条
-        (例如先阵亡再出第二辆车), 每条都要按它自己时间段内那次阵亡单独截断。
-        """
-        rec = self.get_global(gid)
-        if rec is None:
-            return {}
-        clean = {side: str((watchers or {}).get(side) or "").strip()
-                 for side in GLOBAL_SIDES}
-        resolved = kill_timeline.resolve_deaths(rec, clean)
-        with self._lock:
-            rec.watchers = {side: name for side, name in clean.items() if name}
-            # `fixed` = “这条录制已经没有待修正的死亡时刻” → 侧栏的黄色感叹号。
-            # **只有真的修过才置 True**: 选的名字一条线都没对上(或干脆没选),
-            # 说明那个叉还在错误的位置上, 感叹号应该留着提醒(用户 2026-10-22)。
-            rec.fixed = any((row or {}).get("ok") for row in resolved.values())
-            for side in GLOBAL_SIDES:
-                row = resolved.get(side) or {}
-                want = {fix["life_id"]: fix["death"]
-                        for fix in row.get("fixes") or [] if fix.get("ok")}
-                for life in kill_timeline.player_lines(rec, side):
-                    death = want.get(life.life_id)
-                    if death:
-                        self._apply_death(life, death)
-                    else:
-                        self._reset_death(life)
-        self.save()
-        log.info("全局录制 %s 观战玩家: %s", gid,
-                 kill_timeline.summarize(resolved))
-        return resolved
 
     def globals_by_group(self) -> dict[tuple[str, str], list[GlobalRecord]]:
         """{(地图键, 战区指纹): [全局录制条目...]} —— 新的在前(按录制时间倒序)。"""

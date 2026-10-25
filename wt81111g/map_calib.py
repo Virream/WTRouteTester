@@ -26,7 +26,7 @@ import os
 import struct
 from dataclasses import dataclass, field
 
-from .config import resource_path
+from .config import resource_path, data_dir
 
 log = logging.getLogger("map_calib")
 
@@ -186,33 +186,20 @@ def load_from_capture(dir_path: str) -> MapCalib:
             "请选 capture_8111.py 抓取生成的那个目录。")
     with open(info_path, encoding="utf-8") as f:
         info = json.load(f)
-    if not info.get("valid"):
-        raise ValueError("这次抓取时不在战局里（map_info.valid=false），数据不可用。")
-
-    try:
-        lo = [float(v) for v in (info.get("map_min") or [])]
-        hi = [float(v) for v in (info.get("map_max") or [])]
-        assert len(lo) >= 2 and len(hi) >= 2
-    except (TypeError, ValueError, AssertionError) as exc:
-        raise ValueError("map_info.json 里的 map_min / map_max 不完整。") from exc
-
-    calib = MapCalib(min_x=lo[0], max_x=hi[0], min_z=lo[1], max_z=hi[1],
-                     source=os.path.basename(os.path.normpath(dir_path)),
-                     captured_at=str(info.get("time") or ""))
-    if not calib.valid:
-        raise ValueError("map_max 与 map_min 相同，这张图的校准无效。")
 
     # 图片尺寸
+    img: bytes | None = None
     for name in (F_MAP_IMG_PNG, F_MAP_IMG_JPG):
         p = os.path.join(dir_path, name)
         if os.path.isfile(p):
-            with open(p, "rb") as f:
-                w, h = image_size(f.read(65536))
-            if w and h:
-                calib.img_w, calib.img_h = w, h
+            try:
+                with open(p, "rb") as f:
+                    img = f.read()
+            except OSError:
+                img = None
             break
 
-    # 最后一轮地图对象 → 战区 / 重生点(换成世界米)
+    # 最后一轮地图对象 → 战区 / 重生点
     obj_path = os.path.join(dir_path, F_MAP_OBJ)
     objs: list = []
     if os.path.isfile(obj_path):
@@ -228,10 +215,44 @@ def load_from_capture(dir_path: str) -> MapCalib:
             except (ValueError, AttributeError):
                 objs = []
 
+    return build_from_live(info, img, objs,
+                           source=os.path.basename(os.path.normpath(dir_path)))
+
+
+def build_from_live(info: dict, img: bytes | None, objects,
+                    *, source: str = "", captured_at: str = "") -> MapCalib:
+    """从「8111 现场数据」造校准: `map_info` + 地图片字节 + 一轮 `map_obj` 对象。
+
+    这是 `load_from_capture()` 与「地图管理 → 补全信息」**共用**的那一处逻辑 ——
+    两条入口解析出来的东西必须完全一致, 所以只有这一份实现。
+
+    抛 `ValueError` 的三种情况(都带给人看的原因): 不在战局里 / 外框不完整 / 外框无效。
+    """
+    if not info.get("valid"):
+        raise ValueError("这次抓取时不在战局里（map_info.valid=false），数据不可用。")
+
+    try:
+        lo = [float(v) for v in (info.get("map_min") or [])]
+        hi = [float(v) for v in (info.get("map_max") or [])]
+        assert len(lo) >= 2 and len(hi) >= 2
+    except (TypeError, ValueError, AssertionError) as exc:
+        raise ValueError("map_info 里的 map_min / map_max 不完整。") from exc
+
+    calib = MapCalib(min_x=lo[0], max_x=hi[0], min_z=lo[1], max_z=hi[1],
+                     source=source,
+                     captured_at=captured_at or str(info.get("time") or ""))
+    if not calib.valid:
+        raise ValueError("map_max 与 map_min 相同，这张图的校准无效。")
+
+    if img:
+        w, h = image_size(img[:65536])
+        if w and h:
+            calib.img_w, calib.img_h = w, h
+
     kinds: dict[str, int] = {}
     seen_zone: set = set()
     seen_spawn: set = set()
-    for o in objs:
+    for o in objects or []:
         if not isinstance(o, dict):
             continue
         kind = _kind_of(o)
@@ -307,6 +328,33 @@ def bundled_dir() -> str:
     return resource_path(os.path.join("assets", "map_calib"))
 
 
+def collected_dir() -> str:
+    """用户自己补全的校准目录(`data/map_calib/<关卡名>.json`)。
+
+    为什么要单独存一份文件: 「补全信息」给一张图做出了校准以后, 这些文件可以
+    直接拷进下一版软件的 `assets/map_calib/` 随包分发 —— 用户什么都不用做。
+    """
+    d = os.path.join(data_dir(), "map_calib")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as exc:      # noqa: BLE001 - 目录开不了不该影响主流程
+        log.warning("创建校准目录失败 %s: %s", d, exc)
+    return d
+
+
+def export_level(level: str, calib: MapCalib) -> str:
+    """把校准写成 `data/map_calib/<关卡名>.json`, 返回路径。"""
+    d = collected_dir()
+    p = os.path.join(d, f"{level or 'unknown'}.json")
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(calib.to_dict(), f, ensure_ascii=False, indent=1)
+    except OSError as exc:      # noqa: BLE001
+        log.warning("写校准文件失败 %s: %s", p, exc)
+        return ""
+    return p
+
+
 def level_of(map_key: str) -> str:
     """地图键 → 关卡名。回放导入的键是 `wrpl_<level>`, 其它(哈希)键返回空串。"""
     k = (map_key or "")
@@ -314,20 +362,24 @@ def level_of(map_key: str) -> str:
 
 
 def load_bundled(level: str) -> MapCalib | None:
-    """读随软件预置的 `<level>.json`(没有就返回 None)。
+    """读用户补全过的 / 随软件预置的 `<level>.json`(都没有返回 None)。
 
-    优先级: 用户在「地图管理」里导入的校准 > 这里预置的。预置文件只是免去
-    用户每张图都去游戏里抓一遍; 游戏更新后地图变了, 用户重抓一次就覆盖了。
+    优先级: 用户在「地图管理」里导入的校准(存在 routes.json 里) > 这里预置的。
+    预置文件只是免去用户每张图都去游戏里抓一遍; 游戏更新后地图变了,
+    用户重抓一次就覆盖了。
     """
     if not level:
         return None
-    p = os.path.join(bundled_dir(), f"{level}.json")
-    if not os.path.isfile(p):
-        return None
-    try:
-        with open(p, encoding="utf-8") as f:
-            calib = MapCalib.from_dict(json.load(f))
-    except (OSError, ValueError) as exc:    # noqa: BLE001
-        log.warning("读取预置校准失败 %s: %s", p, exc)
-        return None
-    return calib if calib.valid else None
+    for d in (collected_dir(), bundled_dir()):
+        p = os.path.join(d, f"{level}.json")
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                calib = MapCalib.from_dict(json.load(f))
+        except (OSError, ValueError) as exc:    # noqa: BLE001
+            log.warning("读取预置校准失败 %s: %s", p, exc)
+            continue
+        if calib.valid:
+            return calib
+    return None

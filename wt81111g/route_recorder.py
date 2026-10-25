@@ -828,11 +828,9 @@ class RouteRecorder(QObject):
             # “对已经录制过的全局路线重新录制, 那就再收集一遍击杀信息然后覆盖”)。
             # 不覆盖的话旧击毁会和新一局的击毁混在一起, 阵亡次数/时间轴对齐都会错。
             # 同时把“观战玩家”清零: 换了录像, 之前点的名字不一定还成立。
-            log.info("全局录制: %s 队是重录 → 清空旧的击杀记录(%d 条)与观战玩家设置",
-                     side, len(rec.kills))
+            log.info("全局录制: %s 队是重录 → 清空旧的击杀记录(%d 条)", side,
+                     len(rec.kills))
             rec.kills = []
-            rec.watchers = {}
-            rec.fixed = False
         if rec.lives(side):
             # 重录某一队 → 把**这一队**之前录的战区时间轴丢掉(另一队的保留):
             # 时间轴里每条都带 side, 混着留会让回放取到上一局的旧状态。
@@ -1043,9 +1041,8 @@ class RouteRecorder(QObject):
     def _collect_kills(self, rec) -> None:
         """录制结束: 补取最后一次增量, 并做一次“时间差对齐”诊断。
 
-        **只写日志, 不改任何 `dead` 判定** —— 真正的死亡时刻修正要等用户在界面上
-        指定“镜头挂在谁身上”(见 `RouteStore.set_watchers`)。这里只顺带报一下
-        对齐质量, 便于事后从日志里判断数据是否可信。
+        **只写日志, 不改任何 `dead` 判定**(「修正死亡时刻」功能已删除), 便于事后
+        从日志里判断数据是否可信。
         """
         new = self._poll_kills(rec)
         if new:
