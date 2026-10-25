@@ -153,12 +153,19 @@ def main() -> int:
                 kind = _kind_of(o)
                 seen_kinds[kind] += 1
                 if kind == "capture_zone":
-                    label = str(o.get("label") or o.get("icon") or "?")
+                    # ⚠ 不能用 icon 当键 —— 三个战区都叫 `capture_zone`, 会被并成一个。
+                    # 8111 给的是 `zone_label`(A/B/C) 与 `zone_id`。
+                    label = str(o.get("zone_label") or o.get("label")
+                                or o.get("zone_id") or "?")
                     zones.setdefault(label, o)
                     zones[label].update(o)     # 保留最后一轮(含归属色/blink)
                 elif kind not in ("player", "?"):
-                    key = (kind, round(float(o.get("x", -1)), 4),
-                           round(float(o.get("y", -1)), 4))
+                    try:
+                        key = (kind, round(float(o.get("x")), 4),
+                               round(float(o.get("y")), 4))
+                    except (TypeError, ValueError):
+                        # 没有坐标的(如 respawn_base_airfield) 按颜色区分
+                        key = (kind, "-", str(o.get("color")))
                     spawns.setdefault(key, o)
             print(f"  第 {rounds} 轮: {len(objs)} 个对象", flush=True)
             time.sleep(args.interval)
@@ -180,7 +187,8 @@ def main() -> int:
     lines.append(f"=== 战区 {len(zones)} 个 ===")
     for label in sorted(zones):
         o = zones[label]
-        lines.append(f"  {label:<4s} color={o.get('color')} blink={o.get('blink')} "
+        lines.append(f"  {label:<4s} zone_id={o.get('zone_id')} "
+                     f"color={o.get('color')} blink={o.get('blink')} "
                      f"归一化 {_fmt_xy(o)}  {_px(o, info)}")
     lines.append("")
 
