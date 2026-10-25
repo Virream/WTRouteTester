@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from .map_calib import MAP_KEY_PREFIX, MapCalib, level_of, load_bundled
 from .route_store import GlobalRecord, TrackPoint, UnitLife
 from .wrpl_reader import EXT_MASK_UID, ReplayData, load_replay
+from .zones import mode_name as zone_mode_name
 
 # 归一化后仍超出 [0,1] 的点按边界截断（远处 AI 会落在框外）
 GAP_SPLIT_SEC = 45.0        # 相邻采样超过这么久 → 认为是两段（死了/长时间无上报）
@@ -163,19 +164,25 @@ def build_record(data: ReplayData, source_path: str = "",
     if spanx <= 0 or spanz <= 0:
         raise ValueError("地图范围无效(宽/高为 0) —— 回放里没有可用坐标")
 
+    # `map_name` = **只放地图名**(侧栏最上层那一行就用它)。模式已经单独存在
+    # `mode_name` 里(由战区数推出), 拼进来会变成“avg_finland (finland_Dom)”
+    # 这种带内部串的名字。
     map_name = data.level or "未知地图"
-    if data.battle_type:
-        map_name = f"{map_name}  ({data.battle_type})"
 
+    # 模式名: 8111 的规则是「战区数量 → 模式」(3=战区控制 / 2=战区攻陷 /
+    # 1=战区争夺)。回放里战区坐标是占位值, 但 `cz_circle_0N` 的**个数**能数出来,
+    # 所以照样推得出模式 —— 以前直接把回放头的 `finland_Dom` 当模式名塞进去,
+    # 侧栏就显示成 `finland_Dom` 这种内部串(用户 2026-10-26 反馈树结构不对)。
+    _zc = data.zone_count
     rec = GlobalRecord(
         route_id="",                       # 由 store.new_global 之外的地方补; 这里直接给
         map_key=replay_map_key(data.level),
         map_name=map_name,
         created_at=_time_from_name(src) if src else
                    time.strftime("%Y-%m-%dT%H:%M:%S"),
-        zone_count=0,
+        zone_count=_zc,
         zone_signature="",
-        mode_name=data.battle_type,
+        mode_name=zone_mode_name(_zc) if _zc else (data.battle_type or ""),
         duration=max(0.0, data.t_last - data.t_first),
     )
     rec.route_id = f"wrpl{int(time.time() * 1000) % 10 ** 10:010d}"
@@ -664,4 +671,11 @@ def import_replay(path: str, store, *, progress=None,
     calib, _src = resolve_calib(store, data.level)
     rec, stats = build_record(data, path if os.path.isfile(path) else "", calib=calib)
     store.add_global(rec)
+    # 地图名用回放头里的关卡名(`avg_finland`)。不写的话侧栏只能显示
+    # “地图 1 / 地图 2”这种自动编号, 回放导入的图根本对不上号。
+    if rec.map_name and not store.name_of(rec.map_key):
+        try:
+            store.rename_map(rec.map_key, rec.map_name)
+        except Exception:                       # noqa: BLE001 - 取名失败不影响导入
+            log.warning("写入地图名失败: %s", rec.map_key, exc_info=True)
     return rec, stats

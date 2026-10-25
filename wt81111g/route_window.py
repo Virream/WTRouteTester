@@ -1148,6 +1148,17 @@ class RouteTesterWindow(QMainWindow):
                                f"3 个=战区控制, 2 个=战区攻陷, 1 个=战区争夺")
                 top.addChild(mid)
                 for sig, vname, routes, globs in vs:
+                    # 回放导入的条目**没有战区坐标**(回放里 `cz_circle` 是占位变换),
+                    # 所以“战区位置细分”这一层对它没有意义 —— 直接挂在模式层下。
+                    # 否则会多一层无信息的“未知位置”(用户 2026-10-26 反馈层级不对)。
+                    if (not sig and not routes and globs
+                            and all(getattr(g, "is_replay", False) for g in globs)):
+                        for g in globs:
+                            self._add_global_item(mid, g)
+                            alive_lives.update(
+                                life.life_id for side in GLOBAL_SIDES
+                                for life in g.lives(side))
+                        continue
                     var = QTreeWidgetItem(["", vname,
                                            self._count_text(len(routes), len(globs))])
                     var.setData(0, _ROLE_KIND, "variant")
@@ -1223,6 +1234,11 @@ class RouteTesterWindow(QMainWindow):
         self.tree.blockSignals(False)
         self._visible_ids &= alive       # 被删除的记录自动从“显示中”移除
         self._visible_lives &= alive_lives
+        # 侧栏内容变了(导入 / 删除 / 重命名) → 「▶ 回放」的可用性必须跟着变。
+        # 用户 2026-10-26: 删掉 data 目录后重新导入, 「▶ 回放」一直是灰的 —— 因为
+        # 启动时 store 是空的(`has_track=False`), 导入后没人再算一次。
+        if hasattr(self, "btn_play") and hasattr(self, "recorder"):
+            self._update_buttons()
         if self._anchor is not None and not any(
                 (rec := self.store.get(rid)) is not None and self._group_of(rec) == self._anchor
                 for rid in alive):

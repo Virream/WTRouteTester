@@ -1030,6 +1030,14 @@ class RouteStore:
     def add_global(self, rec: GlobalRecord) -> None:
         with self._lock:
             self.globals.append(rec)
+            # 回放导入带了自己的地图名(`avg_finland`) → 直接登记成这张图的显示名,
+            # 否则侧栏最上层只能显示“地图 1 / 地图 2”这种自动编号, 对不上号。
+            # 用户已经起过名的**不覆盖**(`name_of` 非空就跳过)。
+            if (rec.map_key and rec.map_name
+                    and not (self.map_names.get(rec.map_key) or "").strip()):
+                self.map_names[rec.map_key] = rec.map_name.strip()
+            if rec.map_key and rec.map_key not in self.known_maps:
+                self.known_maps.append(rec.map_key)
         if rec.zone_signature:
             self._recover_layouts()
         self.save()

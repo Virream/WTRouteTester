@@ -554,6 +554,30 @@ def ground_parse_packet(payload: bytes, hist: dict[int, DeltaHistory],
 
 
 # ---------------------------------------------------------------- 高层入口
+_CZONE_RE = re.compile(rb"cz_circle_(\d{1,2})(?![0-9])")
+_CZONE_HEAD = b"cz_circle_"
+
+
+def _scan_zone_names(payload: bytes) -> set[str]:
+    """从解压后的包流里找出全部战区名 `cz_circle_0N`。
+
+    关卡对象包(`ptype=4` / `0xD039`)在开局 5~10 秒, 对象名是**明文串** ——
+    战区坐标是占位值用不了, 但**个数**就是模式判定的唯一依据
+    (3=战区控制 / 2=战区攻陷 / 1=战区争夺)。
+
+    ⚠ 不要用 `re.finditer` 扫整段: 老服务器回放解压后有 **42 MB**, 正则会跑 1.1 秒。
+    用 C 实现的 `bytes.find` 定位(整个分片只要 ~20 ms)再在命中处局部匹配。
+    """
+    out: set[str] = set()
+    i = payload.find(_CZONE_HEAD)
+    while i >= 0:
+        m = _CZONE_RE.match(payload, i)
+        if m:
+            out.add(m.group(0).decode("ascii"))
+        i = payload.find(_CZONE_HEAD, i + len(_CZONE_HEAD))
+    return out
+
+
 @dataclass
 class ReplayData:
     """一局回放解析出来的全部地面位置。"""
@@ -593,6 +617,16 @@ class ReplayData:
     ecs_uid_repaired: int = 0       # 按存活窗口重新对齐过 uid 的载具数
     t_first: float = 0.0
     t_last: float = 0.0
+    # 本局关卡对象里的战区名(`cz_circle_01` 之类)。**个数就是战区数** ——
+    # 回放里 `cz_circle` 的平移是占位值(两张不同地图都是 (1832, 5, 2456)),
+    # 所以拿不到坐标, 但**名字一个不少**。8111 不给“模式名”, 模式只能由
+    # 战区数量推(3=战区控制 / 2=战区攻陷 / 1=战区争夺, 见 `zones.MODE_NAMES`)。
+    zone_names: list[str] = field(default_factory=list)
+
+    @property
+    def zone_count(self) -> int:
+        """战区数量(= 模式判定依据); 没解析到时为 0。"""
+        return len(self.zone_names)
 
     @property
     def sample_count(self) -> int:
@@ -749,6 +783,10 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
             data.visibility = info.visibility
             data.server = info.server
         payload = decompress_stream(buf, info)
+        # 战区名(只在开局几个分片里, 找到就停): 关卡对象包 `0xD039` 里是明文串。
+        # 不解包、直接找串 —— 整个分片扫一遍只要几十毫秒。
+        if not data.zone_names and idx <= 2:
+            data.zone_names = sorted(_scan_zone_names(payload))
         packets, _used = parse_packets(payload)
         data.packets += len(packets)
         total = len(packets)
