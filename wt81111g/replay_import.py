@@ -211,7 +211,19 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                            for v in _win)]
         # ECS 的「销毁时刻」也是切段点：uid 被复用后，前一辆车销毁的那一刻
         # 就是分界（比“看不见了”精确，也比速度跳变检测稳）
-        dl = list(deaths.get(uid, ()))
+        #
+        # ⚠ 被 ECS 窗口覆盖的**击杀时刻不再当切段点**：车被击毁后残骸还会被上报
+        #   约 10 秒（实测 uid=61 击杀 363.3s、ECS 销毁 373.7s），在击杀时刻切一刀
+        #   就把这 10 秒残骸切成了**独立线路**（用户 2026-10-25 反馈：一位玩家名下
+        #   出现 4 条 cn_ztz_96b，而游戏里一局只能出击 2 次）。ECS 的 died_t 才是
+        #   权威边界；没有 ECS 档案的（AI 载具）仍用击杀时刻切。
+        _wins = [(v.born_t, v.died_t) for v in vans.get(uid, ())
+                 if v.died_t is not None]
+
+        def _covered(t: float) -> bool:
+            return any(a - 1.0 <= t <= b + 1.0 for a, b in _wins)
+
+        dl = [t for t in deaths.get(uid, ()) if not _covered(t)]
         for _v0 in vans.get(uid, ()):
             # "end" = 到对局结束还在, 不是死亡
             if _v0.died_t and _v0.died_by != "end":
