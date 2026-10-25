@@ -2281,6 +2281,8 @@ class RouteTesterWindow(QMainWindow):
                    f"[{src}{f' {st.parts} 分片' if st.parts > 1 else ''}] "
                    f"{st.lives} 条线路 / {st.samples:,} 样本 / "
                    f"用时 {fmt_time(st.duration)}")
+            if st.players:
+                one += f" / {st.players} 位玩家 / {st.kills} 次击杀"
             if st.failed_packets:
                 one += f" / {st.failed_packets} 个包解析失败"
             if st.dropped:

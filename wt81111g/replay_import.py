@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 
 from .route_store import GlobalRecord, TrackPoint, UnitLife
-from .wrpl_reader import ReplayData, load_replay
+from .wrpl_reader import EXT_MASK_UID, ReplayData, load_replay
 
 # 归一化后仍超出 [0,1] 的点按边界截断（远处 AI 会落在框外）
 GAP_SPLIT_SEC = 45.0        # 相邻采样超过这么久 → 认为是两段（死了/长时间无上报）
@@ -44,6 +44,9 @@ class ImportStats:
     lives: int = 0
     duration: float = 0.0
     dropped: int = 0           # 太短的线路（< 3 个点）丢弃数
+    players: int = 0           # 解出的玩家数（Slot 包）
+    kills: int = 0             # 击杀事件数（Kill 包）
+    mapped: int = 0            # 能对应到玩家的载具数
 
 
 def _robust_range(values: list[float]) -> tuple[float, float]:
@@ -84,7 +87,7 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
         level=data.level, battle_type=data.battle_type, server=data.server,
         parts=data.parts, packets=data.packets,
         failed_packets=data.failed_packets, samples=data.sample_count,
-        units=len(data.units),
+        units=len(data.units), players=len(data.players), kills=len(data.kills),
     )
 
     xs, zs = [], []
@@ -121,6 +124,30 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
     rec.route_id = f"wrpl{int(time.time() * 1000) % 10 ** 10:010d}"
 
     t0 = data.t_first
+    # ---- 玩家身份与真实分队 ------------------------------------------------
+    # Slot 包给「玩家槽位 → 名字/队伍」，Kill 包给「载具 uid ↔ 玩家槽位」+
+    # 「uid → 载具型号」。都不需要 ECS 哈希表（详见 wrpl_events.py 的模块注释）。
+    # 覆盖不到的车（从没参与过击杀/被击毁）只能归到 A 队、名字就叫 uidN
+    # —— 实测服务器回放能覆盖 73%（69/94）。
+    teams = {p.slot: p.team for p in data.players.values()}
+    names = {p.slot: p.display for p in data.players.values()}
+    vehicle_of: dict[int, str] = {}
+    for ev in data.kills:
+        if ev.killer_uid != EXT_MASK_UID and ev.vehicle:
+            vehicle_of.setdefault(ev.killer_uid, ev.vehicle)
+
+    def _side(uid: int) -> str:
+        pid = data.uid_pid.get(uid)
+        return "B" if teams.get(pid) == 2 else "A"
+
+    def _label(uid: int) -> str:
+        pid = data.uid_pid.get(uid)
+        who = names.get(pid) if pid is not None else None
+        car = vehicle_of.get(uid)
+        if who:
+            return f"{who} · {car}" if car else who
+        return car or f"uid{uid}"
+
     for uid, rows in sorted(data.units.items()):
         segs: list[list[tuple[float, float, float, float]]] = []
         cur: list[tuple[float, float, float, float]] = []
@@ -176,18 +203,21 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                                       y=ny,
                                       speed=speed))
                 prev = (t, x, z)
+            side = _side(uid)
+            if data.uid_pid.get(uid) is not None:
+                stats.mapped += 1
             life = UnitLife(
-                life_id=f"{rec.route_id}:A{len(rec.sides['A']) + 1}"
+                life_id=f"{rec.route_id}:{side}{len(rec.sides[side]) + 1}"
                         + (f"_{si}" if len(segs) > 1 else ""),
-                icon=f"uid{uid}",
+                icon=_label(uid),
                 obj_type="ground_model",
-                color="#174DFF",
+                color="#174DFF" if side == "A" else "#FF4D4D",
                 map_key=rec.map_key,
                 points=pts,
-                side="A",
+                side=side,
                 dead=False,
             )
-            rec.sides["A"].append(life)
+            rec.sides[side].append(life)
             stats.lives += 1
     stats.duration = rec.duration
     return rec, stats

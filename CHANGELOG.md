@@ -34,6 +34,28 @@
 - 分片按**自然排序**(`part2` 在 `part10` 前), 纯字符串排序会把顺序弄反、
   解出来的 delta 全错。
 
+### 新增: 玩家身份 + 真实分队 + 击杀(2026-10-25)
+
+位置包只给 `uid`（0..2047 的**载具槽位**），没有任何身份字段。但另外两种包能把身份补齐，
+**而且都不需要 ECS 组件哈希表**:
+
+| 包 | 签名 | 内容 |
+|---|---|---|
+| **Slot** | `0xF02D`(ptype=4) | 玩家槽位 0..255 → `player_id`(u64) + 名字(65 B) / 军团 / 称号 / **队伍**(u8) |
+| **Kill** | `0xF058`(ptype=4) | `KillerPid` / `PlayerVehicle` / `VictimUid` / `KillerUid` / `PlayerWeapon` / `VictimPid` / `DestroyedWeapon` |
+
+实现: `wt81111g/wrpl_events.py`（含 `IdFieldSerializer255/32` 的字段表解码、`ReadSize`）。
+
+- `KillerPid`/`VictimPid` 是**玩家槽位号**，`KillerUid`/`VictimUid` 是**载具 uid** →
+  凡参与过击杀/被击毁的车，uid ↔ 玩家 的映射直接得到;
+- 载具型号也从 `PlayerVehicle` 白拿;
+- 算上击杀事件，**服务器回放实测能覆盖 73%（69/94）的载具**；
+- `build_record()` 现在按 **team 真实分 A/B**（team=1→A, team=2→B），
+  `UnitLife.icon` 改成「玩家名 · 载具型号」，侧栏直接可读。
+
+实测（avg_finland，24 分片）: **32 位玩家 / 88 次击杀 / A 队 49 条 + B 队 46 条**,
+74% 的线路带玩家名。解析耗时 30.3 → 32.7 s（slot 包 14,016 个，多 2.4 s）。
+
 ### 性能(2026-10-25: 服务器录像 34 MB 从 230 秒 → 30 秒, 7.6 倍)
 
 解析耗时 99.6% 都在**解包后的位流解码**, 逐项改下来:

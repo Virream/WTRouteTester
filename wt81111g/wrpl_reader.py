@@ -57,6 +57,9 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 PACKET_MPI = 4
 SIG_GROUND_CLIENT = 0xF073
 SIG_GROUND_SERVER = 0xF074
+SIG_SLOT = 0xF02D               # 玩家槽位（名字/军团/队伍）
+SIG_KILL = 0xF058               # 击杀事件
+EXT_MASK_UID = 0x7FF            # uid 字段里的“无效/无载具”标记
 GROUND_UID_MAX = 1 << 11
 DELTA_HISTORY = 32
 DELTA_TAG_MASK = 0x1FFF
@@ -562,6 +565,11 @@ class ReplayData:
     failed_packets: int = 0
     # uid -> [(秒, x 东, 高度, z 北)]，已按时间排序
     units: dict[int, list[tuple[float, float, float, float]]] = field(default_factory=dict)
+    # 玩家槽位（0..255）→ PlayerSlot；击杀事件（按时间排序）
+    players: dict[int, object] = field(default_factory=dict)
+    kills: list = field(default_factory=list)
+    # 载具 uid → 玩家槽位（只能从 kill 事件里推，没参与击杀的车拿不到）
+    uid_pid: dict[int, int] = field(default_factory=dict)
     t_first: float = 0.0
     t_last: float = 0.0
 
@@ -698,6 +706,8 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
     data = ReplayData(parts=len(files))
     data.source = files[0] if files else ""
     nfiles = len(files)
+    # 延迟导入：wrpl_events 依赖本模块的 BitReader，模块级导入会循环
+    from .wrpl_events import parse_kill_packet, parse_slot_packet   # noqa: PLC0415
     hist: dict[int, DeltaHistory] = {}
     raw: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
 
@@ -724,6 +734,35 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
             if ptype != PACKET_MPI or e - s < 12:
                 continue
             mid = payload[s + 2] | (payload[s + 3] << 8)
+            if mid == SIG_SLOT:
+                try:
+                    for plr in parse_slot_packet(payload, s, e, ms / 1000.0):
+                        old = data.players.get(plr.slot)
+                        if old is None:
+                            data.players[plr.slot] = plr
+                        else:
+                            # 同一个槽位会在不同包里带不同字段，逐个补齐
+                            for f in ("player_id", "name", "clan_tag", "title",
+                                      "team", "real_nick"):
+                                v = getattr(plr, f)
+                                if v:
+                                    setattr(old, f, v)
+                except (ValueError, EOFError, IndexError):
+                    data.failed_packets += 1
+                continue
+            if mid == SIG_KILL:
+                try:
+                    ev = parse_kill_packet(payload, s, e, ms / 1000.0)
+                except (ValueError, EOFError, IndexError):
+                    ev = None
+                if ev is not None:
+                    data.kills.append(ev)
+                    # KillerPid/VictimPid 是**玩家槽位号**，Uid 是载具槽位
+                    if ev.killer_uid != EXT_MASK_UID and ev.killer_pid:
+                        data.uid_pid.setdefault(ev.killer_uid, ev.killer_pid)
+                    if ev.victim_uid != EXT_MASK_UID and ev.victim_pid:
+                        data.uid_pid.setdefault(ev.victim_uid, ev.victim_pid)
+                continue
             if mid not in (SIG_GROUND_CLIENT, SIG_GROUND_SERVER):
                 continue
             try:
@@ -743,4 +782,5 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
     if raw:
         all_t = [rows[0][0] for rows in raw.values()] + [rows[-1][0] for rows in raw.values()]
         data.t_first, data.t_last = min(all_t), max(all_t)
+    data.kills.sort(key=lambda k: k.t)
     return data
