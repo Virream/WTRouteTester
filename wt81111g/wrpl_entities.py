@@ -198,7 +198,7 @@ class EcsCollector:
         self._templates: dict[int, dict] = {}
         self._compdefs: set[int] = set()
         self._creations: list[Creation] = []
-        self._destroys: dict[int, int] = {}      # eid -> tick(ms)
+        self._destroys: dict[int, list[int]] = defaultdict(list)   # eid -> [tick, …]
         self.stats: Counter = Counter()
 
     # ---- 喂包 -----------------------------------------------------------
@@ -279,10 +279,18 @@ class EcsCollector:
             except EOFError:
                 self.stats["destroy_eof"] += 1
                 return
-            # 同一个 eid 只记**第一次**销毁（重复销毁没意义）
-            if eid not in self._destroys:
-                self._destroys[eid] = tick
+            # **eid 也会被复用**: 同一个 eid 可以是先后两个实体(实测 uid=114 的
+            # 后一辆车拿到的是前一辆的销毁时刻, died_t 比 born_t 还早)。所以这里
+            # 记**全部**销毁时刻, 匹配时再取「不早于创建时刻」的那个。
+            self._destroys.setdefault(eid, []).append(tick)
         self.stats["destroy_pkts"] += 1
+
+    def _died_at(self, eid: int, born_tick: int) -> int | None:
+        """这辆车的销毁时刻 = 不早于它创建时刻的**第一个**销毁事件。"""
+        for t in self._destroys.get(eid, ()):
+            if t >= born_tick:
+                return t
+        return None
 
     # ---- 现场标定 uid 偏移 ----------------------------------------------
     @staticmethod
@@ -365,7 +373,7 @@ class EcsCollector:
                         cls = s
                 if spawn and cls:
                     break
-            died = self._destroys.get(c.eid)
+            died = self._died_at(c.eid, c.tick)
             res.vehicles.append(Vehicle(
                 uid=uid, eid=c.eid, born_t=c.tick / 1000.0,
                 died_t=(died / 1000.0) if died else None,

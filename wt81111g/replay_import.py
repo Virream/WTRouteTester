@@ -243,10 +243,30 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
             cur.append(item)
         if cur:
             segs.append((cur, 0.0))
-        # 同一个 uid 的多段轨迹**共用一个基号**（A25_1 / A25_2 / A25_3）。
-        # 以前每段都重新取 `len(sides)+1`，一辆车被切成三段就变成 A25_1 / A26_2 /
-        # A27_3，侧栏按玩家分组时会把一辆车数成三辆、时长也重复累加。
-        _base: dict[str, int] = {}
+        # 段的归属：用**段首时刻**在这段轨迹的 ECS 档案里查。同一个 uid 会被复用
+        # （死后重生 / 操作微型无人机 / **同一玩家又出了同型号的车**），前后段可能
+        # 属于不同玩家、也可能是同一玩家的两台不同载具。
+        #
+        # 必须先把所有段的归属解析出来，才能「**一辆车一个基号**」地编号：
+        #   * 以前按 uid 分配 -> 同一 uid 先后两辆车(实测 uid=61 两辆 cn_ztz_96b)
+        #     被合并成"1 台"，用户从界面上完全看不出是两辆；
+        #   * 更不能按"段"分配 -> 一辆车被切成多段就变成 A25_1/A26_2/A27_3。
+        seg_src: list = []
+        for seg, _dth in segs:
+            _ts = seg[0][0]
+            _veh = None
+            for _cand in vans.get(uid, ()):
+                if _cand.born_t - 1.0 <= _ts <= (
+                        (_cand.died_t + 1.0) if _cand.died_t is not None else 1e9):
+                    _veh = _cand
+                    break
+            seg_src.append(_veh)
+        seg_total: dict[int, int] = {}
+        for _v in seg_src:
+            _k0 = id(_v) if _v is not None else -1
+            seg_total[_k0] = seg_total.get(_k0, 0) + 1
+        _base: dict[int, int] = {}
+        _segno: dict[int, int] = {}
         for si, (seg, death_at) in enumerate(segs, 1):
             # 太短/几乎没动的段直接丢弃: 以前只验点数 >= 3，结果那辆“只被看见 1.4 秒”
             # 的车留在地图上就是一个孤立小点（用户 2026-10-25: 两个角上有 A1/A11）
@@ -295,31 +315,26 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
                                       speed=speed))
                 prev = (t, x, z)
             side = _side(uid)
-            # 段的归属：用**段首时刻**在这段轨迹的 ECS 档案里查 —— 同一个 uid
-            # 被复用（死后重生 / 操作微型无人机）时，前后段可以属于不同玩家。
-            veh = None
-            _ts = seg[0][0]
-            for _cand in vans.get(uid, ()):
-                if _cand.born_t - 1.0 <= _ts <= (_cand.died_t + 1.0
-                                                 if _cand.died_t is not None else 1e9):
-                    veh = _cand
-                    break
+            veh = seg_src[si - 1]           # 上面已按段首时刻解析好
             if veh is not None and veh.team:
                 side = "B" if veh.team == 2 else "A"
             if veh is not None and veh.player:
                 stats.mapped += 1
             elif data.uid_pid.get(uid) is not None:
                 stats.mapped += 1
-            # 基号按**队**分配，但同一个 uid 在同一队里只占一个号
-            if side not in _base:
-                _base[side] = len(rec.sides[side]) + 1
+            # 基号按**这一辆车**（ECS 档案条目）分配，不是按 uid —— 这样同一 uid
+            # 先后两辆车会拿到两个不同基号，侧栏台数才准。
+            _k = id(veh) if veh is not None else -1
+            if _k not in _base:
+                _base[_k] = len(rec.sides[side]) + 1
+            _segno[_k] = _segno.get(_k, 0) + 1
             # 归属兜底：ECS 档案没命中时，用 uid->pid 的名字让侧栏还能归组
             # （这条只用于显示分组，`bind` 仍然是 none，不算“已解析出玩家”）。
             _who = (veh.player if veh is not None and veh.player
                     else (names.get(data.uid_pid.get(uid)) or ""))
             life = UnitLife(
-                life_id=f"{rec.route_id}:{side}{_base[side]}"
-                        + (f"_{si}" if len(segs) > 1 else ""),
+                life_id=f"{rec.route_id}:{side}{_base[_k]}"
+                        + (f"_{_segno[_k]}" if seg_total.get(_k, 1) > 1 else ""),
                 icon=veh.label if veh is not None else _label(uid),
                 player=_who,
                 vehicle_cls=(veh.short_cls if veh is not None
