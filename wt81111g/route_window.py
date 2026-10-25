@@ -2642,11 +2642,38 @@ class RouteTesterWindow(QMainWindow):
         self.btn_play_stop.setStyleSheet("font-weight:bold;" if in_play else "")
 
     # ---------------------------------------------------------------- 回放
+    def _fallback_tracks(self) -> list:
+        """侧栏里**既没选中、也没点亮眼睛**时的兜底: 播「当前底图」下最新那一局。
+
+        v1.3.0 起线路都来自「从录像导入」, 不再有“刚录制的那条”(`_last_record`),
+        而**眼睛点亮状态不落盘** —— 重开程序后侧栏里的眼睛全是关的, 于是直接点
+        「▶ 回放」得到空集合、什么都不发生(用户 2026-10-26 反馈“路线播放器无法播放”)。
+
+        兜底规则:
+        * 只取**一个**全局条目 —— 两次导入是两局不同对局, 混在同一条时间轴上没有意义;
+        * 优先**当前底图**那张, 没有就退到最新的一个;
+        * 每个条目内取全部线路(等价于在侧栏选中整个条目)。
+        """
+        def lives(g) -> list:
+            return [lf for side in GLOBAL_SIDES for lf in g.lives(side)
+                    if len(lf.points) >= 2]
+
+        cand = [g for g in self.store.globals if lives(g)]
+        if not cand:
+            return []
+        try:
+            key = self.map_view.map_key or ""
+        except Exception:        # noqa: BLE001 - 视图还没建好时按“不限定地图”处理
+            key = ""
+        same = [g for g in cand if not key or (g.map_key or "") == key]
+        return lives((same or cand)[-1])      # 最新的那一条
+
     def _playable_tracks(self) -> list[RouteRecord]:
         """要回放的轨迹 = **侧栏当前选中的条目**(选中一条就播一条, 选中多条就播多条,
         一起从 00:00 开始, 以最长的那条作为结束)。
 
-        没有选中任何条目时依次退回: 眼睛点亮的轨迹 → 刚录制的那条。
+        没有选中任何条目时依次退回: 眼睛点亮的轨迹 → 刚录制的那条 →
+        当前底图下最新那一局的全部线路(见 `_fallback_tracks`)。
         """
         if self.player.records:          # 已在回放中 → 保持原来的集合
             return self.player.records
@@ -2656,7 +2683,9 @@ class RouteTesterWindow(QMainWindow):
         shown = self.map_view.visible_tracks
         if not shown and self._last_record is not None:
             shown = [self._last_record]
-        return shown
+        if shown:
+            return shown
+        return self._fallback_tracks()
 
     def _load_playback(self, recs) -> None:
         """载入回放(单条或列表)并复位到开头。
@@ -2681,8 +2710,9 @@ class RouteTesterWindow(QMainWindow):
         if not self.player.records:
             recs = self._playable_tracks()
             if not recs:
-                self._set_status("没有可回放的轨迹(先在侧栏选中条目, 或点亮眼睛)",
-                                 sticky=2.0)
+                self._set_status(
+                    "侧栏里还没有任何线路 —— 先点「从录像中获取路线」导入一次",
+                    sticky=3.0)
                 return
             self._load_playback(recs)
         self.player.toggle()
@@ -2694,8 +2724,9 @@ class RouteTesterWindow(QMainWindow):
         if not self.player.records:
             recs = self._playable_tracks()
             if not recs:
-                self._set_status("没有可回放的轨迹(先在侧栏选中条目, 或点亮眼睛)",
-                                 sticky=2.0)
+                self._set_status(
+                    "侧栏里还没有任何线路 —— 先点「从录像中获取路线」导入一次",
+                    sticky=3.0)
                 return
             self._load_playback(recs)
         self.player.play_to_next_mark()
