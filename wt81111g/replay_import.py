@@ -47,6 +47,8 @@ class ImportStats:
     players: int = 0           # 解出的玩家数（Slot 包）
     kills: int = 0             # 击杀事件数（Kill 包）
     mapped: int = 0            # 能对应到玩家的载具数
+    air_units: int = 0         # 飞机/直升机数（ptype=2）
+    air_lives: int = 0         # 飞机生成的线路数
 
 
 def _robust_range(values: list[float]) -> tuple[float, float]:
@@ -220,6 +222,50 @@ def build_record(data: ReplayData, source_path: str = "") -> tuple[GlobalRecord,
             rec.sides[side].append(life)
             stats.lives += 1
     stats.duration = rec.duration
+    # ---- 飞机 / 直升机 ------------------------------------------------------
+    # `ptype=2`（FlightModel，4 Hz）是**独立的 uid 空间**，数值会和地面 uid 重叠，
+    # 所以不能混进 `units`。位置归一化沿用**地面**算出来的范围 —— 飞机常飞到
+    # 20 km 外的机场，若把它算进范围会把战场压成一小块；超出的点自然画到画布外。
+    for auid, rows in sorted(data.air_units.items()):
+        segs = []
+        cur: list[tuple[float, float, float, float]] = []
+        for item in rows:
+            if cur and item[0] - cur[-1][0] > GAP_SPLIT_SEC:
+                segs.append(cur)
+                cur = []
+            cur.append(item)
+        if cur:
+            segs.append(cur)
+        for si, seg in enumerate(segs, 1):
+            if len(seg) < 3:
+                stats.dropped += 1
+                continue
+            pts = [TrackPoint(t=max(0.0, t - t0),
+                              x=(x - minx) / spanx,
+                              y=(maxz - z) / spanz,
+                              speed=0.0)
+                   for t, x, _y, z in seg]
+            # 速度：飞机按相邻点位移算（不设上限，超音速很正常）
+            for a, b in zip(pts, pts[1:]):
+                dt = b.t - a.t
+                if dt > 1e-6:
+                    a.speed = ((b.x - a.x) ** 2 + (b.y - a.y) ** 2) ** 0.5 / dt * 3.6
+            life = UnitLife(
+                life_id=f"{rec.route_id}:A{len(rec.sides['A']) + 1}"
+                        + (f"_{si}" if len(segs) > 1 else ""),
+                icon=f"✈ uid{auid}",
+                obj_type="air_model",
+                color="#174DFF",
+                map_key=rec.map_key,
+                points=pts,
+                side="A",
+                dead=False,
+            )
+            rec.sides["A"].append(life)
+            stats.lives += 1
+            stats.air_lives += 1
+
+    stats.air_units = len(data.air_units)
     return rec, stats
 
 

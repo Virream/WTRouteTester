@@ -570,6 +570,8 @@ class ReplayData:
     kills: list = field(default_factory=list)
     # 载具 uid → 玩家槽位（只能从 kill 事件里推，没参与击杀的车拿不到）
     uid_pid: dict[int, int] = field(default_factory=dict)
+    # 飞机/直升机：uid → [(秒, x, y, z)]（**独立的 uid 空间**，与地面数值会重叠）
+    air_units: dict[int, list[tuple[float, float, float, float]]] = field(default_factory=dict)
     t_first: float = 0.0
     t_last: float = 0.0
 
@@ -706,10 +708,12 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
     data = ReplayData(parts=len(files))
     data.source = files[0] if files else ""
     nfiles = len(files)
-    # 延迟导入：wrpl_events 依赖本模块的 BitReader，模块级导入会循环
+    # 延迟导入：wrpl_events / wrpl_air 依赖本模块的 BitReader，模块级导入会循环
+    from .wrpl_air import PACKET_FLIGHT_MODEL, parse_fm_packet          # noqa: PLC0415
     from .wrpl_events import parse_kill_packet, parse_slot_packet   # noqa: PLC0415
     hist: dict[int, DeltaHistory] = {}
     raw: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
+    air: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
 
     for idx, fp in enumerate(files, 1):
         note(f"读取分片 {idx}/{nfiles} …", (idx - 1) / nfiles)
@@ -731,6 +735,14 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
             if i % step == 0:
                 note(f"解析分片 {idx}/{nfiles} · 包 {i:,}/{total:,}",
                      ((idx - 1) + i / max(1, total)) / nfiles)
+            if ptype == PACKET_FLIGHT_MODEL:
+                try:
+                    for auid, pos in parse_fm_packet(payload, s, e):
+                        if pos is not None:
+                            air[auid].append((ms / 1000.0, pos[0], pos[1], pos[2]))
+                except (ValueError, EOFError, IndexError):
+                    data.failed_packets += 1
+                continue
             if ptype != PACKET_MPI or e - s < 12:
                 continue
             mid = payload[s + 2] | (payload[s + 3] << 8)
@@ -779,6 +791,9 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
     for uid, rows in raw.items():
         rows.sort()
         data.units[uid] = rows
+    for auid, rows in air.items():
+        rows.sort()
+        data.air_units[auid] = rows
     if raw:
         all_t = [rows[0][0] for rows in raw.values()] + [rows[-1][0] for rows in raw.values()]
         data.t_first, data.t_last = min(all_t), max(all_t)
