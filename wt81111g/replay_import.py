@@ -249,39 +249,75 @@ def build_record(data: ReplayData, source_path: str = "",
     for _v in deaths.values():
         _v.sort()
 
+    # ---- 每辆车的**有效终点** = min(ECS 销毁, 被击毁那一刻) -------------------
+    # ECS 的 `0x26` 销毁包对**残骸常常根本不发**(残骸就留在场上), 此时
+    # `_fill_end_times` 只能把 `died_t` 兜底成对局结束(`died_by == "end"`)。
+    # 只看这个窗口就会把「冻结的残骸」整条留在线上 —— 实测 uid 30/41/40/53/34/32
+    # 在 79~194s 被击毁, 之后 **1.9~2.2 万个采样全在同一个坐标**(跨度 0~5 m), 一直
+    # 报到 1005s, 于是 6 条幽灵线拖了整局。
+    #
+    # 击杀包里的 `VictimUid + 时间戳` 正好补上这个缺口: **被打死的那一刻就是这辆
+    # 车的终点**, 之后的位置流全是残骸。取窗口内**第一次**击杀(之后的属于 uid 复用)。
+    def _eff_end(v) -> tuple[float, str]:
+        """载具档案 -> (有效终点秒, 理由)。理由取 `kill` / `ecs` / `next` / `end`。"""
+        end = v.died_t if v.died_t is not None else 1e9
+        for t in deaths.get(v.uid, ()):
+            if v.born_t - 1.0 <= t <= end:
+                return t, "kill"
+        return end, (v.died_by or "ecs")
+
+    _end_of: dict[int, float] = {}        # id(Vehicle) -> 有效终点秒
+    _end_by: dict[int, str] = {}          # id(Vehicle) -> 理由
+
+    def _veh_ends(m: dict[int, list]) -> dict[int, list[tuple[float, float, str]]]:
+        """uid -> [(born, 有效终点, 理由)]; 同时填好按 id 查的表。"""
+        out: dict[int, list[tuple[float, float, str]]] = {}
+        for _u, _lst in m.items():
+            for _v in _lst:
+                _e, _by = _eff_end(_v)
+                _end_of[id(_v)] = _e
+                _end_by[id(_v)] = _by
+                out.setdefault(_u, []).append((_v.born_t, _e, _by))
+            out[_u].sort()
+        return out
+
+    def _tol_of(by: str) -> float:
+        """窗口容差: 击杀端点只给 0.5 s, 其余 2 s(见地面循环里的说明)。"""
+        return 0.5 if by == "kill" else 2.0
+
+    g_ends = _veh_ends(vans)
+
     for uid, rows in sorted(data.units.items()):
         # 车被击毁后位置流**还会继续上报残骸**(实测某 uid 击毁于 147.7s, 之后
         # 12,641 个点全在同一个坐标, 一直报到 1012s), 而残骸本身仍可以被撞得
-        # 滑动几米 —— 所以**不能用“有没有位移”去猜**, 而是按 ECS 的存活窗口裁:
-        # 每辆车的窗口 `[born, died]` 来自创建包 tick 与 `0x26` 销毁包, 窗口之外的
-        # 采样必然属于别的东西(残骸 / uid 复用)。
+        # 滑动几米 —— 所以**不能用“有没有位移”去猜**, 而是按存活窗口裁:
+        # 窗口 = `[ECS 创建, min(ECS 销毁, 被击毁时刻)]`(见 `_eff_end`)。
+        # 窗口之外的采样必然属于别的东西(残骸 / uid 复用)。
         # 实测三份回放里**每个有采样的 uid 都有 ECS 档案**(0 个孤儿), 所以这条够用。
-        _win = vans.get(uid, ())
+        _win = g_ends.get(uid, ())
         if _win:
-            _tol = 2.0
+            # 击杀端点只给 0.5 s 容差: 残骸本来就从击杀那一刻开始, 给 2 s 会多出一
+            # 截几十个点的碎屑段(击杀时刻也是切段点, 那截就成了独立的 `_2` 线)。
             rows = [r for r in rows
-                    if any(v.born_t - _tol <= r[0]
-                           <= ((v.died_t + _tol) if v.died_t is not None else 1e9)
-                           for v in _win)]
-        # ECS 的「销毁时刻」也是切段点：uid 被复用后，前一辆车销毁的那一刻
-        # 就是分界（比“看不见了”精确，也比速度跳变检测稳）
+                    if any(a - _tol_of(_by) <= r[0] <= b + _tol_of(_by)
+                           for a, b, _by in _win)]
+        # 切段点: uid 被复用后, 前一辆车「真正结束」的那一刻就是分界(比“看不见了”
+        # 精确, 也比速度跳变检测稳)。`died_by == "end"` 且没被击杀的 = 真的活到
+        # 对局结束(或 AI), 不能切。
         #
-        # ⚠ 被 ECS 窗口覆盖的**击杀时刻不再当切段点**：车被击毁后残骸还会被上报
-        #   约 10 秒（实测 uid=61 击杀 363.3s、ECS 销毁 373.7s），在击杀时刻切一刀
-        #   就把这 10 秒残骸切成了**独立线路**（用户 2026-10-25 反馈：一位玩家名下
-        #   出现 4 条 cn_ztz_96b，而游戏里一局只能出击 2 次）。ECS 的 died_t 才是
-        #   权威边界；没有 ECS 档案的（AI 载具）仍用击杀时刻切。
-        _wins = [(v.born_t, v.died_t) for v in vans.get(uid, ())
-                 if v.died_t is not None]
+        # ⚠ 击杀时刻在这里**也会**成为切段点, 但不会有“10 秒残骸被切成第二条线”
+        #   的老问题: 采样已经被上面的窗口裁到 `min(died, kill)` 了(用户 2026-10-25
+        #   反馈的 4 条 cn_ztz_96b 就是当年在击杀时刻切、却没裁采样造成的)。
+        _wins = [(a, b) for a, b, _by in _win]
 
         def _covered(t: float) -> bool:
             return any(a - 1.0 <= t <= b + 1.0 for a, b in _wins)
 
         dl = [t for t in deaths.get(uid, ()) if not _covered(t)]
-        for _v0 in vans.get(uid, ()):
+        for _a, _b, _by in _win:
             # "end" = 到对局结束还在, 不是死亡
-            if _v0.died_t and _v0.died_by != "end":
-                dl.append(_v0.died_t)
+            if _b < 1e8 and _by != "end":
+                dl.append(_b)
         dl.sort()
         di = 0
         segs: list[tuple[list[tuple[float, float, float, float]], float]] = []
@@ -431,6 +467,7 @@ def build_record(data: ReplayData, source_path: str = "",
         air_vans.setdefault(_v.uid, []).append(_v)
     for _lst in air_vans.values():
         _lst.sort(key=lambda v: v.born_t)
+    a_ends = _veh_ends(air_vans)
     _air_base: dict[int, int] = {}
 
     # 机场群质心：AI 机场防空的任务对象名 `t1_`/`t2_` 与队伍编号**是反的**
@@ -460,21 +497,18 @@ def build_record(data: ReplayData, source_path: str = "",
         return None
 
     for auid, rows in sorted(data.air_units.items()):
-        # 与地面一样, 只靠 ECS 存活窗口裁(飞机坠毁后的位置也会继续上报)
+        # 与地面一样, 只靠存活窗口裁(飞机坠毁后的位置也会继续上报), 窗口同样收紧到
+        # `min(ECS 销毁, 被击落时刻)`
         _win = air_vans.get(auid, ())
         if _win:
-            # 与地面同样的「越窗裁剪」：窗口外的采样属于别的实体
-            _tol = 2.0
             rows = [r for r in rows
-                    if any(v.born_t - _tol <= r[0]
-                           <= ((v.died_t + _tol) if v.died_t is not None else 1e9)
-                           for v in _win)]
+                    if any(a - _tol_of(_by) <= r[0] <= b + _tol_of(_by)
+                           for a, b, _by in a_ends.get(auid, ()))]
         if not rows:
             continue
-        # 切段点：长时间没上报 + 每架飞机的销毁时刻（击杀时刻不参与，理由同地面：
-        # 残骸还会被上报几秒，切了会多出一条假线路）
-        cuts = sorted(v.died_t for v in _win
-                      if v.died_t is not None and v.died_by != "end")
+        # 切段点：长时间没上报 + 「真正结束」的时刻（不含“活到对局结束”）
+        cuts = sorted(b for _a, b, _by in a_ends.get(auid, ())
+                      if b < 1e8 and _by != "end")
         segs: list[list[tuple[float, float, float, float]]] = []
         cur: list[tuple[float, float, float, float]] = []
         di = 0
@@ -495,14 +529,21 @@ def build_record(data: ReplayData, source_path: str = "",
             _ts = seg[0][0]
             _veh = None
             for _cand in _win:
-                if _cand.born_t - 2.0 <= _ts <= (
-                        (_cand.died_t + 2.0) if _cand.died_t is not None else 1e9):
+                if _cand.born_t - 2.0 <= _ts <= _end_of.get(id(_cand), 1e9) + 2.0:
                     _veh = _cand
                     break
             seg_veh.append(_veh)
         _segn: dict[int, int] = {}
         for si, seg in enumerate(segs, 1):
             if len(seg) < 3:
+                stats.dropped += 1
+                continue
+            # 与地面同一道闸: 太短又几乎没动的段丢掉。坠机后残骸还会上报 1~2 秒
+            # (被击落时刻成了切段点, 那截尾巴就单独成段), 留着就是 8 个点的碎屑。
+            _dur = seg[-1][0] - seg[0][0]
+            _mv = max(max(q[1] for q in seg) - min(q[1] for q in seg),
+                      max(q[3] for q in seg) - min(q[3] for q in seg))
+            if _dur < 3.0 and _mv < 50.0:
                 stats.dropped += 1
                 continue
             veh = seg_veh[si - 1]
@@ -533,7 +574,9 @@ def build_record(data: ReplayData, source_path: str = "",
                     a.speed = ((b.x - a.x) ** 2 + (b.y - a.y) ** 2) ** 0.5 / dt * 3.6
             _cls = veh.short_cls if veh is not None else ""
             _who = veh.player if veh is not None else ""
-            _dead = bool(veh is not None and veh.died_by in ("ecs", "next"))
+            _vend = _end_of.get(id(veh), 1e9) if veh is not None else 1e9
+            _vby = _end_by.get(id(veh), "") if veh is not None else ""
+            _dead = bool(_vby in ("ecs", "next", "kill")) and _vend < 1e8
             life = UnitLife(
                 life_id=f"{rec.route_id}:{side}{_air_base[_k]}"
                         + (f"_{_segn[_k]}" if len(segs) > 1 else ""),
@@ -547,9 +590,7 @@ def build_record(data: ReplayData, source_path: str = "",
                 points=pts,
                 side=side,
                 dead=_dead,
-                death_t=(max(0.0, veh.died_t - t0)
-                         if (_dead and veh is not None and veh.died_t is not None)
-                         else 0.0),
+                death_t=(max(0.0, _vend - t0) if _dead else 0.0),
             )
             rec.sides[side].append(life)
             stats.lives += 1
