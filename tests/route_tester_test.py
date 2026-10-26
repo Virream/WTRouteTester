@@ -2837,13 +2837,18 @@ def test_map_manager(tmpdir: str):
     # ---- 右: 预览跟着选中走 ----
     assert dlg._preview_pm is not None, "选中一条有底图的, 右边就该有预览"
 
-    # ---- 底部「校准地图位置」: 没选中时不可用 ----
+    # ---- 底部「校准地图位置」: 没选中 → 灰; 选中但**没关联回放关卡** → 也灰 ----
     dlg.table.clearSelection()
     dlg._on_selection_changed()
     assert not dlg.btn_calib.isEnabled(), "没选中就不知道校准哪一张, 按钮要灰着"
     dlg.table.selectRow(row)
     app.processEvents()
-    assert dlg.btn_calib.isEnabled()
+    # 用户 2026-10-26 指出的 bug: 只做过本地录制(没导入过任何回放)的地图根本
+    # 没有关卡代号 —— 校准了也没地方用(实况录制本来就是 8111 的 0~1 坐标)
+    assert win.store.level_of_hash(key) == ""
+    assert not dlg.btn_calib.isEnabled(), \
+        "没关联回放关卡代号时不该能校准(校准只服务回放的米制坐标)"
+    assert "关联" in dlg.btn_calib.toolTip(), dlg.btn_calib.toolTip()
 
     # ---- 可选: 关联回放关卡代号 → 两张地图归成一张 ----
     combo = dlg.table.cellWidget(row, COL_LEVEL)
@@ -2853,6 +2858,7 @@ def test_map_manager(tmpdir: str):
     app.processEvents()
     assert win.store.level_of_hash(key) == "avg_finland"
     assert win.store.canon("wrpl_avg_finland") == key
+    assert dlg.btn_calib.isEnabled(), "关联后代号后校准就该可用"
     win._reload_tree()
     app.processEvents()
     assert win.tree.topLevelItemCount() == 1, "关联后应只剩一张地图"

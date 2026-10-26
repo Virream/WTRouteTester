@@ -14,8 +14,14 @@
 不搬家。所以选错了直接改回来(或改回「未选择」)即可, 不会丢任何东西 ——
 这就是为什么第三列是个可以随时改的下拉框, 而不是"一次性合并"按钮。
 
+**「校准地图位置」只给回放解析出来的路线用**(用户 2026-10-26 明确声明):
+8111 实况录制的单条路线**天然就是准的**(坐标本来就是图片内的 0~1), 不需要校准;
+而回放给的是**米制世界坐标**, 必须知道"这张底图覆盖世界哪个矩形"才能落到位。
+⇒ **没关联任何回放关卡代号的地图, 校准了也无处可用**, 所以按钮有意做成灰的
+(见 `_update_calib_state`)。
+
 界面: 左边一条条键值对(键=哈希 / 值=名字输入框 / 可选=关卡代号), 右边是选中那条
-的底图预览, 底部一个「校准地图位置」按钮(未选中时不可用)。
+的底图预览, 底部一个「校准地图位置」按钮(**选中且已关联关卡代号**才可用)。
 """
 from __future__ import annotations
 
@@ -296,8 +302,37 @@ class MapManagerDialog(QDialog):
             it = self.table.item(rows[0].row(), COL_KEY)
             key = it.data(Qt.ItemDataRole.UserRole) if it is not None else None
         self._cur_key = key
-        self.btn_calib.setEnabled(bool(key))
+        self._update_calib_state()
         self._update_preview()
+
+    def _update_calib_state(self) -> None:
+        """「校准地图位置」的可用状态 —— **必须已经关联了回放关卡代号**。
+
+        为什么(用户 2026-10-26 指出): 校准记录的是「这张底图覆盖世界哪个矩形(米)」,
+        而唯一用到它的地方是**把回放导入的米制坐标换算成 0~1**。本地实况录制的线路
+        本来就是 8111 给的 0~1, **不需要校准**。所以一张没关联任何回放关卡代号的地图
+        (没导入过那局回放), 校准了也无处可用 —— 以前这个按钮只看"有没有选中行",
+        用户点了会被拉去"进对局校准", 却根本不知道校完干什么。
+        """
+        key = self._cur_key
+        level = self.store.level_of_hash(key) if key else ""
+        ok = bool(key) and bool(level)
+        self.btn_calib.setEnabled(ok)
+        if not key:
+            self.btn_calib.setToolTip(
+                "先在左边的列表里**选中一条**, 这个按钮才知道要校准哪张图。")
+        elif not level:
+            self.btn_calib.setToolTip(
+                "这张图还没有关联**回放关卡代号**, 暂时不能校准。\n\n"
+                "校准记录的是「这张底图覆盖世界哪个矩形(米)」, 只有**从回放导入的线路**\n"
+                "（米制坐标）才用得到它；本地实况录制的线路本来就是 8111 给的 0~1, 不需要。\n\n"
+                "先在右边的「可选」列里把它指到一个关卡代号上（那个代号得先导入过一局\n"
+                "回放才会出现）。")
+        else:
+            self.btn_calib.setToolTip(
+                f"校准这张图（回放关卡 {level}）的位置:\n"
+                "点它之后 ① 通过 8111 抓这张图的地图图片 ② 记录图片覆盖的世界范围。\n"
+                "抓完会自动装好, 回放线路随即对齐底图。")
 
     def _update_preview(self) -> None:
         """把右边换成当前选中那条的底图。"""
@@ -399,16 +434,29 @@ class MapManagerDialog(QDialog):
                  key, old, level, renum)
         # 其它行的下拉列表跟着变: 被本行拿走的代号不该再出现在别处
         self._refresh_level_choices()
+        self._update_calib_state()      # 关联状态变了 → 「校准」的可用性也跟着变
         self._update_preview()
         self._update_summary()
 
     # ------------------------------------------------------------------ 校准
     def _calibrate(self) -> None:
-        """「校准地图位置」: ① 8111 抓图 ② 记录图片覆盖的世界范围。"""
+        """「校准地图位置」: ① 8111 抓图 ② 记录图片覆盖的世界范围。
+
+        只能对**已经关联了回放关卡代号**的地图做 —— 校准服务的就是回放的米制坐标,
+        没关联就没有回放记录可以用它(见 `_update_calib_state`)。
+        """
         key = self._cur_key
         if not key:
             QMessageBox.information(self, "校准地图位置",
                                     "请先在左边的列表里选中一张地图")
+            return
+        if not self.store.level_of_hash(key):
+            QMessageBox.information(
+                self, "校准地图位置",
+                "这张图还没有关联回放关卡代号, 不需要校准。\n\n"
+                "校准记录的是「底图覆盖世界哪个矩形(米)」, 只有从回放导入的线路"
+                "（米制坐标）才用得到; 本地实况录制的线路本来就是 8111 给的 0~1。\n\n"
+                "要校准: 先在右侧的「可选」列里把它指到一个已经导入过回放的关卡代号上。")
             return
         shown = self.store.display_name(key)
         level = self.store.level_of_hash(key)
