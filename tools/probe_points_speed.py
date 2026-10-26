@@ -177,7 +177,15 @@ def _end_to_end(src_path: str, tracks: list) -> None:
             print("  (这一局读不回来, 跳过端到端)")
             return
         app = QApplication.instance() or QApplication([])      # noqa: F841
+        from PyQt6.QtGui import QPixmap
+
         view = RouteMapView()
+        view.resize(1200, 800)               # 常见窗口大小
+        # 必须给个底图, 否则 `_map_size()` 返回 (0,0) → LOD 不生效(拿不到屏幕像素尺寸)
+        view._pixmap = QPixmap(2048, 2048)
+        view._pixmap.fill()
+        view._map_digest = "probe"
+        print(f"  (窗口 1200x800 + 2048² 底图 → 地图在屏上 {view._map_size()[0]:.0f} px)")
 
         def lines(rec):
             if hasattr(rec, "sides"):
@@ -187,30 +195,68 @@ def _end_to_end(src_path: str, tracks: list) -> None:
                 return out
             return [rec]
 
-        def paint_prep():
+        def paint_prep(stats: dict | None = None):
+            st = {} if stats is None else stats
             for rec in recs:
                 for lf in lines(rec):
                     if not len(lf.points):
                         continue
-                    vmax = view._vmax(lf)
-                    view._times(lf)
-                    view._bbox(lf)
-                    view._px_line(lf)
-                    view._speed_segments(lf, vmax)
-            return None
+                    for name, fn in (("vmax", lambda r=lf: view._vmax(r)),
+                                     ("times", lambda r=lf: view._times(r)),
+                                     ("bbox", lambda r=lf: view._bbox(r)),
+                                     ("px_line", lambda r=lf: view._px_line(r)),
+                                     ("segments", lambda r=lf: view._speed_segments(
+                                         r, view._vmax(r)))):
+                        t0 = time.perf_counter()
+                        fn()
+                        st[name] = st.get(name, 0.0) + time.perf_counter() - t0
+            return st
+
+        def _clear():
+            view._vmax_cache.clear(); view._times_cache.clear()
+            view._bbox_cache.clear(); view._line_cache.clear()
+            view._seg_cache.clear()
+
+        def _show(label: str, st: dict) -> None:
+            parts = " ".join(f"{k}={v * 1000:.0f}ms" for k, v in st.items())
+            print(f"     {label}: {parts}")
 
         print("\n端到端(第一次画出来, 含解压): ")
-        view._vmax_cache.clear(); view._times_cache.clear()
-        view._bbox_cache.clear(); view._line_cache.clear(); view._seg_cache.clear()
-        _timed("列存储(现在的实现)", paint_prep)
+        _clear()
+        t0 = time.perf_counter()
+        st1 = paint_prep()
+        col_s = time.perf_counter() - t0
+        print(f"     列数组 + LOD:            {col_s * 1000:8.1f} ms")
+        _show("分项", st1)
+
+        # LOD 到底抽掉多少点(**必须赶在物化之前**统计)
+        from wt81111g.route_map_view import lod_mask
+        tot = kept = 0
+        for rec in recs:
+            for lf in lines(rec):
+                cols_of = getattr(lf.points, "columns", None)
+                got = cols_of() if callable(cols_of) else None
+                if got is None:
+                    continue
+                arr = got[1]
+                m = lod_mask(arr, *view._map_size(), view._vmax(lf))
+                tot += int(arr.shape[1])
+                kept += int(m.sum()) if m is not None else int(arr.shape[1])
+        if tot:
+            print(f"     LOD: {tot:,} 点 → 保留 {kept:,}（{kept / tot * 100:.0f}%）")
 
         # 先全部物化, 再算一遍 —— 这正是 P3 之前的路径
         for rec in recs:
             for lf in lines(rec):
                 list(lf.points)
-        view._vmax_cache.clear(); view._times_cache.clear()
-        view._bbox_cache.clear(); view._line_cache.clear(); view._seg_cache.clear()
-        _timed("先物化成点对象(旧行为)", paint_prep)
+        _clear()
+        t0 = time.perf_counter()
+        st2 = paint_prep()
+        old_s = time.perf_counter() - t0
+        print(f"     先物化成点对象(旧行为):  {old_s * 1000:8.1f} ms")
+        _show("分项", st2)
+        if col_s > 0:
+            print(f"     加速比: {old_s / col_s:.2f}×")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

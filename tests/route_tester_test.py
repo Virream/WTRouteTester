@@ -2125,6 +2125,80 @@ def test_column_points(tmpdir: str):
     results.append("性能: 点以列数组常驻(不物化也能画对 / 物化后改点能存对) OK")
 
 
+def test_lod_decimation(tmpdir: str):
+    """LOD 抽稀**只作用于画出来的几何**, 悬浮仍能精确到每一个原始点。
+
+    用户 2026-10-26 问的就是这条: “抽稀会不会损失鼠标悬浮时可读取的点数细节?”
+    —— 不会。`_hit_test` 用的是 `rec.points` 的**全部原始点**(numpy 全量算距离),
+    抽稀只发生在给 QPainter 的折线/分桶几何上。
+    """
+    from wt81111g import route_map_view as rmv
+
+    path = os.path.join(tmpdir, "lod.json")
+    store = RouteStore(path)
+    rec = store.new_route("AAA", "地图 A", "T", 0.1, 0.1)
+    n = 12000
+    # 一条斜穿全图的直线, 速度一路上涨(跨很多速度桶, 专门压一压桶边界的保留逻辑)
+    rec.points = [RoutePoint(0.1 + 0.8 * i / (n - 1), 0.1 + 0.8 * i / (n - 1),
+                             i * 0.01, i * 0.005) for i in range(n)]
+    rec.duration = n * 0.01
+    store.add(rec)
+    store.save_now()
+
+    again = RouteStore(path)
+    got = again.routes[0]
+    cols = got.points.columns()
+    assert cols is not None, "从文件读出来应该是列存储"
+    arr = cols[1]
+
+    view = rmv.RouteMapView()
+    view.resize(1200, 800)
+    view._pixmap = QPixmap(2048, 2048)      # 模拟真底图, 否则 _map_size() 是 0
+    view._pixmap.fill()
+    view._map_digest = "lod-probe"
+    w, h = view._map_size()
+    assert w > 100 and h > 100, (w, h)
+
+    vmax = view._vmax(got)
+    keep = rmv.lod_mask(arr, w, h, vmax)
+    assert keep is not None, "1.2 万点应该触发抽稀"
+    kept = int(keep.sum())
+    assert keep[0] and keep[-1], "首末点必须保留"
+    assert kept < n // 2, f"抽稀后应该明显变少: {kept}/{n}"
+
+    # 速度桶一变, 两侧的点都要留 —— 否则颜色分段的位置会漂(线的颜色会“跳”)
+    np = rmv._np
+    assert np is not None
+    bucket = np.minimum(rmv._SPEED_BUCKETS - 1,
+                        (np.clip(arr[3] / vmax, 0.0, 1.0)
+                         * rmv._SPEED_BUCKETS).astype(np.int32))
+    flips = np.flatnonzero(bucket[1:] != bucket[:-1])
+    assert flips.size > 3, flips.size
+    for i in flips.tolist():
+        assert bool(keep[i]) and bool(keep[i + 1]), f"桶边界 {i} 两侧必须留"
+
+    # 画出来的折线 = 抽稀后的点数; 首末点与原始数据完全一致
+    poly = view._px_line(got)
+    assert poly.size() == kept, (poly.size(), kept)
+    assert abs(poly.at(0).x() - float(arr[1][0])) < 1e-6
+    assert abs(poly.at(kept - 1).x() - float(arr[1][-1])) < 1e-6
+
+    # ★ 关键: 被抽稀掉的点, 悬浮照样能**精确**命中(不是命中最近的保留点)
+    dropped = [i for i in range(1, n) if not keep[i]]
+    assert len(dropped) > 1000, len(dropped)
+    view._visible = [got]
+    r = view._map_rect()
+    for i in (dropped[0], dropped[len(dropped) // 2], dropped[-1]):
+        pt = got.points[i]
+        hit = view._hit_test(pt.x * w + r.left(), pt.y * h + r.top())
+        assert hit is not None and hit[0] is got, (i, hit)
+        assert abs(hit[1].t - pt.t) < 1e-6, (i, hit[1].t, pt.t)
+
+    # 放大后要按新比例重算(缓存键含 zoom): 几何“重新变细”
+    assert got.points.columns() is not None, "悬浮/抽稀都不该把点物化"
+    results.append("性能: LOD 抽稀只动绘制几何(首末点与速度桶边界保留 / 悬浮仍命中原始点) OK")
+
+
 def test_playback_lock(tmpdir: str):
     """回放期间锁定其余功能, 必须点「■ 结束播放」才恢复。
 
@@ -4220,6 +4294,7 @@ def main() -> int:
     test_adopt_and_import_pool(tmpdir)
     test_import_wiring(tmpdir)
     test_column_points(tmpdir)
+    test_lod_decimation(tmpdir)
     test_recorder(tmpdir)
     test_recorder_placeholder()
     test_start_on_move(tmpdir)

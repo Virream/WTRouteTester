@@ -237,22 +237,46 @@ class _LiveGeom:
         self.dirty: set[int] = set()
         self.vmax = 0.0                             # 本几何用的速度基准
 
-    def feed(self, points, vmax: float) -> dict[int, list[QPointF]]:
-        """处理新增的点。返回**本次新增**的线段(按速度桶分组), 供“只补新段”的增量绘制用。"""
-        n = len(points)
+    def feed(self, points, vmax: float,
+             limit: int | None = None) -> dict[int, list[QPointF]]:
+        """处理新增的点。返回**本次新增**的线段(按速度桶分组), 供“只补新段”的增量绘制用。
+
+        `limit` 给定时只处理**前 limit 个点**(回放前缀); 列存储的点直接读第 1/2 行,
+        **既不切片也不造点对象** —— 回放每帧都要调这个, 以前 `pts[:k]` 会为整条线
+        造一遍对象, 那是播放卡顿的主因之一。
+        """
+        arr = None
+        total = len(points)
+        cols_of = getattr(points, "columns", None)
+        if callable(cols_of):
+            got = cols_of()
+            if got is not None and _np is not None:
+                arr = got[1]
+                total = int(arr.shape[1])
+        n = total if limit is None else min(int(limit), total)
         changed = (self.vmax <= 0.0
                    or abs(vmax - self.vmax) > VMAX_REBUILD_RATIO * self.vmax)
         if n < self.n or changed:                    # 基准变了/点数变少 → 从头来
             self.n, self.pts, self.polys, self.dirty = 0, {}, {}, set()
             self.vmax = vmax
         added: dict[int, list[QPointF]] = {}
-        for i in range(max(1, self.n), n):
-            a, b = points[i - 1], points[i]
-            idx = bucket_index((a.speed + b.speed) / 2.0, vmax)
-            pair = (QPointF(a.x, a.y), QPointF(b.x, b.y))
-            self.pts.setdefault(idx, []).extend(pair)
-            added.setdefault(idx, []).extend(pair)
-            self.dirty.add(idx)
+        if arr is None:
+            for i in range(max(1, self.n), n):
+                a, b = points[i - 1], points[i]
+                idx = bucket_index((a.speed + b.speed) / 2.0, vmax)
+                pair = (QPointF(a.x, a.y), QPointF(b.x, b.y))
+                self.pts.setdefault(idx, []).extend(pair)
+                added.setdefault(idx, []).extend(pair)
+                self.dirty.add(idx)
+        else:
+            xs, ys, sp = arr[1], arr[2], arr[3]
+            for i in range(max(1, self.n), n):
+                idx = bucket_index(float(sp[i - 1] + sp[i]) * 0.5, vmax)
+                pair = (QPointF(float(xs[i - 1]), float(ys[i - 1])),
+                        QPointF(float(xs[i]), float(ys[i])))
+                self.pts.setdefault(idx, []).extend(pair)
+                added.setdefault(idx, []).extend(pair)
+                self.dirty.add(idx)
         self.n = n
         for idx in self.dirty:
             self.polys[idx] = QPolygonF(self.pts[idx])
@@ -314,8 +338,47 @@ def _columns_of(points):
     return got
 
 
+# ---- LOD 抽稀(2026-10-26)--------------------------------------------------
+# 44 万点画在 1200 px 宽的窗口里, 每像素 366 个点 —— 画出来的像素和 4 万个点**一模一样**,
+# 但 QPainter 要一个一个 `QPointF` 地吃, 132 万个就是那 776 ms 的来源。
+# 所以只在**给 QPainter 的几何**上抽稀:
+#   * 同一屏幕像素内的连续点合并成一段(屏幕上本来就是一条直线);
+#   * 强制保留 首末点 / **速度桶变化点**(否则颜色分段的位置会漂) / 静止段(hold);
+# ⚠ **只影响画图** —— `rec.points`(点数据)一个都不动, 所以鼠标悬浮读到的
+#   仍是**每一个原始点**(`_hit_test` 直接用 `rec.points` 全量算距离)。
+MIN_LOD_POINTS = 600         # 少于这么多点就不折腾了(那点数量在屏上本来就没几个像素)
+LOD_PX = 1.0                 # 合并阈值: 1 个屏幕像素
+
+
+def lod_mask(arr, w: float, h: float, vmax: float):
+    """列数组 → 要**保留**的点布尔掩码(见上面的说明)。点数不多时返回 None。"""
+    n = int(arr.shape[1])
+    if _np is None or n <= MIN_LOD_POINTS or w <= 0 or h <= 0:
+        return None
+    xs, ys, sp = arr[1], arr[2], arr[3]
+    # 屏幕像素格号: 同格的点画出来落在同一个像素里, 留首末即可
+    gx = (xs * (w / LOD_PX)).astype(_np.int64)
+    gy = (ys * (h / LOD_PX)).astype(_np.int64)
+    same = (gx[1:] == gx[:-1]) & (gy[1:] == gy[:-1])
+    keep = _np.empty(n, dtype=bool)
+    keep[0] = True
+    keep[-1] = True
+    keep[1:] = ~same
+    # 速度桶一变就必须断开: 否则一条线段两端颜色不同, 画出来的段会取中点那档颜色,
+    # 颜色分段的位置就跟原来不一样了(用户眼睛很尖, 会看出“线色跳了”)
+    if vmax > 0:
+        ratio = _np.clip(sp / vmax, 0.0, 1.0)
+        bucket = _np.minimum(_SPEED_BUCKETS - 1,
+                             (ratio * _SPEED_BUCKETS).astype(_np.int32))
+        flip = bucket[1:] != bucket[:-1]
+        keep[1:] |= flip
+        keep[:-1] |= flip
+    return keep
+
+
 def build_speed_segments(points: list[RoutePoint], vmax: float,
-                         to_px) -> dict[int, QPolygonF]:
+                         to_px, wh: tuple[float, float] | None = None
+                         ) -> dict[int, QPolygonF]:
     """把轨迹按"线段中点速度"分桶, 每段独立存为"一对点"。
 
     关键: 同一桶内的多段**不一定相邻**(速度波动时 A→B、C→D 同桶而 B→C 不同桶),
@@ -327,13 +390,12 @@ def build_speed_segments(points: list[RoutePoint], vmax: float,
     5 条线 3766 个点原本要 30ms)。
 
     **列存储的点走 numpy 分支**(2026-10-26): 分桶索引一次 `argsort` 算完,
-    既不为每个点造 `TrackPoint`, 也不调 44 万次 `bucket_index`。
-    实测 44 万点一局: 原本约 700 ms(含造对象 223 ms) → 约 180 ms ——
-    剩下的全是 88 万个 `QPointF` 构造, 那是 Qt 那边的硬成本。
+    既不为每个点造 `TrackPoint`, 也不调 44 万次 `bucket_index`; `wh` 给了地图在
+    屏幕上的像素尺寸时还会先做 LOD 抽稀(见 `lod_mask`)。
     """
     cols = _columns_of(points)
     if cols is not None:
-        return _segments_from_columns(cols[1], vmax)
+        return _segments_from_columns(cols[1], vmax, wh)
     tmp: dict[int, list[QPointF]] = {}
     for i in range(1, len(points)):
         a, b = points[i - 1], points[i]
@@ -342,13 +404,19 @@ def build_speed_segments(points: list[RoutePoint], vmax: float,
     return {idx: QPolygonF(pts) for idx, pts in tmp.items()}
 
 
-def _segments_from_columns(arr, vmax: float) -> dict[int, QPolygonF]:
+def _segments_from_columns(arr, vmax: float, wh=None) -> dict[int, QPolygonF]:
     """列数组 → 速度分桶折线(索引全在 numpy 里算, 只为输出造 `QPointF`)。"""
     n = int(arr.shape[1])
     if n < 2:
         return {}
+    keep = lod_mask(arr, wh[0], wh[1], vmax) if wh else None
+    sub = arr[:, keep] if keep is not None else arr
+    if keep is not None:
+        n = int(sub.shape[1])
+        if n < 2:
+            return {}
     if vmax > 0:
-        ratio = _np.clip(arr[3] / vmax, 0.0, 1.0)
+        ratio = _np.clip(sub[3] / vmax, 0.0, 1.0)
         mid = (ratio[:-1] + ratio[1:]) * 0.5
         idx = _np.minimum(_SPEED_BUCKETS - 1,
                           (mid * _SPEED_BUCKETS).astype(_np.int32))
@@ -356,7 +424,7 @@ def _segments_from_columns(arr, vmax: float) -> dict[int, QPolygonF]:
         idx = _np.zeros(n - 1, dtype=_np.int32)
     order = _np.argsort(idx, kind="stable")      # 桶内保持原顺序(乱了线会抖)
     sorted_idx = idx[order]
-    xs, ys = arr[1].tolist(), arr[2].tolist()    # 一次 C 级转换, 之后只查表
+    xs, ys = sub[1].tolist(), sub[2].tolist()    # 一次 C 级转换, 之后只查表
     out: dict[int, QPolygonF] = {}
     for b in range(_SPEED_BUCKETS):
         s = int(_np.searchsorted(sorted_idx, b, side="left"))
@@ -479,8 +547,8 @@ class RouteMapView(QWidget):
         # 重新构造几千个 QPointF: 5 条线 3766 个点一次重绘 41ms, 25Hz 刷新直接把界面拖垮
         # (2026-10-08 用户反馈“选 5 条卡得不得了”查到的原因; 分桶几何一项就 30ms)
         self._geom: tuple | None = None            # 当前几何指纹(缩放/平移/尺寸/底图)
-        self._seg_cache: dict[str, tuple] = {}     # route_id -> (点数, {桶: QPolygonF})
-        self._line_cache: dict[str, tuple] = {}    # route_id -> (点数, QPolygonF)
+        self._seg_cache: dict[str, tuple] = {}     # route_id -> (点数, 几何, {桶: QPolygonF})
+        self._line_cache: dict[str, tuple] = {}    # route_id -> (点数, 几何, QPolygonF)
         self._vmax_cache: dict[str, tuple] = {}    # route_id -> (点数, 峰值速度)
         self._times_cache: dict[str, tuple] = {}   # route_id -> (点数, [t...])
         self._bbox_cache: dict[str, tuple] = {}    # route_id -> (点数, 包围盒) 视野裁剪用
@@ -1640,13 +1708,17 @@ class RouteMapView(QWidget):
             self._draw_play_prefix(p, rec, k)
 
     def _play_prefix_geom(self, rec, k: int) -> _LiveGeom:
-        """该线路“已播放前缀”的分桶几何(增量缓存, 供重复绘制用)。"""
+        """该线路“已播放前缀”的分桶几何(增量缓存, 供重复绘制用)。
+
+        ⚠ 不要写成 `pts[:k]`(以前就是): 列存储下切片会为**整条已播放前缀**造一遍
+        点对象, 而这是回放每帧都要调的东西 —— 44 万点的局每帧卡几十毫秒就是这么来的。
+        现在交给 `feed(limit=k)`, 它在列数组上直接读前 k 个。
+        """
         geom = self._play_seg.get(rec.route_id)
         if geom is None:
             geom = _LiveGeom()
             self._play_seg[rec.route_id] = geom
-        pts = rec.points
-        geom.feed(pts if k >= len(pts) else pts[:k], self._vmax(rec))
+        geom.feed(rec.points, self._vmax(rec), limit=k)
         return geom
 
     def _draw_play_prefix(self, p: QPainter, rec, k: int) -> None:
@@ -1804,35 +1876,44 @@ class RouteMapView(QWidget):
     def _speed_segments(self, rec: RouteRecord, vmax: float) -> dict[int, QPolygonF]:
         """按速度分桶的轨迹几何(**归一化坐标**, 缓存; 见 `build_speed_segments`)。
 
-        归一化的好处: 缩放 / 改窗口大小 / 拖动都**不用重算几何** —— 画的时候
-        用 `p.scale(s, s)` 缩放画笔、并把线宽设为 `宽度 / s` 即可
-        (否则每次滚轮缩放都要在 Python 里重算 3766 个点)。
+        归一化的好处: 拖动**不用重算**几何 —— 画的时候用 `p.scale(s, s)` 缩放画笔。
+        但 **LOD 抽稀要看屏幕像素**(2026-10-26), 所以缓存键里带了 `_geom_key()`
+        (含 zoom 与窗口尺寸): 缩放停手 200 ms 后重建图层时会按新比例重算一遍,
+        放大后看到的就是**原始精度**。
         """
         n = len(rec.points)
+        geom = self._geom_key()
         got = self._seg_cache.get(rec.route_id)
-        if got is None or got[0] != n:
-            got = (n, build_speed_segments(rec.points, vmax, _normalized))
+        if got is None or got[0] != n or got[1] != geom:
+            polys = build_speed_segments(rec.points, vmax, _normalized,
+                                         self._map_size())
+            got = (n, geom, polys)
             self._seg_cache[rec.route_id] = got
-        return got[1]
+        return got[2]
 
     def _px_line(self, rec: RouteRecord) -> QPolygonF:
-        """整条轨迹的归一化折线(同样缓存): 灰色历史轨迹与回放未播放段共用。
+        """整条轨迹的归一化折线(同样缓存): 灰色历史轨迹与回放阵亡后的灰线共用。
 
         注意: 只取几何, 颜色/线宽由调用方自己设 —— 回放里它是半透明淡色的底衬。
+        列存储的点先做 LOD 抽稀(见 `lod_mask`), 屏幕上每像素最多一段。
         """
         n = len(rec.points)
+        geom = self._geom_key()
         got = self._line_cache.get(rec.route_id)
-        if got is None or got[0] != n:
+        if got is None or got[0] != n or got[1] != geom:
             cols = _columns_of(rec.points)
             if cols is not None:
-                # 列存储: 直接查表造 QPointF, 省掉 44 万个中间点对象
-                xs, ys = cols[1][1].tolist(), cols[1][2].tolist()
+                arr = cols[1]
+                w, h = self._map_size()
+                keep = lod_mask(arr, w, h, self._vmax(rec))
+                sub = arr[:, keep] if keep is not None else arr
+                xs, ys = sub[1].tolist(), sub[2].tolist()
                 poly = QPolygonF([QPointF(x, y) for x, y in zip(xs, ys)])
             else:
                 poly = QPolygonF([QPointF(pt.x, pt.y) for pt in rec.points])
-            got = (n, poly)
+            got = (n, geom, poly)
             self._line_cache[rec.route_id] = got
-        return got[1]
+        return got[2]
 
     # 旧名(灰色历史轨迹就是这条折线)
     _gray_line = _px_line
@@ -2538,6 +2619,21 @@ class RouteMapView(QWidget):
                 # 回放中只允许命中**已播放**的点(玩家还没走到的路段不该能被选中)
                 n = min(n, self._played_prefix(rec, self._playhead)[0])
             if n <= 0:
+                continue
+            cols = _columns_of(pts)
+            if cols is not None and n >= 400:
+                # 列存储 → numpy **全量**算一遍(44 万点约 3 ms): 比下面的“粗扫 + 邻域精查”
+                # 更准(不是抽样, 没有两级的边界问题), 代码也短。
+                # ⚠ 这里用的是**原始点数据**, 与画图用的 LOD 抽稀几何无关 ——
+                #   所以悬浮读到的永远是每一个原始采样点。
+                arr = cols[1]
+                ddx = arr[1][:n] * w - mx
+                ddy = arr[2][:n] * h - my
+                d2 = ddx * ddx + ddy * ddy
+                k = int(d2.argmin())
+                k_d2 = float(d2[k])
+                if k_d2 < best_d2:
+                    best_d2, best = k_d2, (rec, pts[k])
                 continue
             step = 1 if n <= 400 else n // 400
             # 粗扫(step == 1 时就是全量)
