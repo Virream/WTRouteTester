@@ -909,6 +909,23 @@ def test_window(tmpdir: str):
     assert rw.EYE_COLUMN_WIDTH >= 5 * win.tree.indentation() + ICON_SIZE, (
         f"眼睛列太窄: {rw.EYE_COLUMN_WIDTH}")
 
+    # 1.5) 子项**展开时才建**(500 局不能把 10 万行一次建出来)。但 Qt 里没有子项的
+    #      条目**根本不画展开箭头** —— 所以先挂一个占位行, 否则永远点不开
+    #      (用户 2026-10-26 报的 bug: "全局路线条目无法进一步展开了")
+    #      现实的触发路径: 用户把它折起来 → 改名/删除触发 `_reload_tree()` 重建。
+    items[0].setExpanded(False)
+    win._reload_tree()
+    app.processEvents()
+    items = _global_items(win)
+    assert items[0].data(0, rw._ROLE_LAZY) == g.route_id, "折叠时子项应延后建"
+    ph = _children_kind(items[0], "lazy")
+    assert len(ph) == 1, [ph[i].text(rw._COL_NAME) for i in range(len(ph))]
+    assert "展开载入" in ph[0].text(rw._COL_NAME), ph[0].text(rw._COL_NAME)
+    items[0].setExpanded(True)          # 等价于用户点那个三角
+    app.processEvents()
+    assert not _children_kind(items[0], "lazy"), "展开后占位行要被真子项替换"
+    assert items[0].data(0, rw._ROLE_LAZY) is None
+
     # 2) 展开后分 A / B 两队, 组内按时间正序
     sides = _children_kind(items[0], "gside")
     assert [s.text(rw._COL_NAME) for s in sides] == ["A 队", "B 队"]

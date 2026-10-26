@@ -1056,6 +1056,22 @@ class RouteTesterWindow(QMainWindow):
         parent.addChild(item)
         if item.isExpanded():            # 恢复展开状态后可能已经是展开的
             self._populate_global_item(item)
+        else:
+            self._add_lazy_placeholder(item, g.count())
+
+    def _add_lazy_placeholder(self, item: QTreeWidgetItem, n: int) -> None:
+        """给还没展开的全局条目挂一个占位子项。
+
+        为什么必须有它(Qt 的坑): **QTreeWidget 里没有子项的条目根本不画展开箭头** ——
+        没有箭头就点不开, 也就永远等不到 `itemExpanded`, 于是“展开才建子项”变成了
+        “永远展不开”(用户 2026-10-26 报的 bug)。有了占位行箭头就在, 一展开就换掉。
+        """
+        if n <= 0:
+            return                        # 本来就是空局, 没必要给箭头
+        ph = QTreeWidgetItem(["", f"（展开载入 {n} 条线路）", ""])
+        ph.setFlags(Qt.ItemFlag.NoItemFlags)      # 不可选、不可点
+        ph.setData(0, _ROLE_KIND, "lazy")
+        item.addChild(ph)
 
     def _populate_global_item(self, item: QTreeWidgetItem) -> None:
         """把某个全局条目的子项(队 → 玩家 → 每辆车)建出来 —— **展开时才调**。"""
@@ -1063,6 +1079,8 @@ class RouteTesterWindow(QMainWindow):
         if not gid:
             return
         item.setData(0, _ROLE_LAZY, None)       # 先标记, 免得重入
+        while item.childCount():                # 去掉占位行(真正展开时才走到这里)
+            item.takeChild(0)
         g = self.store.get_global(gid)
         if g is None:
             return
