@@ -1941,15 +1941,18 @@ def test_adopt_and_import_pool(tmpdir: str):
             points=[TrackPoint(0.2, y, 0.0, 0.0), TrackPoint(0.4, y, 3.0, 40.0)],
             side=side, player=f"P{side}", dead=True, death_t=3.0))
     header, blocks, tracks = _pack_global(g)
-    tmpd = os.path.join(tmpdir, "tmpin")
-    os.makedirs(tmpd, exist_ok=True)
-    tmp = os.path.join(tmpd, g.route_id + ss.SUFFIX)
-    ss.write_session(tmp, header, blocks, tracks)
-
     store = RouteStore(os.path.join(tmpdir, "adopt.json"))
-    rec = store.adopt_session(tmp)
+    os.makedirs(store.sessions_dir, exist_ok=True)
+    # 半成品写在 sessions 目录里(不是系统临时目录) —— os.replace 不能跨盘,
+    # 实测 C:\...\Temp → D:\... 直接把三局全部变成“写出来了但读不回来”。
+    part = ss.part_path(store.sessions_dir, g.route_id)
+    ss.write_session(part, header, blocks, tracks)
+    assert not [h for h, _p in ss.scan_dir(store.sessions_dir)], \
+        ".wts.part 是半成品, 启动扫描不该把它当会话"
+
+    rec = store.adopt_session(part)
     assert rec is not None and isinstance(rec, GlobalRecord), rec
-    assert not os.path.exists(tmp), "临时文件应当被**挪走**(不是复制一份)"
+    assert not os.path.exists(part), "半成品应当被**改名带走**(同目录原子替换)"
     final = ss.session_path(store.sessions_dir, g.route_id)
     assert os.path.exists(final), final
     assert store.get_global(g.route_id) is rec
@@ -1966,11 +1969,11 @@ def test_adopt_and_import_pool(tmpdir: str):
     assert again.name_of("wrpl_avg_test") == "avg_test"
 
     # 坏文件: 返回 None(当作这一局失败), 不抛异常
-    bad = os.path.join(tmpd, "bad.wts")
+    bad = os.path.join(tmpdir, "bad.wts")
     with open(bad, "wb") as fh:
         fh.write(b"not a session")
     assert store.adopt_session(bad) is None
-    assert store.adopt_session(os.path.join(tmpd, "missing.wts")) is None
+    assert store.adopt_session(os.path.join(tmpdir, "missing.wts")) is None
 
     # ---- 并行框架的小件 ----
     assert import_pool.default_workers(1) == 1, "单局不该开多进程"

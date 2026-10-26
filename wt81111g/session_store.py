@@ -72,6 +72,11 @@ except Exception:                       # pragma: no cover - 兜底用 zlib
 log = logging.getLogger("session_store")
 
 SUFFIX = ".wts"
+# 并行解析时的**半成品**后缀。为什么不写在系统临时目录里: `os.replace` **不能跨盘**
+# (实测 C:\...\Temp → D:\... 直接 WinError 17 “系统无法将文件移到不同的磁盘驱动器”),
+# 而临时目录默认在 C: 盘、数据常在别的盘 —— 干脆就写在 `sessions\` 里再改名,
+# 同目录的 `os.replace` 是原子的。它不以 `SUFFIX` 结尾, `scan_dir` 不会把它当会话。
+PART_SUFFIX = SUFFIX + ".part"
 MAGIC = b"WTS1"
 FORMAT_VERSION = 1
 HEADER_MAX = 64 * 1024 * 1024        # 头部上限(防御损坏文件里的离谱长度)
@@ -327,6 +332,11 @@ def scan_dir(dir_path: str, *, limit: int | None = None) -> list[tuple[dict, str
 def session_path(dir_path: str, route_id: str) -> str:
     """会话文件的规范路径(文件名 = 清洗过的 route_id)。"""
     return os.path.join(dir_path, safe_name(route_id) + SUFFIX)
+
+
+def part_path(dir_path: str, route_id: str) -> str:
+    """半成品路径(并行解析写入; 接管时 `os.replace` 成 `session_path`)。"""
+    return os.path.join(dir_path, safe_name(route_id) + PART_SUFFIX)
 
 
 def remove_session(dir_path: str, route_id: str) -> bool:

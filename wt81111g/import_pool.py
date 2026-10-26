@@ -7,10 +7,15 @@ GIL 把线程挡死了, 所以只有**多进程**才是真并行。按局又是�
 **为什么单局内部不拆**: `wrpl_reader` 的 32 槽 delta 历史跨包、跨分片共享,
 按分片拆开必然算错(P2 方案里明确排除)。
 
-**怎么把结果搬回来**: 子进程**自己把点打包成 `.wts` 会话文件**写进临时目录,
-只回报几十字节的元数据(点数/玩家数/状态) —— 把几十万点 pickle 回主进程纯属搬砖,
-一次就是几百 MB。主进程用 `RouteStore.adopt_session()` 接管那个已经写好的文件,
-**连打包都省了**(正好也是 `session_store` 拆成一局一文件的红利)。
+**怎么把结果搬回来**: 子进程**自己把点打包成 `.wts` 会话文件**, 只回报几十字节的
+元数据(点数/玩家数/状态) —— 把几十万点 pickle 回主进程纯属搬砖, 一次就是几百 MB。
+主进程用 `RouteStore.adopt_session()` 接管那个文件, **连打包都省了**(正好也是
+`session_store` 拆成一局一文件的红利)。
+
+⚠ **半成品必须写在 `routes.sessions` 目录里(后缀 `.wts.part`), 不能用系统临时目录**:
+`os.replace` 不能跨盘 —— 临时目录默认在 C:, 而数据常在 D:/E: —— 实测直接
+`WinError 17 “系统无法将文件移到不同的磁盘驱动器”`, 三局全部“写出来了但读不回来”。
+同目录改名才是原子的。`.wts.part` 不以 `.wts` 结尾, `scan_dir` 不会把它当会话。
 
 ⚠ 打包版(exe)必须 `multiprocessing.freeze_support()`(见 `route_tester.py`
    `__main__` 的第一行), 否则每个子进程都会重新执行一遍 `main()` —— 开一堆窗口。
@@ -22,8 +27,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import tempfile
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -82,10 +85,11 @@ def _worker_init(log_path: str) -> None:
 
 
 def parse_one(path: str, expect_server: bool | None, calibs: dict,
-              tmp_dir: str, route_id: str) -> dict:
-    """**在子进程里**解析一局 → 写成 `.wts` → 回报元数据。失败也返回 dict。
+              out_dir: str, route_id: str) -> dict:
+    """**在子进程里**解析一局 → 写成半成品 `.wts.part` → 回报元数据。失败也返回 dict。
 
-    返回 `{"ok": True, "session": 临时文件, "route_id":..., "stats": {...}}`
+    `out_dir` 必须是主进程的 `routes.sessions` 目录 —— 同目录才能原子改名(见模块说明)。
+    返回 `{"ok": True, "session": 半成品路径, "route_id":..., "stats": {...}}`
     或 `{"ok": False, "error": "..."}`。
     """
     from .replay_import import build_record, resolve_calib
@@ -101,10 +105,10 @@ def parse_one(path: str, expect_server: bool | None, calibs: dict,
         if route_id:
             rec.route_id = route_id
         header, blocks, tracks = _pack_global(rec)
-        os.makedirs(tmp_dir, exist_ok=True)
-        tmp = os.path.join(tmp_dir, rec.route_id + session_store.SUFFIX)
-        session_store.write_session(tmp, header, blocks, tracks)
-        return {"ok": True, "session": tmp, "route_id": rec.route_id,
+        os.makedirs(out_dir, exist_ok=True)
+        part = session_store.part_path(out_dir, rec.route_id)
+        session_store.write_session(part, header, blocks, tracks)
+        return {"ok": True, "session": part, "route_id": rec.route_id,
                 "stats": asdict(stats), "calib_note": note}
     except BaseException as exc:   # noqa: BLE001 - 子进程里任何异常都要带回主进程
         log.warning("并行解析失败 %s: %s", path, exc, exc_info=True)
@@ -164,7 +168,10 @@ def import_many(paths: list[str], store, *, expect_server: bool | None,
 
     n = len(paths)
     total = max(1, workers or default_workers(n))
-    tmp_dir = tempfile.mkdtemp(prefix="wtrt-import-")
+    # 半成品就写在 `routes.sessions\` 里: 与最终文件**同目录**才能原子改名,
+    # 跨盘时 `os.replace` 会直接失败(踩过, 见模块说明)。
+    out_dir = store.sessions_dir
+    _cleanup_parts(out_dir)                 # 清掉上次取消/崩溃留下的半成品
     calibs = collect_calibs(store)
     done: list = []
     failed: list[tuple[str, str]] = []
@@ -172,11 +179,16 @@ def import_many(paths: list[str], store, *, expect_server: bool | None,
     ex = ProcessPoolExecutor(max_workers=total, initializer=_worker_init,
                             initargs=(log_path,))
     futs: dict = {}
+    parts: list[str] = []                   # 本次发出的半成品路径(取消时清理残留)
     try:
         for path in paths:
-            futs[ex.submit(parse_one, path, expect_server, calibs,
-                           tmp_dir, _new_route_id(store))] = path
+            rid = _new_route_id(store)
+            parts.append(session_store.part_path(out_dir, rid))
+            futs[ex.submit(parse_one, path, expect_server, calibs, out_dir, rid)] = path
         log.info("开始并行解析 %d 局回放(并行度 %d)", n, total)
+        if progress is not None:
+            # 进度条先动一下 + 报出并行度: 否则第一局要等半分钟, 看着像卡死了
+            progress(f"正在并行解析 {n} 局(同时 {total} 局, 每局约半分钟)…", 0.01)
         for k, fut in enumerate(as_completed(futs), 1):
             path = futs[fut]
             name = os.path.basename(path.rstrip("\\/")) or path
@@ -189,7 +201,7 @@ def import_many(paths: list[str], store, *, expect_server: bool | None,
                 continue
             rec = store.adopt_session(res["session"])
             if rec is None:
-                failed.append((name, "会话文件写出来了但读不回来"))
+                failed.append((name, "会话文件写出来了但接管失败 —— 详见日志 route_tester.log"))
                 continue
             done.append((rec, ImportStats(**res["stats"])))
     except Exception as exc:   # noqa: BLE001 - 取消(ImportCancelled)或框架异常
@@ -203,9 +215,29 @@ def import_many(paths: list[str], store, *, expect_server: bool | None,
     finally:
         # wait=False: 取消时**不能**等还在跑的那几局(一局几十秒, 界面会像死了一样)
         ex.shutdown(wait=False, cancel_futures=True)
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except OSError:
-            pass
+        for part in parts:                  # 没被接管的半成品(取消/失败)当场删掉
+            try:
+                os.remove(part)
+            except OSError:
+                pass                        # 可能还在被别的进程写 → 下次开始时再清
     log.info("并行解析结束: 成功 %d, 失败 %d, 取消 %s", len(done), len(failed), cancelled)
     return done, failed, cancelled
+
+
+def _cleanup_parts(dir_path: str) -> None:
+    """删掉上次没来得及接管的半成品(`.wts.part`)。
+
+    正常路径上它们会被 `adopt_session` 改名成正式文件、或者被 `finally` 删掉;
+    只有在“取消时子进程还在写”这种情况下会残留, 所以每次导入前顺手扫一遍。
+    """
+    try:
+        names = os.listdir(dir_path)
+    except OSError:
+        return
+    for name in names:
+        if name.endswith(session_store.PART_SUFFIX):
+            try:
+                os.remove(os.path.join(dir_path, name))
+            except OSError:
+                pass                        # 还在被写 → 留着, 下次再说
+

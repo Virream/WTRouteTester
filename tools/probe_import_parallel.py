@@ -1,4 +1,4 @@
-"""并行导入探针: 同一批回放, **串行 vs 按局并行** 的耗时与结果对比。
+r"""并行导入探针: 同一批回放, **串行 vs 按局并行** 的耗时与结果对比。
 
     python tools\probe_import_parallel.py <回放文件或分片文件夹> [更多...]
 
@@ -37,10 +37,14 @@ def _fingerprint(store) -> list[tuple]:
 
 
 def _prepare(inputs: list[str], want: int) -> tuple[list[str], str]:
-    """局数不够就把第一个输入复制几份, 返回 (路径表, 临时目录)。"""
+    """**只给了 1 局**时把它复制几份凑数(否则比不出并行收益)。
+
+    两个以上输入就照原样测 —— 复制整个分片目录既慢又没意义。
+    返回 (路径表, 临时目录)。
+    """
     paths = list(inputs)
     tmp = tempfile.mkdtemp(prefix="wtrt-probe-")
-    if len(paths) >= want or not inputs:
+    if len(paths) > 1 or not inputs:
         return paths, tmp
     src = inputs[0]
     if os.path.isdir(src):
@@ -52,7 +56,7 @@ def _prepare(inputs: list[str], want: int) -> tuple[list[str], str]:
         shutil.copy2(src, dst)
         paths.append(dst)
         k += 1
-    print(f"(!) 只有 {len(inputs)} 个输入, 已复制 {k - 1} 份凑成 {len(paths)} 局")
+    print(f"(!) 只有 1 个输入, 已复制 {k - 1} 份凑成 {len(paths)} 局")
     return paths, tmp
 
 

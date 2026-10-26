@@ -1878,10 +1878,20 @@ class RouteStore:
         dst = session_store.session_path(self.sessions_dir, rid)
         try:
             os.makedirs(self.sessions_dir, exist_ok=True)
-            os.replace(tmp_path, dst)          # 同盘原子替换
+            os.replace(tmp_path, dst)          # 同目录 → 原子替换
         except OSError as exc:
-            log.error("接管会话失败(挪动文件): %s", exc)
-            return None
+            # ⚠ **跨盘时 `os.replace` 一定失败**(实测 WinError 17: 临时目录在 C:,
+            # 数据在 D:)。并行解析现在写在 `sessions\` 里不会走到这里, 但保不齐
+            # 以后有别的调用方传别处的路径 —— 退化成“复制 + 删源”。
+            log.warning("接管会话: os.replace 失败(%s), 改用复制", exc)
+            try:
+                if os.path.exists(dst):
+                    os.remove(dst)
+                shutil.copyfile(tmp_path, dst)
+                os.remove(tmp_path)
+            except OSError as exc2:
+                log.error("接管会话失败(复制): %s", exc2)
+                return None
         kind = str(head.get("kind") or "route")
         try:
             rec = (self._global_from_header(head, dst) if kind == "global"
