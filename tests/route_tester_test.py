@@ -2817,7 +2817,12 @@ def test_map_manager(tmpdir: str):
     # ---- 值: 直接给输入框 ----
     edit = dlg.table.cellWidget(row, COL_NAME)
     assert isinstance(edit, QLineEdit), type(edit)
-    dlg.table.selectRow(row)
+    # ⚠ 程序化选中一律用 `_select_rows()` 而不是 `selectRow()`: 表格现在是**多选**,
+    #    `selectRow()` 内部走 `selectionCommand(index, nullptr)`, 它会读
+    #    `QGuiApplication::keyboardModifiers()`; 前面的用例用 QTest.mouseClick 模拟过
+    #    Ctrl+左键, 那个 Control 会留在 Qt 的注入状态里 —— 于是“选中已选中的行”变成
+    #    “取消选中”, 选中凭空消失。显式 flag 就不受这个影响。
+    dlg._select_rows([row])
     app.processEvents()
     edit.setText("诺曼底")
     edit.editingFinished.emit()
@@ -2841,7 +2846,7 @@ def test_map_manager(tmpdir: str):
     dlg.table.clearSelection()
     dlg._on_selection_changed()
     assert not dlg.btn_calib.isEnabled(), "没选中就不知道校准哪一张, 按钮要灰着"
-    dlg.table.selectRow(row)
+    dlg._select_rows([row])
     app.processEvents()
     # 用户 2026-10-26 指出的 bug: 只做过本地录制(没导入过任何回放)的地图根本
     # 没有关卡代号 —— 校准了也没地方用(实况录制本来就是 8111 的 0~1 坐标)
@@ -2890,6 +2895,90 @@ def test_map_manager(tmpdir: str):
     persisted = RouteStore(os.path.join(tmpdir, "manager.json"))
     assert persisted.level_of_hash(key) == "avg_finland"
     assert any(g.map_key == "wrpl_avg_finland" for g in persisted.globals)
+
+    # ---- 多选: 一次点击按顺序校完选中的几张(用户 2026-10-26) ----
+    #      多选的用处就在这里: 用户挨个进对局, 软件连着抓,
+    #      不用每张都关窗重开、也不至于"选了多行却只校了第一行"
+    import wt81111g.map_manager as mm
+    from PyQt6.QtWidgets import QDialog, QMessageBox
+
+    from wt81111g.map_calib import MapCalib
+
+    class _FakeCapture:
+        """冒充抓取对话框: 立刻给一份外框(不去碰真 8111)。"""
+
+        calls: list[str] = []
+        calib = None
+        image = None
+
+        def __init__(self, map_key, map_name="", parent=None):
+            _FakeCapture.calls.append(map_key)
+            self.map_key = map_key
+            self.map_name = map_name
+
+        def start(self):
+            _FakeCapture.calib = MapCalib(
+                min_x=-2048.0, max_x=2048.0, min_z=-2048.0, max_z=2048.0,
+                img_w=2048, img_h=2048, source="test")
+            _FakeCapture.image = None          # 只装位置校准, 不动已有底图
+            return QDialog.DialogCode.Accepted
+
+    boxes: list[str] = []
+
+    class _Quiet:
+        StandardButton = QMessageBox.StandardButton
+
+        @staticmethod
+        def information(_parent, _title, text, *_a, **_k):
+            boxes.append(text)
+            return QMessageBox.StandardButton.Ok
+
+    # 第二张图(有底图、有回放关卡) + 第三张图(有底图、**没关联**关卡代号)
+    blob2, blob3 = png_solid("#884422"), png_solid("#224488")
+    key2, key3 = map_key(blob2), map_key(blob3)
+    for k, b in ((key2, blob2), (key3, blob3)):
+        with open(os.path.join(win.map_cache.dir, f"{k}.png"), "wb") as fh:
+            fh.write(b)
+    rep2 = win.store.new_global(map_key="wrpl_avg_netherlands",
+                                map_name="avg_netherlands",
+                                zone_count=2, mode_name="战区攻陷")
+    win.store.add_global(rep2)
+    dlg.reload()
+    app.processEvents()
+    row2, row3 = dlg._row_of_key(key2), dlg._row_of_key(key3)
+    assert row2 >= 0 and row3 >= 0, "缓存里的底图都该列出来"
+    combo2 = dlg.table.cellWidget(row2, COL_LEVEL)
+    combo2.setCurrentIndex(combo2.findData("avg_netherlands"))
+    app.processEvents()
+    assert win.store.level_of_hash(key2) == "avg_netherlands"
+
+    # 只选中没关联的那张 → 按钮灰着(校准对它无处可用)
+    dlg._select_rows([row3])
+    app.processEvents()
+    assert not dlg.btn_calib.isEnabled(), "选中的都没有关卡代号 → 按钮要灰着"
+
+    # 三张全选 → 只校有代号的两张, 没代号的那张跳过并报账
+    dlg._select_rows([row, row2, row3])
+    app.processEvents()
+    order = dlg._selected_keys()          # 按列表行序(不一定等于建行顺序)
+    assert set(order) == {key, key2, key3}, order
+    assert dlg.btn_calib.isEnabled()
+
+    orig_capture, orig_box = mm.CalibCaptureDialog, mm.QMessageBox
+    mm.CalibCaptureDialog, mm.QMessageBox = _FakeCapture, _Quiet
+    try:
+        dlg._calibrate()
+    finally:
+        mm.CalibCaptureDialog, mm.QMessageBox = orig_capture, orig_box
+    app.processEvents()
+    assert _FakeCapture.calls == [k for k in order if k != key3], \
+        f"选中的每一张都要校, 顺序按列表: {_FakeCapture.calls}"
+    assert win.store.calib_of(key) is not None
+    assert win.store.calib_of(key2) is not None
+    assert win.store.calib_of(key3) is None, "没关联关卡代号的那张不该被校准"
+    assert dlg.calib_changed == 2
+    assert set(dlg._selected_keys()) == {key, key2, key3}, "重载列表后多选不该丢"
+    assert boxes and "跳过 1 张" in boxes[-1], boxes
 
     dlg.close()
     win.close()

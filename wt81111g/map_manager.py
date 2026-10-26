@@ -21,14 +21,19 @@
 (见 `_update_calib_state`)。
 
 界面: 左边一条条键值对(键=哈希 / 值=名字输入框 / 可选=关卡代号), 右边是选中那条
-的底图预览, 底部一个「校准地图位置」按钮(**选中且已关联关卡代号**才可用)。
+的底图预览, 底部一个「校准地图位置」按钮。
+
+**按钮作用于选中的条目, 支持多选**(用户 2026-10-26: “既然有选择功能还是让它
+起作用比较好”): Ctrl/Shift 选中几张 → 一次性按顺序校完(每张弹一次抓取窗,
+标题带 `[i/N]` 提示接下来该进哪张图); 选中里混着**没关联关卡代号**的会跳过并在
+最后报账 —— 可用性仍然是“选中里**至少有一张**已关联关卡代号”才亮。
 """
 from __future__ import annotations
 
 import logging
 from functools import partial
 
-from PyQt6.QtCore import QSize, Qt
+from PyQt6.QtCore import QItemSelection, QItemSelectionModel, QSize, Qt
 from PyQt6.QtGui import QPixmap, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout,
@@ -77,7 +82,9 @@ class MapManagerDialog(QDialog):
         self.table.setHorizontalHeaderLabels(["键(地图哈希)", "名字", "可选: 回放关卡代号"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # **多选**(Ctrl/Shift): 「校准地图位置」作用于选中的每一条(用户 2026-10-26)
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
@@ -112,9 +119,11 @@ class MapManagerDialog(QDialog):
         self.btn_calib = QPushButton("校准地图位置")
         self.btn_calib.setEnabled(False)
         self.btn_calib.setToolTip(
-            "先在左边的列表里**选中一条**, 这个按钮才知道要校准哪张图。\n\n"
-            "点它之后: ① 通过 8111 抓这张图的地图图片; ② 记录图片覆盖的世界范围\n"
-            "(即「图片应该摆在哪里」)。抓完会自动装好, 回放线路随即对齐底图。")
+            "先在左边的列表里**选中**要校准的地图(Ctrl/Shift 可以选多张),\n"
+            "这个按钮才知道要校准哪张。\n\n"
+            "点它之后对**选中的每一条**依次: ① 通过 8111 抓这张图的地图图片;\n"
+            "② 记录图片覆盖的世界范围(即「图片应该摆在哪里」)。\n"
+            "抓完会自动装好, 回放线路随即对齐底图。")
         self.btn_calib.clicked.connect(self._calibrate)
         row.addWidget(self.btn_calib)
         self.lbl_summary = QLabel("")
@@ -154,8 +163,10 @@ class MapManagerDialog(QDialog):
         return out
 
     def reload(self) -> None:
-        """重建列表(保留原来的选中行)。"""
-        keep = self._cur_key
+        """重建列表(保留原来的选中行 —— **多选也保留**)。"""
+        keep = self._selected_keys()
+        if not keep and self._cur_key:
+            keep = [self._cur_key]
         self._loading = True
         try:
             self.table.setRowCount(0)
@@ -163,13 +174,44 @@ class MapManagerDialog(QDialog):
                 self._add_row(key)
         finally:
             self._loading = False
-        row = self._row_of_key(keep) if keep else -1
-        if row < 0 and self.table.rowCount():
-            row = 0
-        if row >= 0:
-            self.table.selectRow(row)
+        rows = [r for r in (self._row_of_key(k) for k in keep) if r >= 0]
+        if not rows and self.table.rowCount():
+            rows = [0]
+        self._select_rows(rows)
         self._on_selection_changed()
         self._update_summary()
+
+    def _select_rows(self, rows: list[int]) -> None:
+        """选中这些行(多个也行)。
+
+        ⚠ 不能用 `selectRow()` 循环: 它内部是 `ClearAndSelect`, 后一次会把前一次
+        的选中清掉 —— 多选要用 `QItemSelection` 一次拼出整个选区。
+        """
+        if not rows or self.table.rowCount() == 0:
+            self.table.clearSelection()
+            return
+        last_col = self.table.columnCount() - 1
+        model = self.table.model()
+        sel = QItemSelection()
+        for r in rows:
+            sel.select(model.index(r, 0), model.index(r, last_col))
+        self.table.selectionModel().select(
+            sel, QItemSelectionModel.SelectionFlag.ClearAndSelect
+            | QItemSelectionModel.SelectionFlag.Rows)
+
+    def _selected_keys(self) -> list[str]:
+        """当前选中的地图键 —— 按列表从上到下的顺序(多选时也稳定)。"""
+        model = self.table.selectionModel()
+        if model is None:
+            return []
+        rows = sorted({ix.row() for ix in model.selectedRows()})
+        out: list[str] = []
+        for r in rows:
+            it = self.table.item(r, COL_KEY)
+            key = it.data(Qt.ItemDataRole.UserRole) if it is not None else None
+            if key:
+                out.append(key)
+        return out
 
     def _row_of_key(self, key: str | None) -> int:
         if not key:
@@ -295,44 +337,50 @@ class MapManagerDialog(QDialog):
     def _on_selection_changed(self) -> None:
         if self._loading:
             return
-        key = None
-        model = self.table.selectionModel()
-        rows = model.selectedRows() if model is not None else []
-        if rows:
-            it = self.table.item(rows[0].row(), COL_KEY)
-            key = it.data(Qt.ItemDataRole.UserRole) if it is not None else None
-        self._cur_key = key
+        keys = self._selected_keys()
+        self._cur_key = keys[0] if keys else None      # 预览跟第一张走
         self._update_calib_state()
         self._update_preview()
 
     def _update_calib_state(self) -> None:
-        """「校准地图位置」的可用状态 —— **必须已经关联了回放关卡代号**。
+        """「校准地图位置」的可用状态 —— 看**选中的这一批**, 不再是单条。
 
-        为什么(用户 2026-10-26 指出): 校准记录的是「这张底图覆盖世界哪个矩形(米)」,
-        而唯一用到它的地方是**把回放导入的米制坐标换算成 0~1**。本地实况录制的线路
-        本来就是 8111 给的 0~1, **不需要校准**。所以一张没关联任何回放关卡代号的地图
-        (没导入过那局回放), 校准了也无处可用 —— 以前这个按钮只看"有没有选中行",
-        用户点了会被拉去"进对局校准", 却根本不知道校完干什么。
+        为什么要求已关联回放关卡代号(用户 2026-10-26 指出): 校准记录的是「这张底图
+        覆盖世界哪个矩形(米)」, 而唯一用到它的地方是**把回放导入的米制坐标换算成
+        0~1**。本地实况录制的线路本来就是 8111 给的 0~1, **不需要校准**。所以一张
+        没关联任何回放关卡代号的地图(没导入过那局回放), 校准了也无处可用 ——
+        以前这个按钮只看"有没有选中行", 用户点了会被拉去"进对局校准", 却根本不知道
+        校完干什么。
+
+        多选时(用户 2026-10-26: “既然有选择功能还是让它起作用比较好”): 只要这一批里
+        **至少有一张**已关联就亮着; 混着没关联的会在 `_calibrate` 里跳过并报账。
         """
-        key = self._cur_key
-        level = self.store.level_of_hash(key) if key else ""
-        ok = bool(key) and bool(level)
-        self.btn_calib.setEnabled(ok)
-        if not key:
+        keys = self._selected_keys()
+        ready = [k for k in keys if self.store.level_of_hash(k)]
+        self.btn_calib.setEnabled(bool(ready))
+        if not keys:
             self.btn_calib.setToolTip(
-                "先在左边的列表里**选中一条**, 这个按钮才知道要校准哪张图。")
-        elif not level:
+                "先在左边的列表里**选中**要校准的地图(Ctrl/Shift 可以选多张),\n"
+                "这个按钮才知道要校准哪张。")
+        elif not ready:
             self.btn_calib.setToolTip(
-                "这张图还没有关联**回放关卡代号**, 暂时不能校准。\n\n"
+                "选中的地图都还没有关联**回放关卡代号**, 暂时不能校准。\n\n"
                 "校准记录的是「这张底图覆盖世界哪个矩形(米)」, 只有**从回放导入的线路**\n"
                 "（米制坐标）才用得到它；本地实况录制的线路本来就是 8111 给的 0~1, 不需要。\n\n"
                 "先在右边的「可选」列里把它指到一个关卡代号上（那个代号得先导入过一局\n"
                 "回放才会出现）。")
         else:
-            self.btn_calib.setToolTip(
-                f"校准这张图（回放关卡 {level}）的位置:\n"
-                "点它之后 ① 通过 8111 抓这张图的地图图片 ② 记录图片覆盖的世界范围。\n"
-                "抓完会自动装好, 回放线路随即对齐底图。")
+            names = "、".join(
+                f"{self.store.display_name(k)}（{self.store.level_of_hash(k)}）"
+                for k in ready)
+            tip = ("校准选中的地图:\n"
+                   f"  {names}\n\n"
+                   "点它之后**逐张**处理: ① 通过 8111 抓这张图的地图图片 "
+                   "② 记录图片覆盖的世界范围。\n"
+                   "抓完会自动装好, 回放线路随即对齐底图。")
+            if len(ready) < len(keys):
+                tip += f"\n\n⚠ 选中里另有 {len(keys) - len(ready)} 张没关联关卡代号, 会跳过。"
+            self.btn_calib.setToolTip(tip)
 
     def _update_preview(self) -> None:
         """把右边换成当前选中那条的底图。"""
@@ -440,33 +488,78 @@ class MapManagerDialog(QDialog):
 
     # ------------------------------------------------------------------ 校准
     def _calibrate(self) -> None:
-        """「校准地图位置」: ① 8111 抓图 ② 记录图片覆盖的世界范围。
+        """「校准地图位置」: 对**选中的每一条**依次 ① 8111 抓图 ② 记录世界范围。
 
-        只能对**已经关联了回放关卡代号**的地图做 —— 校准服务的就是回放的米制坐标,
-        没关联就没有回放记录可以用它(见 `_update_calib_state`)。
+        多选(用户 2026-10-26): 用 Ctrl/Shift 选中几张, 一次点击就把它们挨个校完 ——
+        每张弹一次抓取窗, 标题带 `[i/N]`, 所以用户清楚"现在该进哪张图"。
+
+        只对**已经关联了回放关卡代号**的条目动手 —— 校准服务的是回放的米制坐标,
+        没关联就没有回放记录能用它(见 `_update_calib_state`)。同一批里混着没关联的
+        就跳过, 但**最后一起报账**, 免得用户以为软件漏了一张。
         """
-        key = self._cur_key
-        if not key:
+        keys = self._selected_keys()
+        if not keys:
             QMessageBox.information(self, "校准地图位置",
-                                    "请先在左边的列表里选中一张地图")
+                                    "请先在左边的列表里选中要校准的地图"
+                                    "（Ctrl/Shift 可以选多张）")
             return
-        if not self.store.level_of_hash(key):
+        todo = [k for k in keys if self.store.level_of_hash(k)]
+        skipped = [self.store.display_name(k) for k in keys
+                   if not self.store.level_of_hash(k)]
+        if not todo:
             QMessageBox.information(
                 self, "校准地图位置",
-                "这张图还没有关联回放关卡代号, 不需要校准。\n\n"
+                "选中的地图都还没有关联回放关卡代号, 不需要校准。\n\n"
                 "校准记录的是「底图覆盖世界哪个矩形(米)」, 只有从回放导入的线路"
                 "（米制坐标）才用得到; 本地实况录制的线路本来就是 8111 给的 0~1。\n\n"
                 "要校准: 先在右侧的「可选」列里把它指到一个已经导入过回放的关卡代号上。")
             return
-        shown = self.store.display_name(key)
-        level = self.store.level_of_hash(key)
-        dlg = CalibCaptureDialog(key, f"{shown}（{level or key}）", self)
-        if dlg.start() != QDialog.DialogCode.Accepted or dlg.calib is None:
+
+        done: list[str] = []
+        stopped = ""          # 用户在第二张上取消了 → 剩下来几张没校
+        for i, key in enumerate(todo, 1):
+            shown = self.store.display_name(key)
+            title = f"{shown}（{self.store.level_of_hash(key) or key}）"
+            if len(todo) > 1:
+                title = f"[{i}/{len(todo)}] {title}"
+            dlg = CalibCaptureDialog(key, title, self)
+            if dlg.start() != QDialog.DialogCode.Accepted or dlg.calib is None:
+                stopped = shown
+                break
+            done.append(self._install_calib(key, dlg))
+
+        self.reload()
+        if not done:
             self.lbl_summary.setText(
-                f"「{shown}」这次没有校准 —— 想校的时候再点一次「校准地图位置」即可")
+                f"「{stopped}」这次没有校准 —— 想校的时候再选中它点「校准地图位置」即可")
             return
 
+        extra = ""
+        if skipped:
+            extra += (f"\n\n跳过 {len(skipped)} 张没关联回放关卡代号的地图: "
+                      f"{'、'.join(skipped)}\n"
+                      "（校准只服务回放导入的米制坐标; 8111 实况录制的线路本来就是 0~1, "
+                      "要校它先在「可选」里关联一个关卡代号）")
+        if stopped:
+            left = len(todo) - len(done)
+            extra += (f"\n\n在「{stopped}」处取消了, 后面还有 {left} 张没校准"
+                      f" —— 想校就重新选中它们再点一次。")
+        QMessageBox.information(
+            self, "校准地图位置",
+            f"已校准 {len(done)} 张地图:\n\n"
+            + "\n".join("· " + s for s in done)
+            + extra
+            + "\n\n以后这些图的线路都会与底图像素一一对应。")
+        self.lbl_summary.setText(f"已校准 {len(done)} 张地图")
+
+    def _install_calib(self, key: str, dlg: CalibCaptureDialog) -> str:
+        """把抓到的东西装进去: 底图 + 校准 + 重算该关卡已导入的回放记录。
+
+        返回一行给汇总弹窗用的说明。
+        """
         calib = dlg.calib
+        if calib is None:                      # 调用方已经判过, 这里只做类型收窄
+            return f"{self.store.display_name(key)}: 没有拿到校准"
         img_note = "底图已装入"
         if dlg.image and not self.cache.put(key, dlg.image):
             img_note = "底图已存在且不更清晰, 保留原图"
@@ -481,16 +574,11 @@ class MapManagerDialog(QDialog):
             renum = renormalize_map_records(self.store, key, calib)
         except Exception as exc:                        # noqa: BLE001
             log.warning("重算回放记录坐标失败: %s", exc)
-
-        self.reload()
-        extra = f"\n已按新校准重算了 {renum} 条回放记录的位置。" if renum else ""
-        QMessageBox.information(
-            self, "校准地图位置",
-            f"「{shown}」校准完成\n\n"
-            f"{calib.describe()}\n{img_note}{extra}\n\n"
-            f"以后这张图的所有线路都会与底图像素一一对应"
-            f"（1 像素 = {calib.span_x / max(1, calib.img_w):.2f} 米）。")
         log.info("地图管理: 校准 %s (%s)", key, calib.describe())
+        line = f"{self.store.display_name(key)}: {calib.describe()} · {img_note}"
+        if renum:
+            line += f" · 重算了 {renum} 条回放线路"
+        return line
 
     # ------------------------------------------------------------------ 收尾
     def done(self, result: int) -> None:
