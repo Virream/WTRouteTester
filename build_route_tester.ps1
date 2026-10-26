@@ -88,6 +88,10 @@ $ErrorActionPreference = "Stop"
 
 if ($OneFile) {
     Write-Host "== 3/3 打包单文件版 =="
+    # 与 onedir 那段同一个坑: PyInstaller 6.21+ 把 INFO 写 stderr, 而这里
+    # $ErrorActionPreference 还是 "Stop"(第 87 行 trim_qt 之后设回来的) ——
+    # 不放宽的话**整个单文件版根本打不出来**, 且报的是一堆看不懂的 ParserError。
+    $ErrorActionPreference = "Continue"
     & $py -m PyInstaller `
         --noconfirm `
         --onefile `
@@ -100,6 +104,7 @@ if ($OneFile) {
         @calibArgs `
         @glArgs `
         route_tester.py 2>&1 | Write-Host
+    if ($LASTEXITCODE -ne 0) { Write-Host "!! PyInstaller(单文件) 失败(exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
 }
 
 if (Test-Path $dataBak) {
