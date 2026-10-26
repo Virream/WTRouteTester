@@ -63,18 +63,6 @@ class MapManagerDialog(QDialog):
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(8)
 
-        tip = QLabel(
-            "一张地图可能以两种身份进来: 8111 录制的是**图片哈希**(如 c59f768c0fde), "
-            "回放文件解析出来的是**关卡代号**(如 avg_finland)。\n"
-            "8111 本身不给地图名, 所以同一张图会被当成两张。在这里把「可选」一栏选成"
-            "那个关卡代号, 两者就归成同一张图:\n"
-            "回放的线路会挂到这张图下面, 用它的底图和校准, 显示名也用你起的名字。\n"
-            "选错了随时改回来(或改回「未选择」), 数据不会丢。"
-        )
-        tip.setWordWrap(True)
-        tip.setStyleSheet("color:#94a3b8;")
-        root.addWidget(tip)
-
         body = QHBoxLayout()
         body.setSpacing(10)
 
@@ -315,6 +303,10 @@ class MapManagerDialog(QDialog):
 
         这是整个机制里**唯一**会改变地图归属的动作, 而且它只改 `map_levels` 这张
         映射表 —— 记录的 `map_key` 一个都不动, 所以改错能改回来。
+
+        关联之后还要做一件事: 那个关卡**已经导入过的**线路是按当初的估算范围归一化
+        的, 现在能拿到这张图的校准了, 得把它们重算一遍 —— 否则用户会发现"关联了,
+        但线路还是歪的"(用户 2026-10-26 描述的场景正是要它们对齐)。
         """
         if self._loading:
             return
@@ -326,14 +318,25 @@ class MapManagerDialog(QDialog):
             return
         self.renamed += 1
         shown = self.store.display_name(key)
+        renum = 0
         if level:
+            calib = self.store.calib_of(key)
+            if calib is not None:
+                try:
+                    from .replay_import import renormalize_map_records   # 懒导入
+                    renum = renormalize_map_records(self.store, key, calib)
+                    self.calib_changed += 1        # 线路位置变了 → 主窗口要重画
+                except Exception as exc:                            # noqa: BLE001
+                    log.warning("按新校准重算回放记录失败: %s", exc)
+        if level:
+            tail = f", 已按这张图的校准重算了 {renum} 条线路" if renum else ""
             self.lbl_summary.setText(
-                f"已关联: {shown} ← 回放关卡 {level}"
-                f"(该关卡的线路现在挂在这张图下面)")
+                f"已关联: {shown} ← 回放关卡 {level}{tail}")
         else:
             self.lbl_summary.setText(
                 f"已解除关联: {shown} 不再对应回放关卡 {old}")
-        log.info("地图管理: %s 的关卡代号 %r -> %r", key, old, level)
+        log.info("地图管理: %s 的关卡代号 %r -> %r (重算 %d 条)",
+                 key, old, level, renum)
         self._update_preview()
         self._update_summary()
 

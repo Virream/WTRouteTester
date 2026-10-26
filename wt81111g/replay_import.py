@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -25,6 +26,8 @@ from .map_calib import MAP_KEY_PREFIX, MapCalib, level_of, load_bundled
 from .route_store import GlobalRecord, TrackPoint, UnitLife
 from .wrpl_reader import EXT_MASK_UID, ReplayData, load_replay
 from .zones import mode_name as zone_mode_name
+
+log = logging.getLogger("replay_import")
 
 # 归一化后仍超出 [0,1] 的点按边界截断（远处 AI 会落在框外）
 GAP_SPLIT_SEC = 45.0        # 相邻采样超过这么久 → 认为是两段（死了/长时间无上报）

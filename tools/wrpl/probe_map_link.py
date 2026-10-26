@@ -189,6 +189,42 @@ def main() -> int:
     check("记录还在", any(g.map_key == REPLAY_KEY for g in again.globals))
     check("校准还在", again.calib_of(REPLAY_KEY) is not None)
 
+    print("\n--- 8) 在界面里关联 → 已导入的回放线路自动按新校准重算 ---")
+    from wt81111g.route_store import TrackPoint, UnitLife
+
+    # 造一条"当初还没有校准、按估算范围归一化"的线路
+    old_rect = [-3000.0, 3000.0, -3000.0, 3000.0]
+    life = UnitLife(life_id="probe:1", map_key=REPLAY_KEY)
+    life.points.append(TrackPoint(x=0.5, y=0.5, t=1.0))   # 旧矩形中心 = 世界 (0, 0)
+    replay.sides["A"].append(life)
+    replay.norm_rect = list(old_rect)
+    store.set_map_level(HASH_KEY, "")          # 先退回"未关联"
+    store.save()
+
+    dlg2 = MapManagerDialog(store, cache)
+    row2 = next(r for r in range(dlg2.table.rowCount())
+                if dlg2.table.item(r, COL_KEY).data(Qt.ItemDataRole.UserRole) == HASH_KEY)
+    combo2 = dlg2.table.cellWidget(row2, COL_LEVEL)
+    before = dlg2.calib_changed
+    combo2.setCurrentIndex(combo2.findData(LEVEL))     # = 用户在下拉框里选中关卡代号
+    app.processEvents()
+
+    check("关联生效", store.level_of_hash(HASH_KEY) == LEVEL)
+    check("记录的归一化矩形已换成校准矩形",
+          replay.norm_rect == [0.0, 2048.0, 0.0, 2048.0], f"={replay.norm_rect}")
+    px = life.points[0]
+    check("线路坐标按新校准重算了",
+          abs(px.x - 0.0) < 1e-6 and abs(px.y - 1.0) < 1e-6,
+          f"=({px.x:.4f}, {px.y:.4f})")
+    check("主窗口会被通知重画(calib_changed 增加)",
+          dlg2.calib_changed == before + 1, f"={before} → {dlg2.calib_changed}")
+    # 解除关联不该把坐标改回去(那属于又一次重算, 没有旧矩形可用)
+    combo2.setCurrentIndex(combo2.findData(""))
+    app.processEvents()
+    check("解除关联后记录本身没被破坏",
+          replay.norm_rect == [0.0, 2048.0, 0.0, 2048.0], f"={replay.norm_rect}")
+    dlg2.close()
+
     print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
     return 0 if not fails else 1
 
