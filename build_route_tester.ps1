@@ -61,6 +61,11 @@ if (Test-Path (Join-Path $root "assets\map_calib")) {
     $n = (Get-ChildItem (Join-Path $root "assets\map_calib") -Filter *.json).Count
     Write-Host "   (已带上 $n 份预置地图校准)"
 }
+# ⚠ PyInstaller 6.21 起把 INFO 日志写到 **stderr**; PowerShell 5.1 在
+#   $ErrorActionPreference="Stop" 下会把外部程序的 stderr 当成致命错误而中断
+#   (报 NativeCommandError, 打包根本没跑完)。所以这一段临时放宽, 改用自己的
+#   exit code 判定 —— 真正的失败仍然会中止。
+$ErrorActionPreference = "Continue"
 & $py -m PyInstaller `
     --noconfirm `
     --clean `
@@ -73,10 +78,13 @@ if (Test-Path (Join-Path $root "assets\map_calib")) {
     --add-data "icon\icon_512X512_WTRouteTester.png;icon" `
     @calibArgs `
     @glArgs `
-    route_tester.py
+    route_tester.py 2>&1 | Write-Host
+if ($LASTEXITCODE -ne 0) { Write-Host "!! PyInstaller 失败(exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
 
 Write-Host "== 2/3 精简 Qt 体积(保留 jpeg/webp 图片插件, 保证地图图片可解码) =="
-& $py "tools\trim_qt.py" WTRouteTester --keep-imageformats
+& $py "tools\trim_qt.py" WTRouteTester --keep-imageformats 2>&1 | Write-Host
+if ($LASTEXITCODE -ne 0) { Write-Host "!! trim_qt 失败(exit $LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+$ErrorActionPreference = "Stop"
 
 if ($OneFile) {
     Write-Host "== 3/3 打包单文件版 =="
@@ -91,7 +99,7 @@ if ($OneFile) {
         --add-data "icon\icon_512X512_WTRouteTester.png;icon" `
         @calibArgs `
         @glArgs `
-        route_tester.py
+        route_tester.py 2>&1 | Write-Host
 }
 
 if (Test-Path $dataBak) {
