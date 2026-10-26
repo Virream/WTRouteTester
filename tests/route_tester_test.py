@@ -1806,13 +1806,25 @@ def test_eye_visibility_opacity(tmpdir: str):
 
 
 def test_store_bom(tmpdir: str):
-    """存储格式: `data/routes.json` 是 **gzip 压缩的 JSON**(2026-10-22 起)。
+    """存储格式: **一局一个二进制会话文件**(2026-10-26 起, 为支撑 500~600 局)。
 
-    动机是体积与加载速度: 实测 3.49MB → 0.47MB(7.4 倍), 加载 80ms → 63ms
-    (磁盘少读 7.4 倍, 省下的 IO 多于解压)。
-    **不做旧格式兼容**(自用软件, 数据可随时重录) —— 所以这里只验证 gzip 往返:
-    写出来的必须是 gzip 魔数, 存进去的东西一字不差地读回来。
+    以前是一个 `routes.json` 装完全部(gzip JSON) —— 一局回放就 80 万点, 五百局
+    会是 5~6 GB 的单文件, 而且**改个地图名都要重写整个文件**。现在:
+
+    * `xxx.json` 只放**地图级小数据**(普通 JSON, 几 KB);
+    * `xxx.sessions/<route_id>.wts` 一局一个(头部 JSON + 每条线一个 zstd 点块);
+    * 加载只读头部, **点用到哪局才读哪局**(`LazyPoints`);
+    * 保存只重写**变过的那一局**。
+
+    这条用例把这几条都钉住: 格式、往返、惰性 + 元数据、只写一局、坏文件自愈、
+    删记录连文件一起删、旧格式自动迁移。
     """
+    import gzip
+    import json
+
+    from wt81111g import session_store as ss
+    from wt81111g.route_store import LazyPoints
+
     path = os.path.join(tmpdir, "fmt_routes.json")
     store = RouteStore(path)
     rec = store.new_route("AAA", "地图 A", "T", 0.2, 0.2)
@@ -1821,19 +1833,87 @@ def test_store_bom(tmpdir: str):
     store.add(rec)
     store.save_now()                  # save() 是异步请求, 这里要立刻看到文件
 
-    raw = open(path, "rb").read()
-    assert raw[:2] == b"\x1f\x8b", "save() 应该写 gzip"
+    with open(path, encoding="utf-8") as fh:
+        meta = json.load(fh)
+    assert meta["layout"] == "sessions-v1", meta.keys()
+    assert "routes" not in meta and "globals" not in meta, "点数据不该再进 meta"
+    assert meta["map_names"] == {}, meta["map_names"]
+
+    spath = ss.session_path(store.sessions_dir, rec.route_id)
+    assert os.path.exists(spath), spath
+    with open(spath, "rb") as fh:
+        assert fh.read(4) == ss.MAGIC, "会话文件要有魔数"
+    assert os.path.getsize(spath) < 4096, "两个点不该写出一大坨"
+
+    # ---- 往返 + 惰性: 看元数据不该触发读点 ----
     again = RouteStore(path)
     assert len(again.routes) == 1, again.routes
-    assert again.routes[0].route_id == rec.route_id
-    assert again.routes[0].points[-1].speed == 30.0
-    assert abs(again.routes[0].points[-1].x - 0.3) < 1e-9
+    got = again.routes[0]
+    assert got.route_id == rec.route_id
+    assert isinstance(got.points, LazyPoints) and not got.points.loaded
+    assert got.point_count == 2
+    assert abs(got.vmax - 30.0) < 0.1, got.vmax        # 头部里的元数据
+    assert got.duration == 5.0
+    assert not got.points.loaded, "只读元数据不该把点读进来"
+    assert got.points[-1].speed == 30.0                # 真用到时才加载
+    assert got.points.loaded
+    # float32 在 0~1 附近的分辨率约 1e-8, 比数据本身的 round(x, 5) 还细两个数量级
+    assert abs(got.points[-1].x - 0.3) < 1e-6, got.points[-1].x
 
-    # 写坏了(不是 gzip) → 当没有数据, 不抛异常、不拿半截数据当完整数据
-    open(path, "wb").write(b"not a gzip file")
-    broken = RouteStore(path)
-    assert not broken.routes and not broken.globals, broken.routes
-    results.append("存储: routes.json 为 gzip(往返一致 / 损坏文件当空数据) OK")
+    # ---- 只写变过的那一局: 改地图级小数据时, 会话文件一个字节都不动 ----
+    with open(spath, "rb") as fh:
+        before = fh.read()
+    stamp = os.stat(spath).st_mtime_ns
+    store.set_map_hidden("AAA", True)
+    store.save_now()
+    with open(spath, "rb") as fh:
+        assert fh.read() == before, "只改了地图级数据, 不该重写轨迹文件"
+    assert os.stat(spath).st_mtime_ns == stamp
+    with open(path, encoding="utf-8") as fh:
+        assert json.load(fh)["hidden_maps"] == ["AAA"]
+
+    # ---- 删记录 → 会话文件一起删 ----
+    store2 = RouteStore(path)
+    assert store2.remove(rec.route_id)
+    store2.save_now()
+    assert not os.path.exists(spath), "删了记录就该把文件也删掉"
+
+    # ---- 坏会话文件: 跳过它, 不抛异常、不拿半截数据当完整数据 ----
+    with open(spath, "wb") as fh:
+        fh.write(b"not a session file")
+    assert not RouteStore(path).routes
+
+    # ---- 旧格式(gzip 整包)自动迁移 ----
+    legacy_path = os.path.join(tmpdir, "legacy.json")
+    payload = {
+        "version": 2,
+        "map_names": {"OLD": "老地图"}, "hidden_maps": [],
+        "known_maps": ["OLD"], "map_zones": {}, "map_calib": {}, "map_levels": {},
+        "routes": [{
+            "route_id": "old1", "map_key": "OLD", "map_name": "老地图",
+            "vehicle": "T", "created_at": "2026-01-01T00:00:00", "duration": 2.0,
+            "start_x": 0.1, "start_y": 0.1,
+            "points": [[0.0, 0.1, 0.1, 0.0, 0.0, 0.0],
+                       [2.0, 0.5, 0.5, 12.0, 0.0, 0.0]],
+            "marks": [[0.1, 0.1, 0.0, "start"]],
+        }],
+        "globals": [],
+    }
+    with gzip.open(legacy_path, "wb") as fh:
+        fh.write(json.dumps(payload).encode("utf-8"))
+    migrated = RouteStore(legacy_path)
+    assert len(migrated.routes) == 1, migrated.routes
+    assert migrated.routes[0].route_id == "old1"
+    assert migrated.routes[0].points[1].speed == 12.0
+    assert len(migrated.routes[0].marks) == 1
+    assert migrated.name_of("OLD") == "老地图"
+    assert os.path.exists(legacy_path + ".v1.bak"), "旧文件要留档, 不删"
+    with open(legacy_path, encoding="utf-8") as fh:
+        assert json.load(fh)["layout"] == "sessions-v1"
+    reopened = RouteStore(legacy_path)
+    assert len(reopened.routes) == 1 and reopened.routes[0].points[1].speed == 12.0
+
+    results.append("存储: 一局一文件(往返 / 惰性 / 只写变过的 / 坏文件自愈 / 旧格式迁移) OK")
 
 
 def test_playback_lock(tmpdir: str):

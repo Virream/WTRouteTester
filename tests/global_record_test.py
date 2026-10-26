@@ -805,9 +805,10 @@ def test_store(tmpdir: str):
     assert got is not None and got.count() == 1, "全局条目没有落盘/读回"
     l2 = got.lives("A")[0]
     assert l2.icon == "MediumTank" and l2.map_key == "MAP1"
-    assert len(l2.points) == 2 and abs(l2.points[1].t - 3.5) < 1e-9
-    assert abs(l2.points[1].x - 0.3) < 1e-9
-    assert abs(l2.points[1].speed - 42.5) < 1e-9, "速度没存住"
+    # 点用 float32 存(0~1 附近分辨率约 1e-8, 比 round(x, 5) 还细), 所以容差 1e-6
+    assert len(l2.points) == 2 and abs(l2.points[1].t - 3.5) < 1e-6
+    assert abs(l2.points[1].x - 0.3) < 1e-6
+    assert abs(l2.points[1].speed - 42.5) < 1e-6, "速度没存住"
 
     # 标记: 同一队只能指向一条记录(打新的会自动清掉旧的)
     g2 = again.new_global("MAP1", "地图 1")

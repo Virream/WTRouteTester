@@ -12,27 +12,21 @@
   单战区会从 3 个位置里随机), 但它们**不再分开归类** —— 侧栏只按战区数量分成
   战区争夺(1)/战区攻陷(2)/战区控制(3)。
 
-数据文件: <data_dir>/routes.json
-**文件名叫 .json, 内容其实是 gzip 压缩的 JSON**(2026-10-22 起):
-实测 3.49MB 的明文压到 0.47MB(7.4 倍), 而加载反而**更快**(80ms → 63ms)——
-磁盘少读 7.4 倍, 省下的 IO 时间多于解压开销。
-**不兼容旧格式**(自用软件, 数据可随时重录): 读不回来就当没有数据。
-想看内容: `python -m gzip -dc data/routes.json`, 或直接用 `tools/probe_turn_radius.py`
-(那个工具同时支持 gzip 和明文 —— `backups/` 里的备份是明文)。
+数据文件(2026-10-26 起, 为了支持 500~600 局):
 
-结构:
-{
-  "version": 1,
-  "map_names": {"<地图指纹>": "地图名"},
-  "hidden_maps": ["<地图指纹>", ...],
-  "known_maps": ["<地图指纹>", ...],
-  "map_zones": {"<地图指纹>": [{"sig": .., "count": .., "mode": ..,
-                               "zones": [{"label": .., "x": .., "y": ..}],
-                               "seen_at": ..}, ...]},
-  "map_calib": {"<地图键>": {MapCalib 的字典(世界矩形 + 图片尺寸)}},
-  "routes": [ {路线记录}, ... ],
-  "globals": [ {全局录制条目}, ... ]
-}
+* `<data_dir>/routes.json`(**普通 JSON, 只有几十 KB**)—— 地图名 / 隐藏标记 /
+  已知地图 / 战区布局 / 地图校准 / 关卡代号关联这些**小数据**;
+* `<data_dir>/routes.sessions/<route_id>.wts` —— **一局一个二进制会话文件**
+  (格式见 `session_store.py`: 小 JSON 头部 + 每条线路一个 zstd 压缩的点块)。
+
+为什么拆: 一局回放实测约 80 万点。五百局 = 4 亿点 —— 单文件会到 5~6 GB, 而且
+**改个地图名都要重写整个文件**; 全量常驻内存则要几十 GB。
+
+现在:
+* 启动只读每个会话文件开头几 KB 的头部(500 局几十毫秒, 且**与总点数无关**);
+* 保存只重写**变过的那一局**(3~5 MB, 一百多毫秒), 改名字只写几 KB 的 meta;
+* 点数据**用到哪局才读哪局**(见 `LazyPoints`), 侧栏/悬停要的是元数据
+  (点数 / 首末时刻 / 最高速), 头部里已经带着, 不用为此读点。
 
 `map_calib` 是「回放里的世界米 → 底图像素」的变换(见 `map_calib.py`)。
 **只有回放导入的线路需要它** —— 战局内录的轨迹本来就是 8111 的归一化坐标,
@@ -55,6 +49,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 
+from . import session_store
 from .config import data_dir
 from .garage import GARAGE_MAP_SHA1
 from .map_calib import MAP_KEY_PREFIX, MapCalib
@@ -71,6 +66,154 @@ SAVE_DEBOUNCE_S = 0.08
 # **测试/探针用**: 置 True 时 `save()` 改回同步写盘。
 # 它们有大量“写完立刻重读”的断言, 不置的话每处都得自己叫 `save_now()`。
 SYNC_SAVE = False
+
+
+class LazyPoints(list):
+    """**占位点列表**: 第一次被访问时才真的从会话文件读出来。
+
+    为什么要继承 `list` 而不是“去掉字段改成属性”: 全项目有 100 多处
+    `rec.points[...]` / `len(...)` / `for p in ...`, 继承 `list` 之后这些**一行都不用改**,
+    也就不会出现“用到点却忘了先加载”(那类 bug 表现为线路画不出来, 极难查)。
+
+    只在 `RouteStore._load()` 里用它顶替真的点列表; 读出来之后就地把数据填充进自己
+    (引用不变), 后面的访问就是普通列表了。
+
+    `loaded` 供界面判断: 侧栏/悬停要的是“点数、首末时刻、最高速”这几项元数据,
+    提前存在记录里, 不用为了显示它们把几十万点读进来。
+    """
+
+    __slots__ = ("_loader", "loaded")
+
+    def __init__(self, loader):
+        super().__init__()
+        self._loader = loader
+        self.loaded = False
+
+    def _ensure(self) -> None:
+        if self.loaded:
+            return
+        self.loaded = True
+        loader, self._loader = self._loader, None
+        try:
+            data = loader() if loader is not None else None
+        except Exception:            # noqa: BLE001 - 读坏文件不能把界面炸掉
+            log.exception("延迟加载线路点失败")
+            data = None
+        if data:
+            list.extend(self, data)
+
+    # ---- 读(全部先确保加载)
+    def __len__(self):
+        self._ensure()
+        return list.__len__(self)
+
+    def __iter__(self):
+        self._ensure()
+        return list.__iter__(self)
+
+    def __getitem__(self, key):
+        self._ensure()
+        return list.__getitem__(self, key)
+
+    def __contains__(self, item):
+        self._ensure()
+        return list.__contains__(self, item)
+
+    def __reversed__(self):
+        self._ensure()
+        return list.__reversed__(self)
+
+    def __eq__(self, other):
+        self._ensure()
+        return list.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __repr__(self):
+        self._ensure()
+        return list.__repr__(self)
+
+    def __bool__(self):
+        self._ensure()
+        return list.__len__(self) > 0
+
+    def __add__(self, other):
+        self._ensure()
+        return list.__add__(self, other)
+
+    def __radd__(self, other):
+        self._ensure()
+        return list.__radd__(self, other)
+
+    def __mul__(self, n):
+        self._ensure()
+        return list.__mul__(self, n)
+
+    def __rmul__(self, n):
+        self._ensure()
+        return list.__rmul__(self, n)
+
+    def copy(self):
+        self._ensure()
+        return list.copy(self)
+
+    def count(self, item):
+        self._ensure()
+        return list.count(self, item)
+
+    def index(self, *args):
+        self._ensure()
+        return list.index(self, *args)
+
+    # ---- 写(先加载再改, 否则会把还没读出来的点冲掉)
+    def __setitem__(self, key, value):
+        self._ensure()
+        list.__setitem__(self, key, value)
+
+    def __delitem__(self, key):
+        self._ensure()
+        list.__delitem__(self, key)
+
+    def append(self, item):
+        self._ensure()
+        list.append(self, item)
+
+    def extend(self, items):
+        self._ensure()
+        list.extend(self, items)
+
+    def insert(self, index, item):
+        self._ensure()
+        list.insert(self, index, item)
+
+    def pop(self, *args):
+        self._ensure()
+        return list.pop(self, *args)
+
+    def remove(self, item):
+        self._ensure()
+        list.remove(self, item)
+
+    def clear(self):
+        self._ensure()
+        list.clear(self)
+
+    def sort(self, *args, **kwargs):
+        self._ensure()
+        list.sort(self, *args, **kwargs)
+
+    def reverse(self):
+        self._ensure()
+        list.reverse(self)
+
+    def __iadd__(self, other):
+        self.extend(other)
+        return self
+
+    def __imul__(self, n):
+        self._ensure()
+        return list.__imul__(self, n)
 
 
 def _read_payload(path: str) -> dict | None:
@@ -152,6 +295,27 @@ class RouteRecord:
     zone_count: int = 0
     zone_signature: str = ""
     mode_name: str = ""
+    # ---- **磁盘元数据**(从会话文件加载时填, 见 `LazyPoints`)--------------
+    n_pts: int = 0
+    vmax_hint: float = 0.0
+
+    @property
+    def point_count(self) -> int:
+        """点数 —— 没加载时用头部里的数, 不会因此读点。"""
+        pts = self.points
+        if isinstance(pts, LazyPoints) and not pts.loaded:
+            return self.n_pts
+        return len(pts)
+
+    @property
+    def vmax(self) -> float:
+        """这条线的最高速度(km/h)。"""
+        pts = self.points
+        if isinstance(pts, LazyPoints) and not pts.loaded:
+            return self.vmax_hint
+        if not self.vmax_hint:
+            self.vmax_hint = max((p.speed for p in pts), default=0.0)
+        return self.vmax_hint
 
     @property
     def label(self) -> str:
@@ -340,6 +504,13 @@ class UnitLife:
     player: str = ""
     # 内部型号名（如 `tankModels/cn_ztz_96b`），画图标/查类别可以用。
     vehicle_cls: str = ""
+    # ---- **磁盘元数据**(只有从会话文件加载时才有值)-----------------------
+    # 侧栏/悬停要的是点数、首末时刻、最高速, 但**不该为此把几十万点读进来**:
+    # 这几项就存在会话头部里, 加载时直接填进来(见 `LazyPoints`)。
+    n_pts: int = 0
+    t0_hint: float = 0.0
+    t1_hint: float = 0.0
+    vmax_hint: float = 0.0
 
     @property
     def route_id(self) -> str:
@@ -362,7 +533,10 @@ class UnitLife:
 
     @property
     def t0(self) -> float:
-        return self.points[0].t if self.points else 0.0
+        pts = self.points
+        if isinstance(pts, LazyPoints) and not pts.loaded:
+            return self.t0_hint      # 还没读点 → 用头部里的元数据(侧栏只靠它)
+        return pts[0].t if pts else 0.0
 
     @property
     def t1(self) -> float:
@@ -371,10 +545,31 @@ class UnitLife:
         静止段的采样被折叠成“一个点 + hold”(见 `TrackPoint.hold`), 所以末点的
         有效结束时刻是 `t + hold`; 旧数据没 hold → 与以前完全一致。
         """
-        if not self.points:
+        pts = self.points
+        if isinstance(pts, LazyPoints) and not pts.loaded:
+            return self.t1_hint
+        if not pts:
             return 0.0
-        last = self.points[-1]
+        last = pts[-1]
         return last.t + float(getattr(last, "hold", 0.0) or 0.0)
+
+    @property
+    def point_count(self) -> int:
+        """点数 —— 没加载时用头部里的数, 不会因此读点。"""
+        pts = self.points
+        if isinstance(pts, LazyPoints) and not pts.loaded:
+            return self.n_pts
+        return len(pts)
+
+    @property
+    def vmax(self) -> float:
+        """这条线的最高速度(km/h) —— 没加载时用头部里的值。"""
+        pts = self.points
+        if isinstance(pts, LazyPoints) and not pts.loaded:
+            return self.vmax_hint
+        if not self.vmax_hint:
+            self.vmax_hint = max((p.speed for p in pts), default=0.0)
+        return self.vmax_hint
 
     @property
     def duration(self) -> float:
@@ -491,6 +686,25 @@ class GlobalRecord:
     #    "x": 东, "z": 北, "dx": 朝向东分量, "dz": 朝向北分量,
     #    "length": 米, "width": 米, "est": True}
     airfields: list[dict] = field(default_factory=list)
+    # ---- 磁盘元数据(从会话文件加载时才有)--------------------------------
+    # 线路数存在**会话头部**里: 侧栏“N 条”不用为了计数去读线路清单。
+    n_lives: int = 0
+    # 线路清单(玩家/型号/点数/点块位置)存在文件的**第二段**; 展开那一局时才读。
+    # 它是 `_fill_lives(rec)` 这种回调 —— 读完自己清空, 不会重复读。
+    _dir_loader: object = None
+
+    def _ensure_dir(self) -> None:
+        """首次需要 `sides` 时把线路清单读进来(见 `session_store.read_tracks`)。"""
+        loader, self._dir_loader = self._dir_loader, None
+        if loader is not None:
+            try:
+                loader(self)
+            except Exception:      # noqa: BLE001 - 读坏文件不能把界面炸掉
+                log.exception("读取线路清单失败: %s", self.route_id)
+
+    def sides_loaded(self) -> bool:
+        """线路清单读过没(没读过不代表没有线路 —— 见 `n_lives`)。"""
+        return self._dir_loader is None
 
     def zone_state_entry(self, t: float, side: str = "") -> dict | None:
         """取回放时刻 `t` 的战区快照**整条**(`{"t","side","zones"}`); 没有返回 None。
@@ -568,9 +782,14 @@ class GlobalRecord:
         return " ".join(s for s in GLOBAL_SIDES if s in self.marks)
 
     def lives(self, side: str) -> list[UnitLife]:
+        self._ensure_dir()
         return self.sides.get(side) or []
 
     def count(self) -> int:
+        """线路总数 —— 清单未加载时用会话头部里的数(不为了报数去读清单)。"""
+        if self._dir_loader is not None:
+            return max(int(self.n_lives or 0),
+                       sum(len(v) for v in self.sides.values()))
         return sum(len(v) for v in self.sides.values())
 
     def timeline_note(self) -> str:
@@ -591,7 +810,7 @@ class GlobalRecord:
         """
         spans = []
         for side in GLOBAL_SIDES:
-            lives = [lf for lf in self.lives(side) if lf.points]
+            lives = [lf for lf in self.lives(side) if lf.point_count]
             if lives:
                 # 用 `t1`(末点 + hold)而不是 `points[-1].t`: 静止车的线尾被折叠成
                 # 一个带持续时长的点, 直接取 `t` 会把“结尾”算早
@@ -641,48 +860,7 @@ class GlobalRecord:
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("跳过损坏的全局录制记录: %s", exc)
             return None
-        try:
-            rect = [float(v) for v in (data.get("norm_rect") or [])]
-            if len(rect) == 4 and rect[1] > rect[0] and rect[3] > rect[2]:
-                rec.norm_rect = rect
-        except (TypeError, ValueError):
-            rec.norm_rect = []
-        for row in data.get("airfields") or []:
-            if not isinstance(row, dict):
-                continue
-            try:
-                rec.airfields.append({
-                    "side": str(row.get("side") or "A"),
-                    "kind": str(row.get("kind") or "runway"),
-                    "x": float(row["x"]), "z": float(row["z"]),
-                    "dx": float(row.get("dx") or 1.0),
-                    "dz": float(row.get("dz") or 0.0),
-                    "length": float(row.get("length") or 3000.0),
-                    "width": float(row.get("width") or 300.0),
-                })
-            except (KeyError, TypeError, ValueError):
-                continue
-        for row in data.get("zone_states") or []:
-            if not isinstance(row, dict):
-                continue
-            zones = row.get("zones")
-            if not isinstance(zones, list) or not zones:
-                continue
-            try:
-                t = float(row.get("t") or 0.0)
-            except (TypeError, ValueError):
-                continue
-            rec.zone_states.append({"t": t, "zones": [z for z in zones
-                                                       if isinstance(z, dict)]})
-        for row in data.get("kills") or []:
-            if not isinstance(row, dict):
-                continue
-            try:
-                rec.kills.append({"id": int(row.get("id") or 0),
-                                  "t": float(row.get("t") or 0.0),
-                                  "msg": str(row.get("msg") or "")})
-            except (TypeError, ValueError):
-                continue
+        _fill_global_meta(rec, data)
         for side, rows in (data.get("sides") or {}).items():
             if side not in GLOBAL_SIDES or not isinstance(rows, list):
                 continue
@@ -695,6 +873,55 @@ class GlobalRecord:
                         life.side = side          # 用所在组的队号
                     rec.sides[side].append(life)
         return rec
+
+
+def _fill_global_meta(rec: GlobalRecord, data: dict) -> None:
+    """解析全局条目的“小数据”: 归一化矩形 / 机场 / 战区时间轴 / 击毁消息。
+
+    旧格式(`routes.json` 里的 dict)与新的会话头部字段名完全一致, 所以两边共用。
+    """
+    try:
+        rect = [float(v) for v in (data.get("norm_rect") or [])]
+        if len(rect) == 4 and rect[1] > rect[0] and rect[3] > rect[2]:
+            rec.norm_rect = rect
+    except (TypeError, ValueError):
+        rec.norm_rect = []
+    for row in data.get("airfields") or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            rec.airfields.append({
+                "side": str(row.get("side") or "A"),
+                "kind": str(row.get("kind") or "runway"),
+                "x": float(row["x"]), "z": float(row["z"]),
+                "dx": float(row.get("dx") or 1.0),
+                "dz": float(row.get("dz") or 0.0),
+                "length": float(row.get("length") or 3000.0),
+                "width": float(row.get("width") or 300.0),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    for row in data.get("zone_states") or []:
+        if not isinstance(row, dict):
+            continue
+        zones = row.get("zones")
+        if not isinstance(zones, list) or not zones:
+            continue
+        try:
+            t = float(row.get("t") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        rec.zone_states.append({"t": t,
+                                "zones": [z for z in zones if isinstance(z, dict)]})
+    for row in data.get("kills") or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            rec.kills.append({"id": int(row.get("id") or 0),
+                              "t": float(row.get("t") or 0.0),
+                              "msg": str(row.get("msg") or "")})
+        except (TypeError, ValueError):
+            continue
 
 
 def fmt_time(seconds: float) -> str:
@@ -824,22 +1051,142 @@ def pretty_vehicle(key: str) -> str:
     return " ".join(out)
 
 
+def _points_changed(holder) -> bool:
+    """这条记录的点有没有被改过(靠“点数变了”判断, 不触发惰性加载)。"""
+    pts = holder.points
+    if isinstance(pts, LazyPoints) and not pts.loaded:
+        return False
+    return len(pts) != int(getattr(holder, "n_pts", 0) or 0)
+
+
+def _pack_route(rec: RouteRecord) -> tuple[dict, list[bytes], list[dict] | None]:
+    """`RouteRecord` → (会话头部, 点块, 无第二段)。单条录制有朝向, 没有 hold。
+
+    单条录制只有**一个**点块, 偏移恒为 0 —— 没必要为它开第二段, 元数据直接放头部。
+    """
+    pts = rec.points
+    fmt = session_store.FMT_BASE | session_store.FMT_DIR
+    raw = session_store.pack_points(pts, fmt=fmt)
+    blob = session_store.compress(raw) if raw else b""
+    entry = {
+        "n": len(pts),
+        "fmt": fmt,
+        "raw": len(raw),
+        "vmax": round(max((p.speed for p in pts), default=0.0), 1),
+        "off": 0,
+        "clen": len(blob),
+    }
+    header = {
+        "v": session_store.FORMAT_VERSION,
+        "kind": "route",
+        "id": rec.route_id,
+        "map_key": rec.map_key,
+        "map_name": rec.map_name,
+        "vehicle": rec.vehicle,
+        "created_at": rec.created_at,
+        "duration": round(rec.duration, 3),
+        "start_x": rec.start_x,
+        "start_y": rec.start_y,
+        "zone_count": rec.zone_count,
+        "zone_signature": rec.zone_signature,
+        "mode_name": rec.mode_name,
+        "marks": [_pack_mark(m) for m in rec.marks],
+        "pts": entry,
+    }
+    return header, [blob], None
+
+
+def _pack_global(rec: GlobalRecord) -> tuple[dict, list[bytes], list[dict]]:
+    """`GlobalRecord` → (会话头部, 每条线的点块, 线路清单)。
+
+    线路清单单独成一段: 500 局的话头部能小两个数量级, 启动就不用读它了。
+    """
+    rec._ensure_dir()                  # 要写就得先把清单读全(否则会丢线路)
+    header = {
+        "v": session_store.FORMAT_VERSION,
+        "kind": "global",
+        "id": rec.route_id,
+        "map_key": rec.map_key,
+        "map_name": rec.map_name,
+        "created_at": rec.created_at,
+        "zone_count": rec.zone_count,
+        "zone_signature": rec.zone_signature,
+        "mode_name": rec.mode_name,
+        "duration": round(rec.duration, 3),
+        "nl": rec.count(),             # 线路数(侧栏报数用, 不必读清单)
+        "norm_rect": list(rec.norm_rect or []),
+        "airfields": list(rec.airfields or []),
+        "zone_states": rec.zone_states,
+        "kills": rec.kills,
+    }
+    tracks: list[dict] = []
+    blocks: list[bytes] = []
+    for side in GLOBAL_SIDES:
+        for life in rec.sides.get(side) or []:
+            pts = life.points
+            fmt = session_store.FMT_BASE
+            if any(getattr(p, "hold", 0.0) for p in pts):
+                fmt |= session_store.FMT_HOLD        # 只有静止段折叠过的点才多一列
+            raw = session_store.pack_points(pts, fmt=fmt)
+            entry = {
+                "id": life.life_id,
+                "side": side,
+                "icon": life.icon,
+                "type": life.obj_type,
+                "color": life.color,
+                "dead": 1 if life.dead else 0,
+                "player": life.player,
+                "cls": life.vehicle_cls,
+                "n": len(pts),
+                "fmt": fmt,
+                "raw": len(raw),
+                # 侧栏/悬停要用的元数据(有它就不用为了显示去读点)
+                "t0": round(life.t0, 3),
+                "t1": round(life.t1, 3),
+                "vmax": round(max((p.speed for p in pts), default=0.0), 1),
+            }
+            if life.death_t:
+                entry["death_t"] = round(life.death_t, 2)
+            if life.watched:
+                entry["w"] = 1
+            tracks.append(entry)
+            blocks.append(session_store.compress(raw) if raw else b"")
+    return header, blocks, tracks
+
+
 class RouteStore:
-    """线路记录读写(原子写, 线程安全)。"""
+    """线路记录读写(原子写, 线程安全)。
+
+    存储布局见模块 docstring: **小数据**在 `routes.json`, **一局一个文件**在
+    `routes.sessions/<id>.wts`。于是:
+
+    * 启动只读每个文件的头部(500 局几十毫秒, 与总点数无关);
+    * 保存只重写变过的那一局;
+    * 点数据用到哪局才读哪局(见 `LazyPoints`)。
+    """
+
     def __init__(self, path: str | None = None):
         self.path = path or os.path.join(data_dir(), "routes.json")
+        # 一局一个文件的目录 —— 用 meta 文件名 + `.sessions` 后缀, 这样同一个进程里
+        # 开两个不同路径的 store(测试/探针)不会互相串数据。
+        self.sessions_dir = os.path.splitext(self.path)[0] + ".sessions"
         self._lock = threading.RLock()
         # 后台写盘(见 `request_save`): 界面只置个标志, 真正的序列化/压缩在另一个
-        # 线程里做 —— 1.3.0 起一局回放就几十万点, 同步写要 1~4 秒。
+        # 线程里做 —— 一局回放就几十万点, 同步写要几百毫秒。
         self._save_pending = False
         self._closing = False
         # 有没有“自上次成功写盘之后又改过东西”—— 退出时据此决定要不要真写一次
         self._dirty = False
         self._save_wake = threading.Event()
         self._save_thread: threading.Thread | None = None
+        # 需要重写/删除的会话(按 route_id) —— 拆文件的意义就在这里:
+        # 改一个地图名不该重写那几百 MB 的轨迹
+        self._dirty_ids: set[str] = set()
+        self._deleted_ids: set[str] = set()
+        self._dirty_meta = False
         self.map_names: dict[str, str] = {}
         # 用户在「地图管理」里勾了“隐藏”的地图: 只是**不在左侧列表里显示**,
-        # 轨迹数据/名称/缓存图片都不动(空战地图永迹不会用到, 留着只碍事)
+        # 轨迹数据/名称/缓存图片都不动(空战地图永远用不到, 留着只碍事)
         self.hidden_maps: list[str] = []
         # 见过的地图键(含**只缓存了图片、还没录过轨迹**的地图):
         # 侧栏与「地图管理」的默认编号都基于它, 保证两边一致且稳定
@@ -865,11 +1212,48 @@ class RouteStore:
         self._load()
         # 写盘线程**惰性启动**(见 `request_save`): 只读的 store(探针/测试)不该占线程
 
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ 加载
     def _load(self) -> None:
-        data = _read_payload(self.path)
-        if not isinstance(data, dict):
-            return
+        """读 meta + 扫会话目录。旧的单文件 `routes.json` 会**自动迁移一次**。"""
+        meta = self._read_meta()
+        legacy = None
+        if isinstance(meta, dict) and isinstance(meta.get("__legacy__"), dict):
+            legacy = meta["__legacy__"]
+            meta = None
+        if isinstance(meta, dict):
+            self._apply_meta(meta)
+            self._load_sessions()
+        elif isinstance(legacy, dict):
+            log.info("检测到旧格式的单文件数据, 迁移成「一局一文件」…")
+            self._apply_meta(legacy)
+            self._migrate_legacy(legacy)      # 迁移自己就填好了 routes/globals
+        else:
+            self._load_sessions()             # 只有会话没有 meta(或全新)也能起来
+        self._rebuild_levels()
+        self._recover_layouts()
+
+    def _read_meta(self) -> dict | None:
+        """读 meta。
+
+        返回三种: 新格式 dict / `{"__legacy__": 旧整包}` / None(没有或读不出来)。
+        """
+        if not os.path.exists(self.path):
+            return None
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                if data.get("layout") == "sessions-v1":
+                    return data
+                # 旧格式的**明文** JSON(1.2 时代的 routes.json 就是这样)
+                return {"__legacy__": data}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        legacy = _read_payload(self.path)      # 旧格式的 gzip 整包
+        return {"__legacy__": legacy} if isinstance(legacy, dict) else None
+
+    def _apply_meta(self, data: dict) -> None:
+        """把 meta(地图名/隐藏/已知地图/战区布局/校准/关卡关联)灌进来。"""
         try:
             names = data.get("map_names")
             if isinstance(names, dict):
@@ -894,35 +1278,196 @@ class RouteStore:
             if isinstance(ml, dict):
                 self.map_levels = {str(k): str(v).strip()
                                    for k, v in ml.items() if str(k) and str(v).strip()}
-            for item in data.get("routes") or []:
-                try:
-                    pts = [_unpack_route_point(p) for p in item.get("points") or []]
-                    mks = [_unpack_mark(m) for m in item.get("marks") or []]
-                    self.routes.append(RouteRecord(
-                        route_id=str(item["route_id"]),
-                        map_key=str(item.get("map_key", "unknown")),
-                        map_name=str(item.get("map_name", "未知地图")),
-                        vehicle=str(item.get("vehicle", "")),
-                        created_at=str(item.get("created_at", "")),
-                        duration=float(item.get("duration", 0.0)),
-                        start_x=float(item.get("start_x", 0.0)),
-                        start_y=float(item.get("start_y", 0.0)),
-                        points=[p for p in pts if p is not None],
-                        marks=[m for m in mks if m is not None],
-                        # 旧版本的记录没有这三个字段 → 默认 0/空 → 归为“未知模式”
-                        zone_count=int(item.get("zone_count") or 0),
-                        zone_signature=str(item.get("zone_signature") or ""),
-                        mode_name=str(item.get("mode_name") or ""),
-                    ))
-                except (KeyError, TypeError, ValueError) as exc:
-                    log.warning("跳过损坏的线路记录: %s", exc)
-            for item in data.get("globals") or []:
-                if isinstance(item, dict):
-                    rec = GlobalRecord.from_json(item)
-                    if rec is not None:
-                        self.globals.append(rec)
-        except (OSError, json.JSONDecodeError) as exc:
-            log.warning("读取线路数据失败: %s", exc)
+        except (TypeError, ValueError) as exc:
+            log.warning("读取地图元数据失败: %s", exc)
+
+    def _load_sessions(self) -> None:
+        """扫会话目录建索引(只读头部, **不读点**)。"""
+        for head, path in session_store.scan_dir(self.sessions_dir):
+            try:
+                kind = str(head.get("kind") or "route")
+                rec = (self._global_from_header(head, path) if kind == "global"
+                       else self._route_from_header(head, path))
+            except (TypeError, ValueError, KeyError) as exc:
+                log.warning("跳过损坏的会话 %s: %s", os.path.basename(path), exc)
+                continue
+            if rec is None:
+                continue
+            if isinstance(rec, GlobalRecord):
+                self.globals.append(rec)
+            else:
+                self.routes.append(rec)
+        # 目录里的顺序不可靠 → 按录制时间排(组内再按 id 保证稳定)
+        self.routes.sort(key=lambda r: (r.created_at, r.route_id))
+        self.globals.sort(key=lambda g: (g.created_at, g.route_id))
+
+    def _route_from_header(self, head: dict, path: str) -> RouteRecord | None:
+        rid = str(head.get("id") or "")
+        if not rid:
+            return None
+        # 单条录制只有一条轨迹, 它的点元数据在第一段里(没有第二段)
+        entry = head.get("pts") if isinstance(head.get("pts"), dict) else {}
+        n = int(entry.get("n") or 0)
+        marks = [m for m in (_unpack_mark(row) for row in head.get("marks") or [])
+                 if m is not None]
+        points: list = LazyPoints(lambda: self._load_points(path, entry, True)) if n else []
+        return RouteRecord(
+            route_id=rid,
+            map_key=str(head.get("map_key") or "unknown"),
+            map_name=str(head.get("map_name") or "未知地图"),
+            vehicle=str(head.get("vehicle") or ""),
+            created_at=str(head.get("created_at") or ""),
+            duration=float(head.get("duration") or 0.0),
+            start_x=float(head.get("start_x") or 0.0),
+            start_y=float(head.get("start_y") or 0.0),
+            points=points,
+            marks=marks,
+            zone_count=int(head.get("zone_count") or 0),
+            zone_signature=str(head.get("zone_signature") or ""),
+            mode_name=str(head.get("mode_name") or ""),
+            n_pts=n,
+            vmax_hint=float(entry.get("vmax") or 0.0),
+        )
+
+    def _global_from_header(self, head: dict, path: str) -> GlobalRecord | None:
+        rid = str(head.get("id") or "")
+        if not rid:
+            return None
+        rec = GlobalRecord(
+            route_id=rid,
+            map_key=str(head.get("map_key") or "unknown"),
+            map_name=str(head.get("map_name") or "未知地图"),
+            created_at=str(head.get("created_at") or ""),
+            zone_count=int(head.get("zone_count") or 0),
+            zone_signature=str(head.get("zone_signature") or ""),
+            mode_name=str(head.get("mode_name") or ""),
+            duration=float(head.get("duration") or 0.0),
+            n_lives=int(head.get("nl") or 0),
+        )
+        _fill_global_meta(rec, head)
+        # 线路清单(200 多条 × 每条 20 个字段)比会话元数据大两个数量级 → 展开时才读
+        dir_len = int(head.get("_dir_len") or 0)
+        rec._dir_loader = lambda r: self._fill_lives(r, path, dir_len)
+        return rec
+
+    def _fill_lives(self, rec: GlobalRecord, path: str, dir_len: int) -> None:
+        """把某局的线路清单读进来(`GlobalRecord._ensure_dir` 触发)。"""
+        for entry in session_store.read_tracks(path, {"_dir_len": dir_len}):
+            side = str(entry.get("side") or "")
+            if side not in GLOBAL_SIDES:
+                continue
+            life_id = str(entry.get("id") or "")
+            if not life_id:
+                continue
+            n = int(entry.get("n") or 0)
+            rec.sides[side].append(UnitLife(
+                life_id=life_id,
+                icon=str(entry.get("icon") or ""),
+                obj_type=str(entry.get("type") or ""),
+                color=str(entry.get("color") or ""),
+                map_key=rec.map_key,
+                points=LazyPoints(
+                    lambda e=entry: self._load_points(path, e, False, dir_len)) if n else [],
+                side=side,
+                dead=bool(entry.get("dead")),
+                death_t=float(entry.get("death_t") or 0.0),
+                watched=bool(entry.get("w")),
+                player=str(entry.get("player") or ""),
+                vehicle_cls=str(entry.get("cls") or ""),
+                n_pts=n,
+                t0_hint=float(entry.get("t0") or 0.0),
+                t1_hint=float(entry.get("t1") or 0.0),
+                vmax_hint=float(entry.get("vmax") or 0.0),
+            ))
+
+    @staticmethod
+    def _load_points(path: str, entry: dict, is_route: bool, dir_len: int = 0):
+        """把一条线路的点块读出来并还原成点对象(`LazyPoints` 第一次访问时调)。"""
+        raw = session_store.read_block(path,
+                                       int(entry.get("off") or 0),
+                                       int(entry.get("clen") or 0),
+                                       int(entry.get("raw") or 0),
+                                       dir_len)
+        if not raw:
+            return []
+        fmt = int(entry.get("fmt") or session_store.FMT_BASE)
+        if is_route:
+            def factory(t, x, y, speed, dx, dy, _hold):
+                return RoutePoint(x, y, t, speed, dx, dy)
+        else:
+            def factory(t, x, y, speed, _dx, _dy, hold):
+                return TrackPoint(x, y, t, speed, 0.0, 0.0, hold)
+        return session_store.unpack_points(raw, fmt=fmt, factory=factory)
+
+    # ------------------------------------------------------------------ 迁移
+    def _migrate_legacy(self, data: dict) -> None:
+        """旧的单文件整包(`routes.json` = gzip 的 JSON)→ 一局一个会话文件。
+
+        顺序很重要: **先把所有会话写出来, 最后才落 meta**(meta 里的 `layout`
+        标记就是“迁移已完成”的凭据)。中途崩了下次启动会重来一遍, 不会丢记录。
+        原文件改名成 `.v1.bak` 留档, 不删。
+        """
+        routes, globals_ = self._parse_legacy(data)
+        with self._lock:
+            self.routes = routes
+            self.globals = globals_
+            self._dirty_ids = {r.route_id for r in [*routes, *globals_]}
+            self._dirty_meta = True
+        for rec in [*routes, *globals_]:
+            try:
+                self._write_session(rec)
+            except Exception:      # noqa: BLE001 - 单局失败不该中断整次迁移
+                log.exception("迁移时写会话失败: %s", rec.route_id)
+        self._write_meta(self.path + ".new")
+        try:
+            os.replace(self.path, self.path + ".v1.bak")
+        except OSError as exc:
+            log.warning("旧数据文件改名失败: %s", exc)
+        try:
+            os.replace(self.path + ".new", self.path)
+        except OSError as exc:
+            log.warning("迁移后的 meta 落盘失败: %s", exc)
+        with self._lock:
+            self._dirty_ids.clear()
+            self._dirty_meta = False
+        self._dirty = False
+        log.info("旧数据迁移完成: %d 条单条录制 + %d 个全局条目",
+                 len(routes), len(globals_))
+
+    @staticmethod
+    def _parse_legacy(data: dict) -> tuple[list[RouteRecord], list[GlobalRecord]]:
+        """解析旧整包里的 `routes` / `globals`(只在迁移时用一次)。"""
+        routes: list[RouteRecord] = []
+        globals_: list[GlobalRecord] = []
+        for item in data.get("routes") or []:
+            try:
+                pts = [_unpack_route_point(p) for p in item.get("points") or []]
+                mks = [_unpack_mark(m) for m in item.get("marks") or []]
+                routes.append(RouteRecord(
+                    route_id=str(item["route_id"]),
+                    map_key=str(item.get("map_key", "unknown")),
+                    map_name=str(item.get("map_name", "未知地图")),
+                    vehicle=str(item.get("vehicle", "")),
+                    created_at=str(item.get("created_at", "")),
+                    duration=float(item.get("duration", 0.0)),
+                    start_x=float(item.get("start_x", 0.0)),
+                    start_y=float(item.get("start_y", 0.0)),
+                    points=[p for p in pts if p is not None],
+                    marks=[m for m in mks if m is not None],
+                    zone_count=int(item.get("zone_count") or 0),
+                    zone_signature=str(item.get("zone_signature") or ""),
+                    mode_name=str(item.get("mode_name") or ""),
+                ))
+            except (KeyError, TypeError, ValueError) as exc:
+                log.warning("跳过损坏的线路记录: %s", exc)
+        for item in data.get("globals") or []:
+            if not isinstance(item, dict):
+                continue
+            rec = GlobalRecord.from_json(item)
+            if rec is not None:
+                globals_.append(rec)
+        return routes, globals_
+
         self._rebuild_levels()
         self._recover_layouts()
 
@@ -979,6 +1524,7 @@ class RouteStore:
             else:
                 self.map_levels.pop(map_key, None)
             self._rebuild_levels()
+            self._dirty_meta = True
         self.save()
         log.info("地图身份: %s 的关卡代号 %r → %r", map_key, old, level)
         return True
@@ -1028,80 +1574,130 @@ class RouteStore:
             known.setdefault(rec.map_key, set()).add(sig)
             changed = True
         if changed:
+            self._dirty_meta = True
             log.info("从轨迹指纹补回了缺失的战区布局")
         return changed
 
-    def _snapshot(self) -> dict:
-        """把当前数据转成可序列化的纯 Python 数据(**在锁内**, 拿一致快照)。
+    def _snapshot_meta(self) -> dict:
+        """地图级的**小数据**(几十 KB) —— 它才是 `routes.json` 里剩下的全部内容。"""
+        return {
+            "version": 2,
+            "layout": "sessions-v1",
+            "map_names": self.map_names,
+            "hidden_maps": self.hidden_maps,
+            # 存**原始** known_maps(不按 canon 去重): 回放键 `wrpl_<关卡>` 即使
+            # 当前被某个哈希认领掉了, 也要留在盘上 —— 用户撤销关联后它得立刻回来。
+            "known_maps": [k for k in self.known_maps if k],
+            "map_zones": self.map_zones,
+            "map_calib": self.map_calib,
+            "map_levels": self.map_levels,
+        }
 
-        点全部走数组打包(见 `_pack_route_point` / `_pack_point`), **不用 `asdict`** ——
-        `asdict` 会递归深拷贝每个字段, 80 万点要 1.8 秒; 手写列表推导不到 0.3 秒。
-        """
+    # ------------------------------------------------------------------ 写盘
+    def mark_dirty(self, *objs) -> None:
+        """标记这些记录需要重写(接受 `route_id` 或记录对象)。"""
         with self._lock:
-            return {
-                "version": 2,
-                "map_names": self.map_names,
-                "hidden_maps": self.hidden_maps,
-                # 存**原始** known_maps(不按 canon 去重): 回放键 `wrpl_<关卡>` 即使
-                # 当前被某个哈希认领掉了, 也要留在盘上 —— 用户撤销关联后它得立刻回来。
-                "known_maps": [k for k in self.known_maps if k],
-                "map_zones": self.map_zones,
-                "map_calib": self.map_calib,
-                "map_levels": self.map_levels,
-                "routes": [
-                    {
-                        "route_id": r.route_id,
-                        "map_key": r.map_key,
-                        "map_name": r.map_name,
-                        "vehicle": r.vehicle,
-                        "created_at": r.created_at,
-                        "duration": r.duration,
-                        "start_x": r.start_x,
-                        "start_y": r.start_y,
-                        "zone_count": r.zone_count,
-                        "zone_signature": r.zone_signature,
-                        "mode_name": r.mode_name,
-                        "points": [_pack_route_point(p) for p in r.points],
-                        "marks": [_pack_mark(m) for m in r.marks],
-                    }
-                    for r in self.routes
-                ],
-                "globals": [g.to_json() for g in self.globals],
-            }
+            for obj in objs:
+                rid = obj if isinstance(obj, str) else getattr(obj, "route_id", "")
+                if rid:
+                    self._dirty_ids.add(rid)
 
     def save(self) -> None:
         """**请求**落盘(异步, 立即返回) —— 真正的写盘在后台线程里做。
 
-        为什么改成异步(用户 2026-10-26): 1.3.0 起一局回放就是几十万点, 一次
-        全量写盘要 1~4 秒 —— 点 F6 保存、开始录制、选关卡代号、关窗口全在那儿等,
-        叠加层都要等它写完才消失、卡得连提示音都听不到。
+        为什么异步(用户 2026-10-26): 一局回放就是几十万点, 写一局要几百毫秒 ——
+        点 F6 保存、开始录制、选关卡代号、关窗口都不该在那儿等。
 
         ⚠ 调用后**不保证**文件已经写好; 要确定落盘用 `save_now()`, 退出前用 `flush()`。
         """
-        if SYNC_SAVE:                  # 测试/探针: 保持旧的同步语义
+        if SYNC_SAVE:                  # 测试/探针: 保持同步语义
             self.save_now()
             return
         self.request_save()
 
     def save_now(self) -> None:
-        """同步写盘, 会阻塞调用方(**后台线程与 `flush()` 用这个**)。
+        """同步落盘: **只写变过的那一局 + meta**; 没有任何改动时是空操作。
 
-        写的是**紧凑 JSON + gzip**: `gzip(level=1)` 而不是 6 —— 体积只大 ~50%
-        (8.3 MB → 12.7 MB), 但压缩耗时从 0.6 s 降到 0.1 s, 而**读回来**的 gzip
-        解压速度几乎一样(实测 load 不受影响)。数据是自己的, 体积不是瓶颈。
+        这就是拆成一局一文件的全部意义(用户 2026-10-26 的 500~600 局目标):
+        改地图名只写几 KB 的 `routes.json`, 导入一局只写那 3~5 MB,
+        其余几百局**一个字节都不动**。
         """
-        payload = self._snapshot()
-        tmp = self.path + ".tmp"
+        with self._lock:
+            meta_dirty = self._dirty_meta
+            ids = set(self._dirty_ids)
+            gone = set(self._deleted_ids)
+            self._dirty_ids.clear()
+            self._deleted_ids.clear()
+            self._dirty_meta = False
+            todo = [rec for rec in [*self.routes, *self.globals]
+                    if rec.route_id in ids or self._needs_write(rec)]
+        for rid in gone:
+            session_store.remove_session(self.sessions_dir, rid)
+        if meta_dirty or not os.path.exists(self.path):
+            self._write_meta()
+        failed: list[str] = []
+        for rec in todo:
+            try:
+                self._write_session(rec)
+            except Exception:      # noqa: BLE001 - 单局失败不能拖垮整次保存
+                log.exception("写会话失败: %s", rec.route_id)
+                failed.append(rec.route_id)
+        if failed:
+            with self._lock:
+                self._dirty_ids.update(failed)     # 下次再试
+            return
+        self._dirty = False
+
+    def _needs_write(self, rec) -> bool:
+        """这条记录要不要重写: 文件不在 / 点被改过(点数变了)。
+
+        `LazyPoints` 没加载时**只看元数据** —— 不会为了判断把几十万点读进来。
+        """
+        path = session_store.session_path(self.sessions_dir, rec.route_id)
+        if not os.path.exists(path):
+            return True
+        if isinstance(rec, GlobalRecord):
+            if not rec.sides_loaded():
+                return False          # 清单都没读 → 点不可能被改过
+            for side in GLOBAL_SIDES:
+                for life in rec.sides.get(side) or []:
+                    if _points_changed(life):
+                        return True
+            return False
+        return _points_changed(rec)
+
+    def _write_meta(self, dst: str | None = None) -> None:
+        """写地图级小数据(普通 JSON, 可直接打开看)。"""
+        target = dst or self.path
+        tmp = target + ".tmp"
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            blob = gzip.compress(text.encode("utf-8"), compresslevel=1)
-            with open(tmp, "wb") as f:
-                f.write(blob)
-            os.replace(tmp, self.path)
-            self._dirty = False
-        except (OSError, ValueError) as exc:
-            log.error("保存线路数据失败: %s", exc)
+            os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+            with self._lock:
+                text = json.dumps(self._snapshot_meta(),
+                                  ensure_ascii=False, separators=(",", ":"))
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.replace(tmp, target)
+        except (OSError, TypeError, ValueError) as exc:
+            log.error("保存地图元数据失败: %s", exc)
+
+    def _write_session(self, rec) -> None:
+        """把一局压成 `.wts`(内部是临时文件 + 原子替换)。"""
+        if isinstance(rec, GlobalRecord):
+            header, blocks, tracks = _pack_global(rec)
+        else:
+            header, blocks, tracks = _pack_route(rec)
+        path = session_store.session_path(self.sessions_dir, rec.route_id)
+        session_store.write_session(path, header, blocks, tracks)
+        with self._lock:
+            if isinstance(rec, GlobalRecord):
+                rec.n_lives = 0
+                for side in GLOBAL_SIDES:
+                    for life in rec.sides.get(side) or []:
+                        life.n_pts = len(life.points)
+                        rec.n_lives += 1
+            else:
+                rec.n_pts = len(rec.points)
 
     # ------------------------------------------------------ 后台写盘(界面不等)
     def request_save(self) -> None:
@@ -1191,6 +1787,7 @@ class RouteStore:
     def add(self, rec: RouteRecord) -> None:
         with self._lock:
             self.routes.append(rec)
+            self._dirty_ids.add(rec.route_id)      # 只写这一局
         if rec.zone_signature:
             # 这条记录带着战区指纹, 但可能没存过对应布局(旧版 exe/手工数据)
             # → 立刻从指纹补上, 保证侧栏四层树与地图画战区都能正常工作
@@ -1202,6 +1799,9 @@ class RouteStore:
             before = len(self.routes)
             self.routes = [r for r in self.routes if r.route_id != route_id]
             changed = len(self.routes) != before
+            if changed:
+                self._dirty_ids.discard(route_id)
+                self._deleted_ids.add(route_id)    # 文件也删
         if changed:
             self.save()
         return changed
@@ -1232,6 +1832,7 @@ class RouteStore:
     def add_global(self, rec: GlobalRecord) -> None:
         with self._lock:
             self.globals.append(rec)
+            self._dirty_ids.add(rec.route_id)      # 只写这一局
             # 回放导入带了自己的地图名(`avg_finland`) → 直接登记成这张图的显示名,
             # 否则侧栏最上层只能显示“地图 1 / 地图 2”这种自动编号, 对不上号。
             # 用户已经起过名的**不覆盖**(`name_of` 非空就跳过)。
@@ -1249,6 +1850,9 @@ class RouteStore:
             before = len(self.globals)
             self.globals = [g for g in self.globals if g.route_id != gid]
             changed = len(self.globals) != before
+            if changed:
+                self._dirty_ids.discard(gid)
+                self._deleted_ids.add(gid)
         if changed:
             self.save()
         return changed
@@ -1340,6 +1944,7 @@ class RouteStore:
             if map_key in self.known_maps:
                 return
             self.known_maps.append(map_key)
+            self._dirty_meta = True
         self.save()
 
     def rename_map(self, map_key: str, name: str) -> None:
@@ -1351,8 +1956,11 @@ class RouteStore:
             else:
                 self.map_names.pop(map_key, None)
             for r in self.routes:
-                if self.canon(r.map_key) == map_key:
+                if self.canon(r.map_key) == map_key and r.map_name != name.strip():
                     r.map_name = name.strip()
+                    # 名字存在每条记录的会话头部里 → 那几条要重写(不碰点)
+                    self._dirty_ids.add(r.route_id)
+            self._dirty_meta = True
         self.save()
 
     def is_map_hidden(self, map_key: str) -> bool:
@@ -1371,6 +1979,7 @@ class RouteStore:
             else:
                 while map_key in self.hidden_maps:
                     self.hidden_maps.remove(map_key)
+            self._dirty_meta = True
         self.save()
         log.info("地图管理: %s %s", "隐藏" if hidden else "取消隐藏", map_key)
 
@@ -1440,6 +2049,10 @@ class RouteStore:
             if drop_level and not self.level_of_hash(keep):
                 self.map_levels[keep] = drop_level
             self._rebuild_levels()
+            # 记录的 `map_key` / `map_name` 变了 → 那几条会话要重写(不碰点数据)
+            for rec in [*moved, *moved_g]:
+                self._dirty_ids.add(rec.route_id)
+            self._dirty_meta = True
         self.save()
         log.info("已合并地图条目: %s ← %s (%d 条轨迹)", keep, drop, len(moved))
         return True
@@ -1504,6 +2117,7 @@ class RouteStore:
             self.map_calib[map_key] = data
             if map_key not in self.known_maps:      # 让它出现在侧栏/地图管理里
                 self.known_maps.append(map_key)
+            self._dirty_meta = True
         self.save()
         log.info("地图校准: %s <- %s (%s)", map_key, calib.source or "?", calib.describe())
         return True
@@ -1515,6 +2129,7 @@ class RouteStore:
             if map_key not in self.map_calib:
                 return False
             self.map_calib.pop(map_key, None)
+            self._dirty_meta = True
         self.save()
         log.info("已清除地图校准: %s", map_key)
         return True
@@ -1560,6 +2175,7 @@ class RouteStore:
                     "seen_at": now,
                 })
                 del layouts[12:]                 # 单张地图最多留 12 种布局
+            self._dirty_meta = True
         self.save()
         return is_new
 

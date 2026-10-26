@@ -114,6 +114,9 @@ _ROLE_ID = Qt.ItemDataRole.UserRole + 1
 _ROLE_SIG = Qt.ItemDataRole.UserRole + 2      # 全局线路行的队别(A/B)
 # 分组行的稳定标识(地图/模式): 侧栏重建后用它对上“原来折起来的是哪几个分组”
 _ROLE_KEY = Qt.ItemDataRole.UserRole + 3
+# 「子项还没建」的标记(= 全局条目的 route_id)。一局就有 200 多条线, 五百局是 10 万行 ——
+# 启动时全建出来要一两秒, 所以子项**展开到那一局时才建**。
+_ROLE_LAZY = Qt.ItemDataRole.UserRole + 4
 
 # 层级行(地图/模式/版本)只当“分组标题”: 可点击展开、可右键, 但**不可被选中** ——
 # 否则多选时会把标题行也选进去(回放/基准只应以轨迹条目为单位)。
@@ -748,6 +751,8 @@ class RouteTesterWindow(QMainWindow):
         self.tree.customContextMenuRequested.connect(self._on_tree_menu)
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
+        # 展开一个「全局录制」条目时才去建它下面那 200 多条线路行(见 `_populate_global_item`)
+        self.tree.itemExpanded.connect(self._on_tree_item_expanded)
         # 双击轨迹行 = 把它所在的“地图·模式·版本”定为基准(之后多选只在该版本内)
         self.tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
         layout.addWidget(self.tree, 1)
@@ -974,10 +979,19 @@ class RouteTesterWindow(QMainWindow):
         return out
 
     def _life_map_keys(self) -> dict[str, str]:
-        """{线路 id: 所属地图键(已按图片哈希归并)} —— 换图时用它判断哪些全局线路已不属于当前地图。"""
-        return {life.life_id: self.store.canon(g.map_key)
-                for g in self.store.globals for side in GLOBAL_SIDES
-                for life in g.lives(side)}
+        """{线路 id: 所属地图键(已按图片哈希归并)} —— 换图时用它判断哪些全局线路已不属于当前地图。
+
+        ⚠ 按 `life_id` 的 `<条目 id>:` 前缀**直接查**, 不去枚举每条线路 ——
+        一局 200 多条线, 五百局就是 10 万条, 枚举一次会把所有会话都读进内存。
+        已删掉的条目自然查不到(调用方会把那些 id 当成“不属于当前地图”清掉)。
+        """
+        by_gid = {g.route_id: self.store.canon(g.map_key) for g in self.store.globals}
+        out: dict[str, str] = {}
+        for lid in self._visible_lives:
+            gid = lid.rpartition(":")[0]
+            if gid in by_gid:
+                out[lid] = by_gid[gid]
+        return out
 
     def _tree_modes(self):
         """把「单条路线」与「全局录制条目」合并成 **地图 → 模式** 两层。
@@ -1016,26 +1030,42 @@ class RouteTesterWindow(QMainWindow):
         return f"{n_route} 条 · {n_global} 局" if n_global else f"{n_route} 条"
 
     def _add_global_item(self, parent: QTreeWidgetItem, g: GlobalRecord) -> None:
-        """在版本行下挂一个「全局录制」条目: 条目 → A/B 队 → 每辆车的线路。"""
+        """在模式行下挂一个「全局录制」条目: 条目 → A/B 队 → 玩家 → 每辆车的线路。
+
+        ⚠ **子项延后到展开时才建**(`_populate_global_item`): 一局就有 200 多条线,
+        五百局是 10 万行 —— 启动时全建出来要一两秒、还要吃掉上百 MB。
+        """
         mark = f"  [{g.mark_label}]" if g.mark_label else ""
         item = QTreeWidgetItem(["", f"全局 {g.label}{mark}", f"{g.count()} 条"])
         item.setData(0, _ROLE_KIND, "global")
         item.setData(0, _ROLE_ID, g.route_id)
         item.setData(0, _ROLE_KEY, f"global|{g.route_id}")
-        item.setIcon(_COL_EYE, eye_icon(any(life.life_id in self._visible_lives
-                                            for side in GLOBAL_SIDES
-                                            for life in g.lives(side))))
+        item.setData(0, _ROLE_LAZY, g.route_id)      # 展开时才建子项
+        prefix = f"{g.route_id}:"
+        item.setIcon(_COL_EYE, eye_icon(
+            any(lid.startswith(prefix) for lid in self._visible_lives)))
         item.setToolTip(_COL_EYE, "点击显示 / 隐藏整局的全部线路")
         tooltip = [
             f"全局录制 · {g.map_name} · {g.mode_label}",
             f"录制时间 {g.created_at.replace('T', ' ')}",
-            f"用时 {fmt_time(g.duration)} · "
-            f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条",
+            f"用时 {fmt_time(g.duration)} · 共 {g.count()} 条线路",
             f"标记: {g.mark_label or '(无 — 点「A/B 队录制」会新建一个条目)'}",
         ]
         tooltip.append("右键可标记为 A/B 队录制目标或删除")
         item.setToolTip(_COL_NAME, "\n".join(tooltip))
         parent.addChild(item)
+        if item.isExpanded():            # 恢复展开状态后可能已经是展开的
+            self._populate_global_item(item)
+
+    def _populate_global_item(self, item: QTreeWidgetItem) -> None:
+        """把某个全局条目的子项(队 → 玩家 → 每辆车)建出来 —— **展开时才调**。"""
+        gid = item.data(0, _ROLE_LAZY)
+        if not gid:
+            return
+        item.setData(0, _ROLE_LAZY, None)       # 先标记, 免得重入
+        g = self.store.get_global(gid)
+        if g is None:
+            return
 
         def _add_life_item(parent_item: QTreeWidgetItem, life, side_key: str) -> None:
             """一辆车的线路行。"""
@@ -1056,8 +1086,8 @@ class RouteTesterWindow(QMainWindow):
             if life.vehicle_cls:
                 detail += f"\n型号 {life.vehicle_cls}"
             detail += (f"\n出现 {fmt_time(life.t0)} → 消失 {fmt_time(life.t1)}"
-                       f"\n点数 {len(life.points)} · 最高速 "
-                       f"{fmt_speed(max((p.speed for p in life.points), default=0.0))} km/h")
+                       f"\n点数 {life.point_count} · 最高速 "
+                       f"{fmt_speed(life.vmax)} km/h")
             detail += "\n（已阵亡）" if life.dead else "\n（到对局结束还在场上）"
             detail += f"\n色标 {life.color or '-'}(8111 原始颜色, 仅参考)"
             litem.setToolTip(_COL_NAME, detail)
@@ -1183,9 +1213,11 @@ class RouteTesterWindow(QMainWindow):
                 # 全局录制条目排在单条路线之后(用户要求: 加在这一级的末尾)
                 for g in globs:
                     self._add_global_item(mid, g)
-                    alive_lives.update(
-                        life.life_id for side in GLOBAL_SIDES
-                        for life in g.lives(side))
+        # 已缓存的全局线路 id: 按 `<条目 id>:` 前缀剪掉已删条目的 ——
+        # 不去枚举每条线路(那样会把所有会话的线路清单读进内存)
+        alive_gids = {g.route_id for g in self.store.globals}
+        alive_lives.update(lid for lid in self._visible_lives
+                           if lid.rpartition(":")[0] in alive_gids)
         # 展开/折叠统一放在重建末尾恢复(见 _restore_folded)
         # 已缓存图片、但还没录过轨迹的地图也列出来(灰色, 用时列写“仅缓存”):
         # 否则在「地图管理」里给它们改完名字, 主界面根本看不到任何变化。
@@ -1269,7 +1301,11 @@ class RouteTesterWindow(QMainWindow):
         def walk(item: QTreeWidgetItem) -> None:
             key = item.data(0, _ROLE_KEY)
             if key:
-                item.setExpanded(False if collapse_all else key not in folded)
+                expanded = not collapse_all and key not in folded
+                item.setExpanded(expanded)
+                # 重建时 tree 的信号是屏蔽的 → 展开事件不会触到, 这里手动补建子项
+                if expanded and item.data(0, _ROLE_LAZY):
+                    self._populate_global_item(item)
             for i in range(item.childCount()):
                 walk(item.child(i))
 
@@ -1296,8 +1332,17 @@ class RouteTesterWindow(QMainWindow):
         walk(self.tree.invisibleRootItem())
         node = found[0] if found else None
         while node is not None:
+            if node.data(0, _ROLE_LAZY):
+                self._populate_global_item(node)      # 先把子项建出来
             node.setExpanded(True)
             node = node.parent()
+
+    def _on_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
+        """展开一个「全局录制」条目 → 这时才建它下面的队/玩家/线路行。"""
+        if item is None or not item.data(0, _ROLE_LAZY):
+            return
+        self._populate_global_item(item)
+        self._refresh_implied_marks()      # 新出现的行也要按父项的选中状态刷一遍
 
     def _expand_to_route(self, route_id: str) -> None:
         """兼容旧调用点: 展开到某条单条轨迹。"""
