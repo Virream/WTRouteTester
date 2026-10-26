@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QPointF, Qt
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QPointF, QSettings, Qt
 from PyQt6.QtGui import QColor, QIcon, QImage, QPixmap
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QAbstractItemView, QApplication
@@ -2420,6 +2420,160 @@ def test_rate_menu(tmpdir: str):
     results.append("轮询率在菜单里(只保留单条录制一档) OK")
 
 
+def test_gfx_settings(tmpdir: str):
+    """显卡设置(2026-10-27): 默认自动 / 可指定某块卡 / 可强制软件 / 驱动坏了要弹窗。
+
+    为什么要有这些断言: pygfx 的 device 是**全局单例**, 建好之后不能再换 ——
+    所以"指定显卡"只能是"存起来 + 下次启动生效", 一旦有人误改成热切换就会
+    在第二次建 renderer 时炸(`Shared._instance` 的 assert)。
+    """
+    from wt81111g import gfx_info
+    from wt81111g.gfx_info import GpuNotice, adapter_option, gpu_usable
+
+    class _FakeAdapter:
+        """最小可用的假适配器(只需要 info 字典 + summary)。"""
+
+        def __init__(self, summary: str, **info):
+            self.summary = summary
+            self.info = info
+
+    # ① 适配器 → 选项: 真显卡 / WARP / 老版 API(只给属性, 没有 info 字典)
+    gpu = _FakeAdapter("RTX 3060 (DiscreteGPU) via D3D12", device="RTX 3060",
+                       backend_type="D3D12", adapter_type="DiscreteGPU",
+                       vendor_id=4318, device_id=9568)
+    o = adapter_option(gpu)
+    assert o.key == "RTX 3060|D3D12", o.key
+    assert o.is_gpu and not o.is_fallback
+    assert "独立显卡" in o.detail and "D3D12" in o.detail
+
+    warp = _FakeAdapter("Microsoft Basic Render Driver (CPU) via D3D12",
+                        device="Microsoft Basic Render Driver", backend_type="D3D12",
+                        adapter_type="CPU", vendor_id=5140, device_id=140)
+    w = adapter_option(warp)
+    assert w.is_fallback and not w.is_gpu, "WARP 必须被识别成软件模拟"
+    assert "软件模拟" in w.detail
+
+    class _OldStyle:
+        device = "Intel UHD"
+        backend_type = "Vulkan"
+        adapter_type = "IntegratedGPU"
+
+    assert adapter_option(_OldStyle()).key == "Intel UHD|Vulkan"
+    assert adapter_option(_OldStyle()).is_gpu
+
+    # ② 自动模式: 有真显卡就不选 WARP; 只找到 WARP 时按"没有显卡"处理(→ 软件渲染)
+    import wgpu as _wgpu
+
+    from wt81111g.route_map_gl import _pick_adapter
+
+    real = _wgpu.gpu.enumerate_adapters_sync
+    try:
+        _wgpu.gpu.enumerate_adapters_sync = lambda: [warp, gpu]
+        picked, note = _pick_adapter(gfx_info.PREF_AUTO)
+        assert picked is gpu, "自动模式不该选 WARP"
+        assert note == ""
+
+        _wgpu.gpu.enumerate_adapters_sync = lambda: [warp]
+        try:
+            _pick_adapter(gfx_info.PREF_AUTO)
+        except LookupError as exc:
+            assert "CPU 模拟" in str(exc), exc
+        else:
+            raise AssertionError("只有 WARP 时应该抛 LookupError(改用软件渲染)")
+
+        # 显式选了 WARP → 必须照办(用户要自己承担慢)
+        _wgpu.gpu.enumerate_adapters_sync = lambda: [warp, gpu]
+        assert _pick_adapter(adapter_option(warp).key)[0] is warp
+
+        # 指定的卡不存在 → 回退自动, 但要返回一句话告诉用户
+        got, note = _pick_adapter("某块已经拔掉的卡|Vulkan")
+        assert got is gpu and "已不可用" in note, note
+    finally:
+        _wgpu.gpu.enumerate_adapters_sync = real
+
+    # ③ 强制软件绘制 → 完全不碰 GPU, 而且**不该**打扰用户(是他自己选的)
+    assert gpu_usable(force_software=True)[0] is False
+    from wt81111g.route_map_gl import create_map_view
+    soft = create_map_view(None, force_software=True)
+    try:
+        assert soft.gpu_adapter == "软件渲染(QPainter)", soft.gpu_adapter
+        assert soft.gpu_notice is None, soft.gpu_notice
+    finally:
+        soft.deleteLater()
+
+    # ④ 崩溃标记: 上次留了 gfx_pending=1 → 这次强制软件 + 持久化 + 一条提示
+    cfg_path = os.path.join(tmpdir, "gfx_crash.ini")
+    cfg = QSettings(cfg_path, QSettings.Format.IniFormat)
+    cfg.setValue("gfx_pending", 1)
+    cfg.setValue("gfx_adapter", "RTX 3060|D3D12")
+    cfg.sync()
+    win = RouteTesterWindow(RouteStore(os.path.join(tmpdir, "gfx_crash.json")),
+                            map_cache=MapCache(os.path.join(tmpdir, "maps_gfxcrash")),
+                            start_recorder=False, settings=cfg)
+    win.recorder.stop()
+    win.hotkeys.stop()
+    try:
+        assert win._gfx_software is True, "上次崩过 → 本次必须走软件渲染"
+        assert int(cfg.value("gfx_software", 0)) == 1, "崩溃结论要落盘, 否则每次都崩"
+        assert int(cfg.value("gfx_pending", 1)) == 0, "已经处理过了, 别再重复判崩"
+        notice = win._gpu_notice
+        assert isinstance(notice, GpuNotice) and notice.kind == "crashed", notice
+        assert "显卡" in notice.title
+        # 菜单: 勾在「强制软件绘制」上, 而且指定的卡还留着(取消勾选就能回去)
+        assert win._gfx_actions[gfx_info.PREF_SOFTWARE].isChecked()
+        assert win._gfx_prefer == "RTX 3060|D3D12", win._gfx_prefer
+        # 软件绘制时 `_clear_gfx_pending` 什么都不写(它只管 GPU 那一路)
+        cfg.setValue("gfx_pending", 1)
+        win._clear_gfx_pending()
+        assert int(cfg.value("gfx_pending", 0)) == 1
+    finally:
+        win.close()
+
+    # ⑤ 正常路径: 启动先留标记, 4 秒后(或正常退出时)抹掉; 换设置要弹"重启生效"
+    cfg2 = QSettings(os.path.join(tmpdir, "gfx_ok.ini"), QSettings.Format.IniFormat)
+    win2 = RouteTesterWindow(RouteStore(os.path.join(tmpdir, "gfx_ok.json")),
+                             map_cache=MapCache(os.path.join(tmpdir, "maps_gfxok")),
+                             start_recorder=False, settings=cfg2)
+    win2.recorder.stop()
+    win2.hotkeys.stop()
+    _saved_info = rw.QMessageBox.information
+    rw.QMessageBox.information = staticmethod(lambda *a, **k: None)   # 别阻塞测试
+    try:
+        # 无头平台下 GPU 不可用 → 不会留 pending 标记(软件渲染不会崩在 wgpu 里)
+        if win2._gfx_software:
+            assert int(cfg2.value("gfx_pending", 0)) == 0
+        # 手动选「强制软件绘制」/ 选回自动 → 写配置 + 清掉崩溃标记
+        cfg2.setValue("gfx_pending", 1)
+        win2._on_pick_adapter(gfx_info.PREF_SOFTWARE)
+        assert int(cfg2.value("gfx_software", 0)) == 1
+        assert int(cfg2.value("gfx_pending", 0)) == 0, "换了设置就该重新试一次 GPU"
+        win2._on_pick_adapter(gfx_info.PREF_AUTO)
+        assert int(cfg2.value("gfx_software", 1)) == 0
+        _got = str(cfg2.value("gfx_adapter", ""))
+        assert _got == gfx_info.PREF_AUTO, (
+            f"gfx_adapter={_got!r} saved={win2._gfx_prefer_saved!r} "
+            f"eff={win2._gfx_prefer!r} soft_saved={win2._gfx_software_saved!r}")
+        # 选同一个值不算改动: 不写盘(盘上被外部改过也不会被覆盖)、不弹窗
+        cfg2.setValue("gfx_adapter", "别的卡|Vulkan")
+        win2._on_pick_adapter(gfx_info.PREF_AUTO)
+        assert str(cfg2.value("gfx_adapter", "")) == "别的卡|Vulkan", \
+            "选的是当前已保存的值 → 不该再写一次"
+        # 菜单项齐全: 自动 / 强制软件 / 当前渲染方式
+        assert gfx_info.PREF_AUTO in win2._gfx_actions
+        assert gfx_info.PREF_SOFTWARE in win2._gfx_actions
+        assert win2.act_gfx_software.isCheckable()
+    finally:
+        rw.QMessageBox.information = _saved_info
+        win2.close()
+
+    # ⑥ 枚举本身不该抛(本机没有显卡时返回空列表 + 原因)
+    opts, err = gfx_info.enumerate_adapters()
+    assert isinstance(opts, list), opts
+    if err:
+        assert not opts
+    results.append("显卡设置(自动/指定/强制软件/崩溃回退) OK")
+
+
 def test_sound(tmpdir: str):
     """提示音: 默认用 Windows 自带音效, 音量靠重采样(不动系统音量), 设置可持久化。"""
     from PyQt6.QtCore import QSettings
@@ -2572,14 +2726,18 @@ def test_eye_icon_no_overlap(tmpdir: str):
 
 
 def make_window(tmpdir: str, name: str) -> RouteTesterWindow:
-    """测试用窗口: **不启动 8111 轮询**, 地图缓存指向临时目录。
+    """测试用窗口: **不启动 8111 轮询**, 地图缓存与配置都指向临时目录。
 
     否则测试会真的去访问本机 8111(游戏可能在跑)并把地图图片写进真实 data/maps,
     既让断言变脆(会多出没录过轨迹的地图), 也污染用户数据。
+    `settings` 尤其重要: 显卡/轮询间隔/显示开关都存在 QSettings 里,
+    用真实配置会让"跑一遍测试"直接改掉用户的设置。
     """
     store = RouteStore(os.path.join(tmpdir, name))
     cache = MapCache(os.path.join(tmpdir, "maps_" + name))
-    return RouteTesterWindow(store, map_cache=cache, start_recorder=False)
+    cfg = QSettings(os.path.join(tmpdir, "cfg_" + name + ".ini"),
+                    QSettings.Format.IniFormat)
+    return RouteTesterWindow(store, map_cache=cache, start_recorder=False, settings=cfg)
 
 
 def routes_of(top) -> list:
@@ -4227,8 +4385,9 @@ def test_dead_style(tmpdir: str):
     view.set_playback(None)
 
     # ⑥ 窗口层: 两个勾选框**默认都勾上**, 一改就作用到地图并记住设置
-    from PyQt6.QtCore import QSettings
-    conf = QSettings("WTBlackList", "RouteTester")
+    # (配置用临时 ini —— 测试绝不能读写用户真实的 QSettings)
+    conf = QSettings(os.path.join(tmpdir, "cfg_deadwin.json.ini"),
+                     QSettings.Format.IniFormat)
     keep = (conf.value("dead_dim"), conf.value("dead_mark"))
     try:
         conf.remove("dead_dim")
@@ -4430,6 +4589,7 @@ def main() -> int:
     test_eye_visibility_opacity(tmpdir)
     test_playback_lock(tmpdir)
     test_rate_menu(tmpdir)
+    test_gfx_settings(tmpdir)
     test_recording_end_eye(tmpdir)
     test_record_overlay(tmpdir)
     test_playback_source_selection(tmpdir)

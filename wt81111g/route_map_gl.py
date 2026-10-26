@@ -14,6 +14,24 @@
 已知取舍:
 * 段长 < 线宽时 pygfx 厚线会画成“一颗颗珠子”(接头缩短), 用户已确认可接受;
 * 中文字体要显式注册(`_register_cjk_font`)。
+
+**支持范围(用户 2026-10-27 定下的用户画像)**:
+
+| 项 | 结论 |
+|---|---|
+| 操作系统 | **只支持 Windows 桌面**; 不做 macOS —— 用 macOS 的人不需要这个软件 |
+| 显卡 | 2012 年之后的卡(DX12 FL11_0 / GL 3.3 一代); 再早的驱动早已停更, 不提供支持 |
+| 远程桌面 / 云电脑 / 虚拟机 | **明确不支持**(反作弊本身就过不去) |
+| 兜底 | **仍然保留**, 而且是两条: 软件渲染(QPainter) 与 WARP(D3D12 的 CPU 光栅化) |
+
+“门槛是 2012 年”只是给人看的说法; 程序里**唯一可靠的判据**是适配器支不支持
+`float32-filterable` —— 那是 pygfx 在 import 时就写死的 `required_features`,
+拿不到的适配器**根本建不出 device**(见 `tools/probe_gpu_caps.py`)。
+所以老显卡不是“按年份拒绝”, 而是“建 device 时失败 → 弹窗让用户更新驱动”。
+
+⚠ WARP 也满足这个特性(实测), 所以“没显卡”时 wgpu 依然会**成功**返回一块适配器 ——
+只是它跑在 CPU 上, 比 QPainter 还慢。所以判“有没有显卡”必须看
+`info["adapter_type"] == "CPU"`, 不能只看“拿到了适配器没有”。
 """
 from __future__ import annotations
 
@@ -34,43 +52,172 @@ import pylinalg as la
 from pygfx.utils.text import font_manager as _font_manager
 
 from . import route_map_view as rmv
+from .gfx_info import (
+    BACKEND_RANK, GpuNotice, PREF_AUTO, PREF_SOFTWARE, PYGFX_REQUIRED,
+    adapter_option, describe_adapter, gpu_usable,
+)
 from .route_map_view import RouteMapView, bucket_index, speed_color
 
 log = logging.getLogger("route_map_gl")
 
 
-def _gpu_usable() -> bool:
-    """能不能安全地创建 GPU 画布。
+# ================================================================ 适配器选择
+# pygfx 的 device 是**全局单例**(`pygfx.renderers.wgpu.engine.shared.Shared._instance`,
+# 里面还有 `assert Shared._instance is None`), 而 wgpu 官方给了在建 device **之前**
+# 指定适配器的注入口:
+#
+#     wgpu.preconfigure_default_device("owner", adapter=某块适配器)
+#
+# 之后第一次 `gfx.WgpuRenderer(...)` 建出来的 device 就用它(实测见
+# `tools/probe_pick_adapter.py`: 指定 WARP / 指定 D3D12 都能精确命中)。
+#
+# ⚠ 三条硬约束:
+#   1. 只能在**第一次**建 renderer 之前调 —— device 建好后再调会 `RuntimeError`。
+#      所以"设置里改显卡"只能**存起来 + 提示重启**, 不能热切换。
+#   2. `PYGFX_WGPU_ADAPTER_NAME` 环境变量也能选, 但**找不到时 pygfx import 就抛
+#      ValueError**(整个模块炸掉) —— 所以我们不用它, 一律走 API。
+#   3. 判"有没有显卡"必须看 `adapter_type`: WARP 的 adapter_type 是 `"CPU"`,
+#      它也能建 device、也能渲染, 只是慢得离谱。
+#
+# 数据类型与常量在 `gfx_info.py`(它不 import wgpu, 菜单/弹窗可以安全导入)。
 
-    **必须在创建 canvas 之前判断**: 在 `QT_QPA_PLATFORM=offscreen`/`minimal` 这类没有
-    真实窗口系统的平台上, wgpu 配置 surface 会在 **Rust 层直接 panic**
-    (`wgpuSurfaceConfigure: Surface does not support the adapter's queue family`),
-    那是 try/except 抓不住的进程级崩溃 —— 所以测试/无头环境一律走软件渲染。
+
+def _pick_adapter(preferred: str):
+    """按存盘的 key(或 `PREF_AUTO`)挑一块适配器。
+
+    返回 `(adapter, note)` —— `note` 非空表示"用户选的那块没找到, 已改用自动选择",
+    主窗口会把这句话显示出来(不弹窗: 程序照常能用, 只是用了他没选的那块)。
+
+    **自动模式下永远不选 WARP**: WARP 是 D3D12 的 CPU 光栅化, 画起来比
+    QPainter 软件渲染还慢, 只在用户**显式选**它时才用(留着它是为了能实测对比)。
     """
-    if os.environ.get("WT_MAP_SOFTWARE", "") not in ("", "0"):
-        return False
-    app = QApplication.instance()
-    if app is not None and app.platformName().lower() in ("offscreen", "minimal", "vnc"):
-        return False
-    return True
+    import wgpu
+
+    raw = list(wgpu.gpu.enumerate_adapters_sync())
+    if not raw:
+        raise LookupError("系统没有提供任何图形适配器")
+
+    if preferred and preferred not in (PREF_AUTO, PREF_SOFTWARE):
+        for a in raw:
+            if adapter_option(a).key == preferred:
+                return a, ""
+        note = (f"设置里指定的显卡已不可用({preferred}) —— "
+                "可能换了驱动、显卡被禁用或者换了机器, 本次改用自动选择")
+    else:
+        note = ""
+
+    # 自动: 只认真显卡, 同类里按后端偏好(D3D12 > Vulkan > OpenGL)
+    gpus = [a for a in raw if not adapter_option(a).is_fallback]
+    if not gpus:
+        raise LookupError(
+            "只找到 WARP / Microsoft Basic Render Driver 这类 CPU 模拟适配器 —— "
+            "说明这台机器没有可用的显卡驱动(或被远程桌面接管了)")
+
+    def rank(a):
+        return BACKEND_RANK.get(adapter_option(a).backend, 5)
+
+    return min(gpus, key=rank), note
 
 
-def create_map_view(parent=None) -> RouteMapView:
+def create_map_view(parent=None, *, prefer: str = PREF_AUTO,
+                    force_software: bool = False) -> RouteMapView:
     """主程序用的工厂: 优先 GPU 画布, 不行就回退软件渲染。
 
-    环境变量 `WT_MAP_SOFTWARE=1` 可强制走软件渲染(排查显卡/驱动/远程桌面问题时用)。
-    任何异常(没装 pygfx、wgpu 找不到适配器、GL 上下文创建失败…)都回退, 保证程序能开。
+    * `prefer` —— 用户在「设置 → 图形」里选的适配器 key, 或 `PREF_AUTO` / `PREF_SOFTWARE`;
+    * `force_software` —— 强制软件绘制(与 `WT_MAP_SOFTWARE=1` 等价);
+
+    返回的控件上会挂两个属性供主程序使用(软件渲染时也有):
+
+    * `gpu_notice` —— `GpuNotice | None`。非空 = 没能用上 GPU, **该弹一次窗告诉用户**
+      (以前是静默回退, 用户只会觉得卡);
+    * `gpu_adapter` —— 实际用的适配器摘要, 例如
+      `"NVIDIA GeForce RTX 3060 Laptop GPU (DiscreteGPU) via Vulkan"` 或 `"软件渲染(QPainter)"`。
+
+    任何异常(没装 pygfx、wgpu 找不到适配器、驱动太老、GL 上下文创建失败…)都回退,
+    保证程序能开 —— 用户的机器再差也不该"打不开"。
     """
-    if not _gpu_usable():
-        log.info("GPU 画布不可用(环境变量或无头平台) → 软件渲染")
-        return RouteMapView(parent)
+    notice: GpuNotice | None = None
+    summary = "软件渲染(QPainter)"
+
+    ok, why = gpu_usable(force_software)
+    if not ok:
+        log.info("GPU 画布不可用(%s) → 软件渲染", why)
+        view = RouteMapView(parent)
+        view.gpu_notice = None          # 用户自己选的 / 无头环境: 不用打扰他
+        view.gpu_adapter = summary
+        return view
+
+    def _fallback(ntc: GpuNotice) -> RouteMapView:
+        view = RouteMapView(parent)
+        view.gpu_notice = ntc
+        view.gpu_adapter = summary
+        return view
+
+    # ① 枚举 + 按设置挑适配器(这一步失败基本就是驱动/组件问题)
+    try:
+        chosen, note = _pick_adapter(prefer)
+    except LookupError as exc:
+        return _fallback(GpuNotice(
+            kind="no-adapter", title="没有找到可用的显卡",
+            body="系统只提供了软件模拟(CPU)适配器, 或者显卡驱动没有正常工作。\n\n"
+                 "地图已改用软件绘制 —— 能用, 但线条多的时候会慢。\n\n"
+                 "建议: 更新显卡驱动后重启本程序。",
+            detail=str(exc)))
+    except Exception as exc:            # noqa: BLE001 - 驱动层异常五花八门
+        log.exception("枚举显卡失败")
+        return _fallback(GpuNotice(
+            kind="driver", title="无法访问显卡",
+            body="程序没能从显卡驱动那里拿到可用的图形设备。\n\n"
+                 "地图已改用软件绘制。\n\n"
+                 "建议: 更新显卡驱动(Intel / AMD / NVIDIA 官网), 然后重启本程序。\n"
+                 f"技术细节: {type(exc).__name__}: {exc}",
+            detail=repr(exc)))
+    if note:
+        log.warning(note)
+
+    # ② 让 pygfx 用这块适配器建 device(必须在第一次建 renderer 之前)
+    chosen_summary = describe_adapter(chosen)
+    try:
+        import wgpu
+        wgpu.preconfigure_default_device("wt81111g", adapter=chosen)
+    except RuntimeError as exc:
+        # device 已经建过了 → 说明这个进程里早就有一份 GPU 画布了。
+        # 这时**不能**再改口(全局单例), 但也不必失败: 沿用已有的 device。
+        log.info("device 已存在, 沿用先前选定的适配器(%s)", exc)
+    except Exception as exc:            # noqa: BLE001
+        log.exception("指定显卡失败: %s", chosen_summary)
+        return _fallback(GpuNotice(
+            kind="driver", title="显卡初始化失败",
+            body=f"选中「{chosen_summary}」后没能建出图形设备。\n\n"
+                 "地图已改用软件绘制。\n\n"
+                 "建议: 更新显卡驱动; 或者在「设置 → 图形」里换一块显卡试试。\n"
+                 f"技术细节: {type(exc).__name__}: {exc}",
+            detail=repr(exc), extra={"adapter": chosen_summary}))
+
+    # ③ 真建画布
     try:
         view = RouteMapGlView(parent)
-        log.info("地图画布: GPU (pygfx/wgpu)")
-        return view
-    except Exception:  # noqa: BLE001
-        log.exception("GPU 画布初始化失败, 回退软件渲染")
-        return RouteMapView(parent)
+    except Exception as exc:            # noqa: BLE001
+        log.exception("GPU 画布初始化失败(%s), 回退软件渲染", chosen_summary)
+        return _fallback(GpuNotice(
+            kind="driver", title="显卡能识别, 但画不出来",
+            body=f"已经认出显卡「{chosen_summary}」, 可是建渲染窗口时失败 —— "
+                 "多半是驱动版本太旧(或者驱动和 wgpu 不兼容)。\n\n"
+                 "地图已改用软件绘制。\n\n"
+                 "建议: 更新显卡驱动; 更新后仍然这样, 就在「设置 → 图形」里"
+                 "换成另一块显卡或 WARP 试试。\n"
+                 f"技术细节: {type(exc).__name__}: {exc}",
+            detail=repr(exc), extra={"adapter": chosen_summary}))
+
+    log.info("地图画布: GPU —— %s%s", chosen_summary,
+             f"(设置指定: {prefer})" if prefer not in (PREF_AUTO, "") else "")
+    # 注意 `note` 只表示"你选的那块没了, 已自动换一块", 程序照常是 GPU 加速的 ——
+    # 所以 kind 用 adapter-gone(主窗口只弹"提醒", 不弹"出错了")。
+    view.gpu_notice = GpuNotice(
+        kind="adapter-gone", title="指定的显卡换了", body=note) if note else None
+    view.gpu_adapter = chosen_summary
+    return view
+
 
 # ---------------------------------------------------------------- 常量
 BG_COLOR = rmv.COLOR_BG.name() if isinstance(rmv.COLOR_BG, QColor) else "#0f172a"

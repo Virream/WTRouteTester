@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 
-from PyQt6.QtCore import QSettings, QSize, Qt
+from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
 from PyQt6.QtGui import (
     QAction, QActionGroup, QBrush, QCloseEvent, QColor, QFont, QIcon, QPalette,
 )
@@ -37,6 +38,7 @@ from .global_hotkey import (
     ACTION_LABELS, DEFAULT_BINDINGS, GlobalHotkey, GlobalHotkeyWatcher, describe_binding,
     load_bindings, reset_bindings, save_bindings,
 )
+from .gfx_info import PREF_AUTO, PREF_SOFTWARE, AdapterOption, GpuNotice, enumerate_adapters
 from .help_text import about_html
 from .hotkey_dialog import HotkeyDialog
 from .icons import ICON_SIZE, circle_icon, eye_icon, pin_icon
@@ -83,19 +85,43 @@ def _log_file_path() -> str:
     return ""
 
 
-def _create_map_view(parent) -> RouteMapView:
+def _create_map_view(parent, *, prefer: str = PREF_AUTO,
+                     force_software: bool = False) -> RouteMapView:
     """建地图控件: 优先 GPU(pygfx), 不行就软件渲染。
 
     这里**必须惰性导入** `route_map_gl`: 它一 import 就会加载 `wgpu-native` 的 DLL,
     而无头/offscreen 平台下这会和 Qt 冲突(实测整个进程 0xC000041D 崩掉, 连测试都跑不了),
     而且普通用户也省掉几百毫秒启动时间。`create_map_view` 内部还会判平台与异常回退。
+
+    返回值上挂着 `gpu_notice`(`GpuNotice | None`)与 `gpu_adapter`(用的哪块卡),
+    主窗口据此决定要不要弹一次窗 —— **以前是静默回退软件渲染**,
+    用户只会觉得"为什么这么卡", 完全不知道原因。
     """
     try:
         from .route_map_gl import create_map_view
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.exception("GPU 画布模块导入失败, 使用软件渲染")
-        return RouteMapView(parent)
-    return create_map_view(parent)
+        view = RouteMapView(parent)
+        view.gpu_notice = GpuNotice(
+            kind="missing", title="GPU 加速组件缺失",
+            body="程序里负责显卡加速的组件没能加载(pygfx / wgpu)。\n\n"
+                 "地图已改用软件绘制 —— 能用, 但线条多的时候会慢。\n\n"
+                 "如果是自己打包的版本, 请检查打包是否漏了 wgpu 的 DLL;\n"
+                 "如果是官方发布版, 请把这个日志发给作者。",
+            detail=f"{type(exc).__name__}: {exc}")
+        view.gpu_adapter = "软件渲染(QPainter)"
+        return view
+    return create_map_view(parent, prefer=prefer, force_software=force_software)
+
+
+def _gpu_module_loaded() -> bool:
+    """本进程里 GPU 画布模块**已经成功导入**了吗?
+
+    菜单里要枚举显卡, 而枚举就得 `import wgpu` —— 在无头/离屏平台上那会让整个进程
+    崩掉(见 `_create_map_view`)。所以只在"已经加载过"的前提下才枚举:
+    加载过就说明平台没问题, 再 import 一次是空操作。
+    """
+    return f"{__package__}.route_map_gl" in sys.modules
 
 
 # 采样间隔选项(毫秒):
@@ -150,14 +176,16 @@ class RouteTesterWindow(QMainWindow):
     """跑图线路测试器主窗口。"""
 
     def __init__(self, store: RouteStore | None = None, parent=None,
-                 map_cache: MapCache | None = None, start_recorder: bool = True):
+                 map_cache: MapCache | None = None, start_recorder: bool = True,
+                 settings: QSettings | None = None):
         super().__init__(parent)
         self.setWindowTitle("跑图线路测试器 —— 战争雷霆")
         self.resize(1400, 880)
 
         self.store = store or RouteStore()
         # 地图图片本地缓存: 关掉游戏后仍能用缓存的底图看回放
-        # (map_cache / start_recorder 可注入: 测试里指向临时目录且不启动真实 8111 轮询)
+        # (map_cache / start_recorder / settings 可注入: 测试里指向临时目录/临时配置,
+        #  且不启动真实 8111 轮询 —— 否则会**写进用户真实的 QSettings**)
         # 必须在 _reload_tree() 之前赋值 —— 侧栏会用它判断“哪些地图只有缓存图片”
         self.map_cache = map_cache if map_cache is not None else MapCache()
         # 同一张地图可能被 8111 以不同分辨率发过来(1024²/2048²/4096²) —— 老版本会按
@@ -194,7 +222,10 @@ class RouteTesterWindow(QMainWindow):
         # 采样/轮询间隔(毫秒)持久化(PyQt 自带的 QSettings)。
         # **三档分开**(2026-10-23 用户要求): 单条录制 / 全局录制 / hudmsg。
         # 入口在菜单「设置 → 轮询间隔」—— 主界面不再放这个下拉框(见上方常量注释)。
-        self._settings = QSettings("WTBlackList", "RouteTester")
+        # 可注入: 测试必须用**临时配置**, 否则会改写用户真实设置
+        # (以前就踩过: 测试跑一遍, 用户的轮询间隔/显示开关全被改掉)。
+        self._settings = settings if settings is not None else QSettings(
+            "WTBlackList", "RouteTester")
         # 默认值改过(见 SETTINGS_VERSION) → 把老用户存的值清掉, 让新默认生效
         try:
             _ver = int(self._settings.value("settings_version", 1))
@@ -248,6 +279,56 @@ class RouteTesterWindow(QMainWindow):
             self._show_airfields = int(self._settings.value("show_airfields", 1)) != 0
         except (TypeError, ValueError):
             self._show_airfields = True
+        # ---- 图形(显卡)设置(用户 2026-10-27 要求可在设置里指定用哪块卡)
+        # 存的格式: "auto" = 自动选择 / "<device>|<backend>" = 指定某块适配器;
+        # 「强制软件绘制」单独一个布尔(勾上就不碰 GPU, 连枚举都不做)。
+        self._gfx_prefer = str(self._settings.value("gfx_adapter", PREF_AUTO) or PREF_AUTO)
+        try:
+            self._gfx_software = int(self._settings.value("gfx_software", 0)) != 0
+        except (TypeError, ValueError):
+            self._gfx_software = False
+        # 上面两个是**本次生效**的值(菜单勾选 / 崩溃标记都看它们)。
+        # 下面两个是**存进设置、下次启动才生效**的值 —— 两者必须分开:
+        # 用户改了设置但还没重启时, "现在是 GPU 在跑"这件事不能跟着变,
+        # 否则 `_clear_gfx_pending` 会以为走的是软件渲染、不去抹崩溃标记。
+        self._gfx_prefer_saved = self._gfx_prefer
+        self._gfx_software_saved = self._gfx_software
+        # 上次启动是不是在用 GPU 画布时**崩掉**了。
+        # 为什么需要它: wgpu 配置 surface 失败会在 **Rust 层 panic** —— try/except 抓不住,
+        # 打包版还是 --windowed(无控制台), 用户看到的就是"闪退、什么都没有"。
+        # 所以启动时先留一个"我正在尝试 GPU"的标记, 画布活过几秒再抹掉;
+        # 下次启动发现标记还在 = 上次崩了 → 这次直接走软件渲染, 至少能打开。
+        try:
+            self._gfx_crashed_before = int(self._settings.value("gfx_pending", 0)) != 0
+        except (TypeError, ValueError):
+            self._gfx_crashed_before = False
+        self._gpu_notice: GpuNotice | None = None
+        self._gpu_notice_shown = False
+        self._gpu_adapters: list[AdapterOption] = []
+        self._gpu_adapters_error = ""
+        if self._gfx_crashed_before and not self._gfx_software:
+            log.warning("上次启动时 GPU 画布没能活下来(可能崩在 wgpu 内部) → 本次强制软件渲染")
+            self._gfx_software = True
+            # **持久化**: 下次也别再试了。用户修好驱动后要自己取消「强制软件绘制」
+            # (提示里就是这么写的), 否则每次启动都要崩一次。
+            self._settings.setValue("gfx_software", 1)
+            self._settings.setValue("gfx_pending", 0)
+            self._settings.sync()
+            self._gfx_software_saved = True
+            self._gpu_notice = GpuNotice(
+                kind="crashed", title="上次用显卡渲染时程序崩了",
+                body="这个版本的显卡渲染在你的机器上没能正常启动(程序和驱动之间的问题),\n"
+                     "所以本次先用**软件绘制**启动 —— 能正常用, 只是线条多的时候会慢。\n\n"
+                     "可以试试:\n"
+                     "  · 更新显卡驱动;\n"
+                     "  · 在「设置 → 图形」里换另一块显卡(例如核显/独显互换), 再取消"
+                     "「强制软件绘制」重启。",
+                )
+        else:
+            # 留标记: 只有真的走 GPU 才需要(软件渲染不会崩在 wgpu 里)
+            if not self._gfx_software:
+                self._settings.setValue("gfx_pending", 1)
+                self._settings.sync()      # 必须**立刻**落盘 —— 崩了就没机会再写了
         # 录制叠加层(独立透明置顶窗, 显示录制进度/实际采集率; 默认关闭)
         self._overlay_settings = self._load_overlay_settings()
 
@@ -264,6 +345,13 @@ class RouteTesterWindow(QMainWindow):
         # 叠加层对象必须在 _build_menu 之后建(菜单要读 _overlay_settings),
         # 且必须在 recorder 之前 —— _on_tick 每帧都会用到它
         self.overlay = RecordOverlay(self._overlay_settings, parent=None)
+        # 显卡提示: 延到事件循环转起来再弹(那时主窗口已经画出来了, 弹窗有正确的父窗口)。
+        # 无头/离屏环境下 `_show_gpu_notice` 自己会跳过 —— 测试不会被阻塞。
+        QTimer.singleShot(300, self._show_gpu_notice)
+        # 画布活过 4 秒 → 认为"这次 GPU 启动成功", 抹掉崩溃标记。
+        # 为什么要等: wgpu 的 panic 常常发生在 surface configure(也就是渲染头几帧),
+        # 那一刻之前的代码都已经"成功返回"了 —— 只有真跑几帧才说明没问题。
+        QTimer.singleShot(4000, self._clear_gfx_pending)
         self.map_view.set_show_zones(self._show_zones)
         self.map_view.set_show_spawns(self._show_spawns)
         self.map_view.set_show_airfields(self._show_airfields)
@@ -379,6 +467,72 @@ class RouteTesterWindow(QMainWindow):
         self.act_airfields.toggled.connect(self._on_show_airfields)
         setting.addAction(self.act_airfields)
 
+        # ---- 图形(显卡): 用户 2026-10-27 要求"默认自动, 用户觉得有必要就自己指定"。
+        # 适配器列表只在本进程**真的加载过** GPU 模块时才枚举 ——
+        # 无头/离屏平台上 import wgpu 会让整个进程崩掉(见 _create_map_view 的说明)。
+        setting.addSeparator()
+        gfx_menu = setting.addMenu("图形(&G)")
+        self._gfx_group = QActionGroup(self)
+        self._gfx_group.setExclusive(True)
+        self._gfx_actions: dict[str, QAction] = {}
+        act_auto = QAction("自动选择(推荐)", self)
+        act_auto.setCheckable(True)
+        act_auto.setToolTip(
+            "让程序自己挑: 优先真显卡(D3D12 → Vulkan → OpenGL), **不会**挑 WARP。\n"
+            "笔记本双显卡时如果发现选错了卡(比如跑在核显上), 再手动指定。")
+        act_auto.triggered.connect(lambda _c=False: self._on_pick_adapter(PREF_AUTO))
+        self._gfx_group.addAction(act_auto)
+        gfx_menu.addAction(act_auto)
+        self._gfx_actions[PREF_AUTO] = act_auto
+
+        if _gpu_module_loaded():
+            self._gpu_adapters, self._gpu_adapters_error = enumerate_adapters()
+        for opt in self._gpu_adapters:
+            act = QAction(opt.label, self)
+            act.setCheckable(True)
+            act.setToolTip(
+                f"{opt.detail}\n"
+                + ("⚠ 这是 **CPU 软件模拟**(WARP) —— 能用, 但比软件绘制还慢,\n"
+                   "  只在排查问题时选它。\n" if opt.is_fallback else
+                   "选中后**重启程序**才会生效。\n"))
+            act.triggered.connect(
+                lambda _c=False, k=opt.key: self._on_pick_adapter(k))
+            self._gfx_group.addAction(act)
+            gfx_menu.addAction(act)
+            self._gfx_actions[opt.key] = act
+        if self._gpu_adapters_error:
+            hint = QAction(f"（枚举显卡失败: {self._gpu_adapters_error}）", self)
+            hint.setEnabled(False)
+            gfx_menu.addAction(hint)
+        elif _gpu_module_loaded() and not self._gpu_adapters:
+            hint = QAction("（没有枚举到任何显卡）", self)
+            hint.setEnabled(False)
+            gfx_menu.addAction(hint)
+
+        gfx_menu.addSeparator()
+        self.act_gfx_software = QAction("强制软件绘制(不用 GPU, 最慢但最保险)", self)
+        self.act_gfx_software.setCheckable(True)
+        self.act_gfx_software.setChecked(self._gfx_software)
+        self.act_gfx_software.setToolTip(
+            "完全不碰显卡: 用 QPainter 画线。\n"
+            "显卡驱动有问题、远程桌面/虚拟机里跑、或者不确定是不是显卡导致卡顿时勾它。\n"
+            "⚠ 改了以后**重启程序**才生效。")
+        self.act_gfx_software.triggered.connect(
+            lambda _c=False: self._on_pick_adapter(PREF_SOFTWARE))
+        # 三种选择互斥: 自动 / 某块卡 / 强制软件 —— 所以它也在同一个动作组里
+        self._gfx_group.addAction(self.act_gfx_software)
+        gfx_menu.addAction(self.act_gfx_software)
+        self._gfx_actions[PREF_SOFTWARE] = self.act_gfx_software
+        act_gfx_info = QAction("当前用的渲染方式…", self)
+        act_gfx_info.triggered.connect(self._show_gfx_info)
+        gfx_menu.addAction(act_gfx_info)
+        # 勾选状态按**本次实际生效**的来(含"上次崩了自动切软件"的情况)。
+        # 指定的那块卡如果已经不存在了, 就把「自动」勾上 —— 这也正是运行时会做的事。
+        _cur = PREF_SOFTWARE if self._gfx_software else self._gfx_prefer
+        if _cur not in self._gfx_actions:
+            _cur = PREF_AUTO
+        self._gfx_actions[_cur].setChecked(True)
+
         # ---- 轮询间隔: 从信息区挪到菜单(2026-10-23)。
         # 用户口径: “采样设置不该让用户经常改, 最好是定在一个合适的数值, 现在这项功能
         # 在主界面太显眼, 用户可能没事干就会调得过高或过低导致 bug。”
@@ -476,9 +630,101 @@ class RouteTesterWindow(QMainWindow):
         act_about.triggered.connect(self._show_about)
         help_menu.addAction(act_about)
 
+    # ------------------------------------------------------------ 图形(显卡)
+    def _on_pick_adapter(self, key: str) -> None:
+        """菜单「设置 → 图形」里选了 自动 / 某块卡 / 强制软件绘制。
+
+        **只存不改**: pygfx 的 device 是全局单例, 建好之后不能再换 ——
+        所以三项都是"下次启动生效", 界面上必须这么说, 别让用户以为是热切换。
+        """
+        if key == PREF_SOFTWARE:
+            new_prefer, new_soft = self._gfx_prefer_saved, True
+        else:
+            new_prefer, new_soft = key, False
+        if (new_prefer, new_soft) == (self._gfx_prefer_saved, self._gfx_software_saved):
+            return
+        self._settings.setValue("gfx_adapter", new_prefer)
+        self._settings.setValue("gfx_software", 1 if new_soft else 0)
+        # 换了显卡/换回 GPU → 把"上次崩过"的结论作废, 让下次启动真的去试一次。
+        # (否则用户修好驱动、选回显卡, 却因为旧标记仍然走软件, 会以为设置没生效)
+        self._settings.setValue("gfx_pending", 0)
+        self._settings.sync()
+        self._gfx_prefer_saved, self._gfx_software_saved = new_prefer, new_soft
+        if new_soft:
+            what = "软件绘制(QPainter)"
+        elif key == PREF_AUTO:
+            what = "自动选择显卡"
+        else:
+            what = f"指定显卡「{key.replace('|', ' / ')}」"
+        log.info("图形设置改为 %s(下次启动生效)", what)
+        QMessageBox.information(
+            self, "图形设置",
+            f"已记录: {what}\n\n"
+            "⚠ 这个设置**重启程序后才生效** —— 显卡渲染设备只能在启动时建一次。")
+
+    def _show_gfx_info(self) -> None:
+        """菜单「设置 → 图形 → 当前用的渲染方式…」: 把实际状态摆出来。
+
+        用户报"卡"时让他点这里, 一眼就能看出是走了 WARP、走了软件渲染,
+        还是显卡正常(而卡在别的地方)。
+        """
+        lines = [f"本次实际使用: {getattr(self.map_view, 'gpu_adapter', '未知')}", ""]
+        lines.append(f"设置项: gfx_adapter = {self._gfx_prefer!r}, "
+                     f"gfx_software = {int(self._gfx_software)}")
+        if self._gfx_software:
+            lines.append("  （强制软件绘制 / 或上次启动崩溃后自动切换）")
+        lines.append("")
+        if not _gpu_module_loaded():
+            lines.append("GPU 模块没有加载(无头平台或组件缺失), 未枚举显卡。")
+        elif self._gpu_adapters_error:
+            lines.append(f"枚举显卡失败: {self._gpu_adapters_error}")
+        else:
+            lines.append(f"本机共 {len(self._gpu_adapters)} 块适配器:")
+            for i, opt in enumerate(self._gpu_adapters, 1):
+                mark = " ←★" if opt.key == self._gfx_prefer else ""
+                lines.append(f"  [{i}] {opt.label}   ({opt.detail}){mark}")
+        lines.append("")
+        lines.append("说明: 只有 Windows 桌面被支持; 远程桌面 / 云电脑 / 虚拟机不保证可用;")
+        lines.append("      2012 年之前的显卡(DX12 之前)驱动已停止维护, 同样不支持。")
+        lines.append("细节见 data\\route_tester.log。")
+        QMessageBox.information(self, "渲染方式", "\n".join(lines))
+
+    def _show_gpu_notice(self) -> None:
+        """启动后把 `gpu_notice` 弹一次 —— 让用户知道"为什么没用上显卡"。
+
+        以前是静默回退软件渲染, 用户只觉得卡, 完全不知道原因。
+        **无头/离屏环境不弹**(测试会卡死), 只写日志。
+        """
+        notice = self._gpu_notice or getattr(self.map_view, "gpu_notice", None)
+        if notice is None or self._gpu_notice_shown:
+            return
+        self._gpu_notice_shown = True
+        log.warning("显卡提示[%s] %s | %s", notice.kind, notice.title, notice.body)
+        app = QApplication.instance()
+        if app is not None and app.platformName().lower() in ("offscreen", "minimal", "vnc"):
+            return
+        icon = (QMessageBox.Icon.Information if notice.kind == "adapter-gone"
+                else QMessageBox.Icon.Warning)
+        box = QMessageBox(icon, "显卡", notice.as_text(), QMessageBox.StandardButton.Ok, self)
+        box.setDetailedText(
+            (notice.detail or "") + "\n\n"
+            "可以在「设置 → 图形」里手动指定显卡, 或勾选「强制软件绘制」去掉这条提示。")
+        box.exec()
+
+    def _clear_gfx_pending(self) -> None:
+        """画布活下来了 → 抹掉"我正在尝试 GPU"的标记。
+
+        只在**已经用上 GPU**时才需要(软件渲染不会崩在 wgpu 里)。
+        调用时机见 `__init__` 里那个 4 秒的 QTimer。
+        """
+        if self._gfx_software:
+            return
+        if self._settings.contains("gfx_pending"):
+            self._settings.setValue("gfx_pending", 0)
+            self._settings.sync()
+
     def _show_about(self) -> None:
         """菜单「帮助 → 关于」: 全部说明都收在这里。
-
         界面上不再放常驻提示文字(侧栏底部、信息区那几行已删除) ——
         那些文字只在第一次用的时候有用, 之后纯粹是占地方。
         """
@@ -706,7 +952,8 @@ class RouteTesterWindow(QMainWindow):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
 
-        self.map_view = _create_map_view(right)
+        self.map_view = _create_map_view(right, prefer=self._gfx_prefer,
+                                         force_software=self._gfx_software)
         rl.addWidget(self.map_view, 1)
         rl.addWidget(self._build_info_panel(right), 0)
         splitter.addWidget(right)
@@ -3219,6 +3466,9 @@ class RouteTesterWindow(QMainWindow):
             self.player.pause()
             self.recorder.stop()
             self.overlay.close()          # 叠加层是独立顶层窗, 不关会留在屏幕上
+            # 正常退出 = GPU 画布这一路没问题 → 抹掉"正在尝试 GPU"的标记,
+            # 否则用户开机 2 秒就关掉时, 下次启动会被误判成"上次崩了"。
+            self._clear_gfx_pending()
             # 写盘在后台线程里做(见 `RouteStore.request_save`), 这里**等它做完** ——
             # 不等的话进程一退, 用户刚录的那条就没了。
             self.store.flush()
