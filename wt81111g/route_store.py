@@ -1857,6 +1857,57 @@ class RouteStore:
             self.save()
         return changed
 
+    def adopt_session(self, tmp_path: str) -> GlobalRecord | None:
+        """接管一个**已经写好**的会话文件(并行解析的成果) —— **不再重新打包**。
+
+        与 `add_global()` 的区别: 点已经在文件里了, 所以这里不碰点、不标脏 id,
+        只做三件事 —— 把文件挪进 `routes.sessions/`、按头部建出内存里的元数据、
+        把地图名 / 已知地图登记上。
+
+        这是「一局一文件」结构的红利: 子进程(见 `import_pool`)自己就能把一局压成
+        完整会话, 主进程接手时**连打包都省了**, 只读几百字节的头部。
+        文件坏了返回 None(调用方当这一局失败)。
+        """
+        head = session_store.read_header(tmp_path)
+        if not head:
+            log.warning("接管的会话文件读不出头部: %s", tmp_path)
+            return None
+        rid = str(head.get("id") or "")
+        if not rid:
+            return None
+        dst = session_store.session_path(self.sessions_dir, rid)
+        try:
+            os.makedirs(self.sessions_dir, exist_ok=True)
+            os.replace(tmp_path, dst)          # 同盘原子替换
+        except OSError as exc:
+            log.error("接管会话失败(挪动文件): %s", exc)
+            return None
+        kind = str(head.get("kind") or "route")
+        try:
+            rec = (self._global_from_header(head, dst) if kind == "global"
+                   else self._route_from_header(head, dst))
+        except (TypeError, ValueError, KeyError) as exc:
+            log.warning("接管的会话头部有问题 %s: %s", os.path.basename(dst), exc)
+            return None
+        if rec is None:
+            return None
+        with self._lock:
+            if isinstance(rec, GlobalRecord):
+                self.globals.append(rec)
+            else:
+                self.routes.append(rec)
+            if (rec.map_key and rec.map_name
+                    and not (self.map_names.get(rec.map_key) or "").strip()):
+                self.map_names[rec.map_key] = rec.map_name.strip()
+            if rec.map_key and rec.map_key not in self.known_maps:
+                self.known_maps.append(rec.map_key)
+            self._dirty_meta = True            # 地图名/已知地图变了, meta 要落盘
+            # ⚠ **不**把 id 加进 `_dirty_ids`: 文件已经就位, 别再打包一遍
+        if rec.zone_signature:
+            self._recover_layouts()
+        self.save()
+        return rec
+
     def get_global(self, gid: str) -> GlobalRecord | None:
         for g in self.globals:
             if g.route_id == gid:

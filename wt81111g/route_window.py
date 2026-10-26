@@ -70,6 +70,19 @@ from .zones import remap_capture_color
 log = logging.getLogger("route_window")
 
 
+def _log_file_path() -> str:
+    """主日志文件的路径(`logging.basicConfig(filename=...)` 里设的那个)。
+
+    并行导入的子进程是新解释器: spawn 带不过去任何 handler, 得自己配一次
+    —— 打包版是 `--windowed`, 子进程里的告警没地方去就只能静悄悄地丢掉。
+    """
+    for h in logging.getLogger().handlers:
+        name = getattr(h, "baseFilename", "")
+        if name:
+            return str(name)
+    return ""
+
+
 def _create_map_view(parent) -> RouteMapView:
     """建地图控件: 优先 GPU(pygfx), 不行就软件渲染。
 
@@ -2347,7 +2360,10 @@ class RouteTesterWindow(QMainWindow):
         * 进度框常驻, 每解析一部分就刷新一次并 `processEvents` —— 不然界面会假死
           (2026-10-25 用户反馈: 点服务器录像后卡住 + 内存一直涨);
         * 「取消」随时可点: 抛 `ImportCancelled` 中止当前这局;
-        * 单局失败只跳过它, 不影响后面的。
+        * 单局失败只跳过它, 不影响后面的;
+        * **两局以上按局并行**(每局一个进程, 见 `import_pool`): 一局服务器回放
+          要解 20~35 秒的位流, 串行导入 10 局就是等 5 分钟。单局仍走下面这条路
+          —— 它能给出「分片 3/24」这种细进度, 而且不必为一次导入 spawn 一个解释器。
         """
         from .wrpl_reader import ImportCancelled
 
@@ -2362,13 +2378,16 @@ class RouteTesterWindow(QMainWindow):
         dlg.show()
         QApplication.processEvents()
 
-        state = {"i": 0}
+        # `i` = 串行时正在解析第几局; `whole` = 并行时 frac 已经是**整体**进度
+        state = {"i": 0, "whole": False}
 
         def progress(msg: str, frac: float | None = None) -> None:
-            i = state["i"]
             span = 1.0 / max(1, n)
-            v = i * span + span * (frac or 0.0)
-            dlg.setLabelText(f"[{i + 1}/{n}] {msg}")
+            if state["whole"]:
+                v = frac or 0.0
+            else:
+                v = state["i"] * span + span * (frac or 0.0)
+            dlg.setLabelText(msg)
             dlg.setValue(int(max(0.0, min(1.0, v)) * 1000))
             QApplication.processEvents()
             if dlg.wasCanceled():
@@ -2378,24 +2397,28 @@ class RouteTesterWindow(QMainWindow):
         failed: list[tuple[str, str]] = []
         cancelled = False
         try:
-            for i, path in enumerate(paths):
-                state["i"] = i
-                name = os.path.basename(path.rstrip("\\/")) or path
-                dlg.setLabelText(f"[{i + 1}/{n}] 准备解析 {name} …")
-                dlg.setValue(int(i / max(1, n) * 1000))
-                QApplication.processEvents()
-                try:
-                    rec, stats = import_replay(
-                        path, self.store, progress=progress,
-                        expect_server=expect_server)
-                except ImportCancelled:
-                    cancelled = True
-                    break
-                except Exception as exc:            # noqa: BLE001 - 逐个报错
-                    log.warning("回放导入失败 %s: %s", path, exc)
-                    failed.append((name, str(exc)))
-                    continue
-                done.append((rec, stats))
+            if n >= 2 and not os.environ.get("WTRT_NO_PARALLEL"):
+                done, failed, cancelled = self._import_replay_parallel(
+                    paths, expect_server=expect_server, state=state, progress=progress)
+            else:
+                for i, path in enumerate(paths):
+                    state["i"] = i
+                    name = os.path.basename(path.rstrip("\\/")) or path
+                    dlg.setLabelText(f"[{i + 1}/{n}] 准备解析 {name} …")
+                    dlg.setValue(int(i / max(1, n) * 1000))
+                    QApplication.processEvents()
+                    try:
+                        rec, stats = import_replay(
+                            path, self.store, progress=progress,
+                            expect_server=expect_server)
+                    except ImportCancelled:
+                        cancelled = True
+                        break
+                    except Exception as exc:            # noqa: BLE001 - 逐个报错
+                        log.warning("回放导入失败 %s: %s", path, exc)
+                        failed.append((name, str(exc)))
+                        continue
+                    done.append((rec, stats))
         finally:
             dlg.close()
 
@@ -2417,6 +2440,18 @@ class RouteTesterWindow(QMainWindow):
             self._refresh_map_tracks()
 
         self._report_import(done, failed, cancelled, n)
+
+    def _import_replay_parallel(self, paths: list[str], *, expect_server: bool,
+                                state: dict, progress) -> tuple[list, list, bool]:
+        """多局一起导入时**按局并行**(见 `import_pool`)。
+
+        取消 = 不再等后面那些局; **已经解析完的照样入库**(不让白跑的活浪费掉)。
+        """
+        from .import_pool import import_many
+
+        state["whole"] = True              # 这里的 frac 直接就是整体进度
+        return import_many(paths, self.store, expect_server=expect_server,
+                           progress=progress, log_path=_log_file_path())
 
     def _report_import(self, done: list, failed: list[tuple[str, str]],
                        cancelled: bool, total: int) -> None:

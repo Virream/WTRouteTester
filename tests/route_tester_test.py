@@ -1916,6 +1916,86 @@ def test_store_bom(tmpdir: str):
     results.append("存储: 一局一文件(往返 / 惰性 / 只写变过的 / 坏文件自愈 / 旧格式迁移) OK")
 
 
+def test_adopt_and_import_pool(tmpdir: str):
+    """并行导入的两个关键件: **接管已写好的会话文件** + 并行框架的算数。
+
+    多局一起导入时(`import_pool`), 每局由**子进程**解析并自己压成 `.wts`,
+    主进程只读几百字节的头部就把它当成一条记录(`RouteStore.adopt_session`) ——
+    这样几十万点根本不用 pickle 回主进程, 也不用再打包一遍。
+
+    这里不跑真并行(那要几局真实回放, 而**读游戏文件是禁止的**), 只钉住
+    "子进程写出来的那种文件主进程能原样接管", 以及并行度/发号/校准表这几个小件。
+    """
+    from wt81111g import import_pool
+    from wt81111g import session_store as ss
+    from wt81111g.route_store import GlobalRecord, TrackPoint, UnitLife, _pack_global
+
+    # ---- 造一个“子进程刚写完”的会话文件(与 `import_pool.parse_one` 里一模一样) ----
+    g = GlobalRecord(
+        route_id="wrpl0000000001", map_key="wrpl_avg_test", map_name="avg_test",
+        created_at="2026-10-26T12:00:00", zone_count=3, mode_name="战区控制",
+        duration=60.0)
+    for side, y in (("A", 0.2), ("B", 0.8)):
+        g.sides[side].append(UnitLife(
+            life_id=f"{g.route_id}:{side}0", icon=f"{side}车", obj_type="ground_model",
+            points=[TrackPoint(0.2, y, 0.0, 0.0), TrackPoint(0.4, y, 3.0, 40.0)],
+            side=side, player=f"P{side}", dead=True, death_t=3.0))
+    header, blocks, tracks = _pack_global(g)
+    tmpd = os.path.join(tmpdir, "tmpin")
+    os.makedirs(tmpd, exist_ok=True)
+    tmp = os.path.join(tmpd, g.route_id + ss.SUFFIX)
+    ss.write_session(tmp, header, blocks, tracks)
+
+    store = RouteStore(os.path.join(tmpdir, "adopt.json"))
+    rec = store.adopt_session(tmp)
+    assert rec is not None and isinstance(rec, GlobalRecord), rec
+    assert not os.path.exists(tmp), "临时文件应当被**挪走**(不是复制一份)"
+    final = ss.session_path(store.sessions_dir, g.route_id)
+    assert os.path.exists(final), final
+    assert store.get_global(g.route_id) is rec
+    assert rec.count() == 2, rec.count()          # 头部里的线路数, 没读清单
+    assert rec.lives("A")[0].point_count == 2     # 点按时才读
+    assert abs(rec.lives("B")[0].points[-1].speed - 40.0) < 1e-6
+    # 地图名/已知地图要登记 —— 否则侧栏最上层显示“地图 1”这种自动编号
+    assert store.name_of("wrpl_avg_test") == "avg_test", store.name_of("wrpl_avg_test")
+    assert "wrpl_avg_test" in store.known_maps
+
+    # 重启之后还在(证明文件真落在 sessions 目录里, meta 也写了)
+    again = RouteStore(os.path.join(tmpdir, "adopt.json"))
+    assert again.get_global(g.route_id) is not None
+    assert again.name_of("wrpl_avg_test") == "avg_test"
+
+    # 坏文件: 返回 None(当作这一局失败), 不抛异常
+    bad = os.path.join(tmpd, "bad.wts")
+    with open(bad, "wb") as fh:
+        fh.write(b"not a session")
+    assert store.adopt_session(bad) is None
+    assert store.adopt_session(os.path.join(tmpd, "missing.wts")) is None
+
+    # ---- 并行框架的小件 ----
+    assert import_pool.default_workers(1) == 1, "单局不该开多进程"
+    assert import_pool.default_workers(100) <= import_pool.MAX_WORKERS
+    new_id = import_pool._new_route_id(store)
+    assert new_id.startswith("wrpl") and len(new_id) == 14, new_id
+    assert store.get_global(new_id) is None
+
+    # 校准表要按「关卡代号」也展开一份 —— 子进程只有这张表, 没有 RouteStore
+    # (回放导入查的是 `wrpl_<level>`, 而用户校准的是图片哈希键)
+    calib = {"min_x": 0.0, "max_x": 2048.0, "min_z": 0.0, "max_z": 2048.0,
+             "img_w": 2048, "img_h": 2048, "source": "test"}
+    store.map_calib["hashA"] = dict(calib)
+    store.map_levels["hashA"] = "avg_test"
+    calibs = import_pool.collect_calibs(store)
+    assert calibs.get("hashA") == calib, calibs.keys()
+    assert calibs.get("wrpl_avg_test") == calib, "关卡代号也要查得到那张图的校准"
+    view = import_pool._CalibView(calibs)
+    got = view.calib_of("wrpl_avg_test")
+    assert got is not None and got.valid and got.span_x == 2048.0
+    assert view.calib_of("wrpl_nothing") is None
+
+    results.append("导入: 接管子进程写好的会话文件 + 并行度/发号/校准表 OK")
+
+
 def test_playback_lock(tmpdir: str):
     """回放期间锁定其余功能, 必须点「■ 结束播放」才恢复。
 
@@ -4008,6 +4088,7 @@ def main() -> int:
     test_player_detect()
     test_store(tmpdir)
     test_store_bom(tmpdir)
+    test_adopt_and_import_pool(tmpdir)
     test_recorder(tmpdir)
     test_recorder_placeholder()
     test_start_on_move(tmpdir)

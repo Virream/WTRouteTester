@@ -110,4 +110,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # ⚠ **打包版的多进程硬要求**: 批量导入回放时按局开子进程(见 import_pool),
+    # 而 PyInstaller 出来的 exe 如果没有这一行, 每个子进程都会把 main() 重跑一遍
+    # —— 表现为“点导入后一下子开了好几个窗口”。开发环境里是无害的空操作。
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     sys.exit(main())
