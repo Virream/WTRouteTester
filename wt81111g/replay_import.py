@@ -626,12 +626,16 @@ def renormalize_map_records(store, map_key: str, calib) -> int:
     """
     if calib is None or not getattr(calib, "valid", False):
         return 0
+    # 地图键要按**图片哈希**归一: 回放记录存的是 `wrpl_<关卡代号>`, 而用户在
+    # 「地图管理」里把那张图关联到某个图片哈希之后, 两边就该算同一张图。
+    canon = getattr(store, "canon", None) or (lambda k: k)
+    target = canon(map_key)
     new_rect = [float(calib.min_x), float(calib.max_x),
                 float(calib.min_z), float(calib.max_z)]
     nspanx, nspanz = new_rect[1] - new_rect[0], new_rect[3] - new_rect[2]
     changed = 0
     for rec in getattr(store, "globals", ()):
-        if getattr(rec, "map_key", "") != map_key:
+        if canon(getattr(rec, "map_key", "")) != target:
             continue
         old = getattr(rec, "norm_rect", None) or []
         if len(old) != 4:

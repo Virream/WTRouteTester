@@ -2375,9 +2375,16 @@ def test_cached_map_switch(tmpdir: str):
 
 
 def test_map_manager(tmpdir: str):
-    """地图管理: 缓存列表 + 命名 → 侧栏与轨迹记录都显示新名字; 菜单栏入口存在。"""
+    """地图管理: 左边键值对(哈希→名字, 可选=回放关卡代号) + 右边底图预览。
+
+    用户 2026-10-26 定的规格: 一张图会以**两种身份**进来 —— 8111 录制的是图片哈希,
+    回放解析出来的是关卡代号(`avg_finland`)。在「可选」里指认之后两者归成一张图,
+    回放的线路挂到那张图下、用它的底图与校准、显示用户起的名字; 而且**随时能改**。
+    """
+    from PyQt6.QtWidgets import QComboBox, QLineEdit
+
     from wt81111g.map_cache import map_key
-    from wt81111g.map_manager import MapManagerDialog
+    from wt81111g.map_manager import COL_KEY, COL_LEVEL, COL_NAME, MapManagerDialog
 
     app = QApplication.instance()
     win = make_window(tmpdir, "manager.json")
@@ -2396,70 +2403,87 @@ def test_map_manager(tmpdir: str):
     rec = win.store.new_route(key, "地图 1", "T", 0.2, 0.2)
     rec.duration = 3.0
     win.store.add(rec)
+    # 回放侧: 同一张图的另一重身份(有轨迹、没底图、没校准)
+    rep = win.store.new_global(map_key="wrpl_avg_finland", map_name="avg_finland",
+                               zone_count=3, mode_name="战区控制")
+    win.store.add_global(rep)
     win._reload_tree()
     app.processEvents()
-    assert win.tree.topLevelItem(0).text(1) == win.store.display_name(key)   # 1 = 名称列
+    assert win.tree.topLevelItemCount() == 2, "关联之前是两张地图"
 
     dlg = MapManagerDialog(win.store, win.map_cache, win)
-    assert dlg.table.rowCount() == 1, "地图管理应列出缓存的地图"
-    assert dlg.table.item(0, 0).data(Qt.ItemDataRole.UserRole) == key
-    assert dlg.table.item(0, 4).text() == "1"        # 该图的轨迹数(第 5 列)
-    # 表头必须有「隐藏」列(空战地图永远用不到, 只会碍事)
-    heads = [dlg.table.horizontalHeaderItem(c).text()
-             for c in range(dlg.table.columnCount())]
-    assert "隐藏" in heads, heads
-    # 表格里一律不许就地编辑(以前双击图片会在图片格里弹出输入框)
+    assert dlg.table.rowCount() == 1, "回放身份不该单独占一行(它没有底图)"
+    row = next(r for r in range(dlg.table.rowCount())
+               if dlg.table.item(r, COL_KEY).data(Qt.ItemDataRole.UserRole) == key)
+    assert dlg.table.item(row, COL_KEY).text().endswith(key), \
+        dlg.table.item(row, COL_KEY).text()      # 键里有图片哈希
+    # 表格里一律不许就地编辑(名字走那一格里的输入框)
     assert dlg.table.editTriggers() == QAbstractItemView.EditTrigger.NoEditTriggers
-    assert not (dlg.table.model().flags(dlg.table.model().index(0, 0))
-                & Qt.ItemFlag.ItemIsEditable)
-    assert not (dlg.table.model().flags(dlg.table.model().index(0, 1))
-                & Qt.ItemFlag.ItemIsEditable)
-    # 改名走顶部固定的输入框: 回车即保存(立即写盘)
-    dlg.table.setCurrentCell(0, 0)
+
+    # ---- 值: 直接给输入框 ----
+    edit = dlg.table.cellWidget(row, COL_NAME)
+    assert isinstance(edit, QLineEdit), type(edit)
+    dlg.table.selectRow(row)
     app.processEvents()
-    assert dlg.edit_name.isEnabled()
-    dlg.edit_name.setText("诺曼底")
-    dlg.edit_name.returnPressed.emit()
+    edit.setText("诺曼底")
+    edit.editingFinished.emit()
     app.processEvents()
     assert win.store.name_of(key) == "诺曼底"
     win._reload_tree()
     app.processEvents()
-    assert win.tree.topLevelItem(0).text(1) == "诺曼底"
+    assert "诺曼底" in [win.tree.topLevelItem(i).text(1)
+                        for i in range(win.tree.topLevelItemCount())]
     assert win.store.get(rec.route_id).map_name == "诺曼底"
-    assert "诺曼底" in win.store.display_name(key)
     # 重建 store 后名字应仍在(落盘)
     again = RouteStore(os.path.join(tmpdir, "manager.json"))
     assert again.name_of(key) == "诺曼底"
     assert key in again.known_maps
 
-    # 「隐藏」列: 勾上后左侧列表不再显示这张地图, 但轨迹/名称/缓存图片都在
-    hide_item = dlg.table.item(0, 2)
-    assert hide_item.flags() & Qt.ItemFlag.ItemIsUserCheckable, "隐藏列要可勾选"
-    assert hide_item.checkState() == Qt.CheckState.Unchecked
-    hide_item.setCheckState(Qt.CheckState.Checked)
+    # ---- 右: 预览跟着选中走 ----
+    assert dlg._preview_pm is not None, "选中一条有底图的, 右边就该有预览"
+
+    # ---- 底部「校准地图位置」: 没选中时不可用 ----
+    dlg.table.clearSelection()
+    dlg._on_selection_changed()
+    assert not dlg.btn_calib.isEnabled(), "没选中就不知道校准哪一张, 按钮要灰着"
+    dlg.table.selectRow(row)
     app.processEvents()
-    assert win.store.is_map_hidden(key), "勾选后应立即可查"
-    assert dlg.table.item(0, 1).text().endswith("(已隐藏)"), dlg.table.item(0, 1).text()
+    assert dlg.btn_calib.isEnabled()
+
+    # ---- 可选: 关联回放关卡代号 → 两张地图归成一张 ----
+    combo = dlg.table.cellWidget(row, COL_LEVEL)
+    assert isinstance(combo, QComboBox), type(combo)
+    assert combo.currentData() == "", "初始应为「未选择」"
+    combo.setCurrentIndex(combo.findData("avg_finland"))
+    app.processEvents()
+    assert win.store.level_of_hash(key) == "avg_finland"
+    assert win.store.canon("wrpl_avg_finland") == key
     win._reload_tree()
     app.processEvents()
-    assert win.tree.topLevelItemCount() == 0, "隐藏的地图不该占侧栏一行"
-    assert win.store.get(rec.route_id) is not None, "隐藏不能删轨迹"
-    assert win.map_cache.has(key), "隐藏不能删缓存图片"
-    # 落盘: 重建 store 后隐藏标记仍在(下次启动不会再冒出来)
+    assert win.tree.topLevelItemCount() == 1, "关联后应只剩一张地图"
+    assert win.tree.topLevelItem(0).text(1) == "诺曼底", "侧栏用的是用户起的名字"
+    assert rep.map_key == "wrpl_avg_finland", "记录的 map_key 不该被搬走"
+
+    # ---- 选错了要能改: 换成别的关卡代号 → 立刻分开; 换回来 → 又合并 ----
+    combo.setCurrentIndex(combo.findData(""))          # =「未选择」
+    app.processEvents()
+    assert win.store.level_of_hash(key) == ""
+    win._reload_tree()
+    app.processEvents()
+    assert win.tree.topLevelItemCount() == 2, "解除关联后又是两张地图"
+    combo.setCurrentIndex(combo.findData("avg_finland"))
+    app.processEvents()
+    win._reload_tree()
+    app.processEvents()
+    assert win.tree.topLevelItemCount() == 1, "改回来应重新合并"
+    # 落盘: 关联与记录的原始身份都还在
     persisted = RouteStore(os.path.join(tmpdir, "manager.json"))
-    assert persisted.is_map_hidden(key)
-    assert persisted.name_of(key) == "诺曼底"
-    # 取消勾选 → 侧栏恢复
-    hide_item.setCheckState(Qt.CheckState.Unchecked)
-    app.processEvents()
-    assert not win.store.is_map_hidden(key)
-    win._reload_tree()
-    app.processEvents()
-    assert win.tree.topLevelItemCount() == 1
-    results.append("地图管理: 「隐藏」勾选 → 侧栏不显示/落盘/不删数据/取消后恢复 OK")
+    assert persisted.level_of_hash(key) == "avg_finland"
+    assert any(g.map_key == "wrpl_avg_finland" for g in persisted.globals)
+
     dlg.close()
     win.close()
-    results.append("地图管理(缓存列表/命名/落盘/菜单栏) OK")
+    results.append("地图管理: 键值对(哈希→名字) + 关卡代号关联/撤销 + 预览 + 校准按钮 OK")
 
 
 def test_zones_and_modes(tmpdir: str):

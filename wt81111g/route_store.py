@@ -58,7 +58,7 @@ from dataclasses import asdict, dataclass, field
 
 from .config import data_dir
 from .garage import GARAGE_MAP_SHA1
-from .map_calib import MapCalib
+from .map_calib import MAP_KEY_PREFIX, MapCalib
 from .zones import layout_spread
 from .zones import mode_name as zone_mode_name
 from .zones import signature as zones_signature
@@ -795,6 +795,15 @@ class RouteStore:
         # 地图校准(世界米 → 底图像素): {地图键: MapCalib.to_dict()}
         # 回放导入的线路是**米制世界坐标**, 必须有这个矩形才能准确落到 2048² 底图上
         self.map_calib: dict[str, dict] = {}
+        # ---- 地图身份的「别名」: {图片哈希键: 回放里的关卡代号} ------------------
+        # 为什么要有它(用户 2026-10-26): 同一张地图会以**两种身份**进来 ——
+        #   * 8111 实况/单条录制 → 图片哈希(如 `c59f768c0fde`), 有图有校准;
+        #   * 回放文件解析     → 关卡代号(`wrpl_avg_finland`), 有轨迹但没图。
+        # 两者其实是同一张图, 软件自己判不出来(8111 不给地图名), 只能靠用户指认。
+        # 指认**只改这张表**, 绝不改任何记录的 `map_key` —— 所以随时能改、改错能改回来。
+        self.map_levels: dict[str, str] = {}
+        # `map_levels` 的反向索引(关卡代号 → 认领它的哈希键), 由 `_rebuild_levels()` 维护
+        self._level_owner: dict[str, str] = {}
         self.routes: list[RouteRecord] = []
         # 全局录制条目(整局所有玩家的线路, 分 A/B 两队)
         self.globals: list[GlobalRecord] = []
@@ -832,6 +841,10 @@ class RouteStore:
                 for key, calib in mc.items():
                     if isinstance(calib, dict):
                         self.map_calib[str(key)] = calib
+            ml = data.get("map_levels")
+            if isinstance(ml, dict):
+                self.map_levels = {str(k): str(v).strip()
+                                   for k, v in ml.items() if str(k) and str(v).strip()}
             for item in data.get("routes") or []:
                 try:
                     pts = [RoutePoint(**p) for p in item.get("points") or []]
@@ -860,8 +873,83 @@ class RouteStore:
                         self.globals.append(rec)
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("读取线路数据失败: %s", exc)
+        self._rebuild_levels()
         self._migrate_replay_keys()
         self._recover_layouts()
+
+    # ------------------------------------------------- 地图身份(哈希 ↔ 关卡代号)
+    def _rebuild_levels(self) -> None:
+        """按 `map_levels` 重建反向索引(关卡代号 → 认领它的哈希键)。
+
+        同一个关卡代号被两个哈希同时认领时**先到先得**(字典顺序)—— 语义上不该发生
+        (一张图不可能既是芬兰又是荷兰), 但用户误操作时也不该炸, 取第一个即可。
+        """
+        self._level_owner = {}
+        for hk, level in self.map_levels.items():
+            level = (level or "").strip()
+            if hk and level:
+                self._level_owner.setdefault(level, hk)
+
+    def level_of_hash(self, map_key: str) -> str:
+        """这个图片哈希关联的回放关卡代号(没关联返回空串)。"""
+        return (self.map_levels.get(map_key) or "").strip()
+
+    def hash_of_level(self, level: str) -> str:
+        """这个回放关卡代号被哪个图片哈希认领了(没人认领返回空串)。"""
+        return self._level_owner.get((level or "").strip(), "")
+
+    def canon(self, map_key: str) -> str:
+        """把地图键**归一化到实际的那张图**。
+
+        回放导入的 `wrpl_<关卡代号>` 一旦被某个图片哈希认领, 它的数据就该和那张图
+        算作同一张 —— 树状结构、校准查找、底图查找全部走这里。
+
+        ⚠ 只做映射, **不搬数据**: 记录里的 `map_key` 永远是原值, 所以解除关联
+        (把「可选」改回「未选择」或改指别的关卡代号) 立刻恢复原状, 不会丢东西。
+        """
+        if not map_key or not self._level_owner:
+            return map_key
+        if not map_key.startswith(MAP_KEY_PREFIX):
+            return map_key
+        return self._level_owner.get(map_key[len(MAP_KEY_PREFIX):], map_key)
+
+    def set_map_level(self, map_key: str, level: str) -> bool:
+        """把某个图片哈希关联到回放关卡代号(传空串 = 解除关联)。返回是否真的变了。"""
+        map_key = (map_key or "").strip()
+        level = (level or "").strip()
+        if not map_key:
+            return False
+        if level.startswith(MAP_KEY_PREFIX):        # 允许用户传 `wrpl_avg_finland`
+            level = level[len(MAP_KEY_PREFIX):]
+        with self._lock:
+            old = (self.map_levels.get(map_key) or "").strip()
+            if old == level:
+                return False
+            if level:
+                self.map_levels[map_key] = level
+            else:
+                self.map_levels.pop(map_key, None)
+            self._rebuild_levels()
+        self.save()
+        log.info("地图身份: %s 的关卡代号 %r → %r", map_key, old, level)
+        return True
+
+    def level_choices(self) -> list[str]:
+        """可选的回放关卡代号(软件里出现过的全部, 按字母序)。
+
+        「地图管理」那一列下拉框就用它 —— 只能选软件真见过的代号, 天然防止手打错字。
+        """
+        out: list[str] = []
+        for key in [*self.known_maps,
+                    *(r.map_key for r in self.routes),
+                    *(g.map_key for g in self.globals)]:
+            key = key or ""
+            if not key.startswith(MAP_KEY_PREFIX):
+                continue
+            level = key[len(MAP_KEY_PREFIX):]
+            if level and level != "unknown" and level not in out:
+                out.append(level)
+        return sorted(out)
 
     def _migrate_replay_keys(self) -> bool:
         """旧回放地图键 `wrpl:<level>` → `wrpl_<level>`(不写盘, 下次正常保存时落回)。
@@ -941,9 +1029,12 @@ class RouteStore:
                 "map_names": self.map_names,
                 "hidden_maps": self.hidden_maps,
                 "layout_names": self.layout_names,
-                "known_maps": self.ordered_map_keys(),
+                # 存**原始** known_maps(不按 canon 去重): 回放键 `wrpl_<关卡>` 即使
+                # 当前被某个哈希认领掉了, 也要留在盘上 —— 用户撤销关联后它得立刻回来。
+                "known_maps": [k for k in self.known_maps if k],
                 "map_zones": self.map_zones,
                 "map_calib": self.map_calib,
+                "map_levels": self.map_levels,
                 "routes": [
                     {
                         **{k: v for k, v in asdict(r).items()
@@ -1094,10 +1185,14 @@ class RouteStore:
                 target.marks.clear()
 
     def globals_by_group(self) -> dict[tuple[str, str], list[GlobalRecord]]:
-        """{(地图键, 战区指纹): [全局录制条目...]} —— 新的在前(按录制时间倒序)。"""
+        """{(地图键, 战区指纹): [全局录制条目...]} —— 新的在前(按录制时间倒序)。
+
+        地图键已按图片哈希归并, 所以回放导入和 8111 录制的同图条目会落在同一组。
+        """
         out: dict[tuple[str, str], list[GlobalRecord]] = {}
         for g in self.globals:
-            out.setdefault((g.map_key or "", g.zone_signature or ""), []).append(g)
+            out.setdefault((self.canon(g.map_key or ""),
+                            g.zone_signature or ""), []).append(g)
         for rows in out.values():
             rows.sort(key=lambda g: g.created_at, reverse=True)
         return out
@@ -1105,6 +1200,7 @@ class RouteStore:
     # ------------------------------------------------------------------
     def display_name(self, map_key: str) -> str:
         """地图显示名: 用户命名优先, 否则按“首次见到”的顺序自动编号。"""
+        map_key = self.canon(map_key)
         if map_key in self.map_names and self.map_names[map_key].strip():
             return self.map_names[map_key]
         keys = self.ordered_map_keys()
@@ -1112,9 +1208,17 @@ class RouteStore:
             return f"地图 {keys.index(map_key) + 1}"
         return f"地图 {len(keys) + 1}"
 
+    def auto_name(self, map_key: str) -> str:
+        """纯自动编号(`地图 N`), **不看用户起的名字** —— 地图管理里当“键”的前缀用。"""
+        map_key = self.canon(map_key)
+        keys = self.ordered_map_keys()
+        if map_key in keys:
+            return f"地图 {keys.index(map_key) + 1}"
+        return f"地图 {len(keys) + 1}"
+
     def name_of(self, map_key: str) -> str:
         """用户给这张地图起的名字(没起过则为空串)。"""
-        return (self.map_names.get(map_key) or "").strip()
+        return (self.map_names.get(self.canon(map_key)) or "").strip()
 
     def remember_map(self, map_key: str) -> None:
         """登记一张见过(缓存过图片)的地图, 使它也有稳定的默认编号。"""
@@ -1127,21 +1231,27 @@ class RouteStore:
         self.save()
 
     def rename_map(self, map_key: str, name: str) -> None:
+        """给地图命名(空串 = 恢复自动编号)。"""
+        map_key = self.canon(map_key)
         with self._lock:
-            self.map_names[map_key] = name.strip() or self.map_names.get(map_key, "")
+            if name.strip():
+                self.map_names[map_key] = name.strip()
+            else:
+                self.map_names.pop(map_key, None)
             for r in self.routes:
-                if r.map_key == map_key:
-                    r.map_name = self.map_names[map_key]
+                if self.canon(r.map_key) == map_key:
+                    r.map_name = name.strip()
         self.save()
 
     def is_map_hidden(self, map_key: str) -> bool:
         """这张地图是否被用户在「地图管理」里勾了“隐藏”。"""
-        return map_key in self.hidden_maps
+        return self.canon(map_key) in self.hidden_maps
 
     def set_map_hidden(self, map_key: str, hidden: bool) -> None:
         """勾选/取消“隐藏”。**只影响左侧列表**, 轨迹与缓存图片都不动。"""
         if not map_key:
             return
+        map_key = self.canon(map_key)
         with self._lock:
             if hidden:
                 if map_key not in self.hidden_maps:
@@ -1222,16 +1332,27 @@ class RouteStore:
             drop_calib = self.map_calib.pop(drop, None)
             if drop_calib and not self.map_calib.get(keep):
                 self.map_calib[keep] = drop_calib
+            # 关卡代号关联: 别把用户指认的别名弄丢(drop 认领的关卡归到 keep)
+            drop_level = self.map_levels.pop(drop, None)
+            if drop_level and not self.level_of_hash(keep):
+                self.map_levels[keep] = drop_level
+            self._rebuild_levels()
         self.save()
         log.info("已合并地图条目: %s ← %s (%d 条轨迹)", keep, drop, len(moved))
         return True
 
     def ordered_map_keys(self) -> list[str]:
-        """按首次见到顺序返回全部地图键(轨迹里的 + 全局录制的 + 只缓存了图片的)。"""
-        keys = [k for k in self.known_maps]
-        for r in [*self.routes, *self.globals]:
-            if r.map_key not in keys:
-                keys.append(r.map_key)
+        """按首次见到顺序返回全部地图键 —— **已按图片哈希归并**。
+
+        回放键 `wrpl_<关卡代号>` 若已被某个图片哈希认领, 就不单独占一行(它的数据
+        已经归到那张图下了); 解除关联后自动恢复 Ù。
+        """
+        keys: list[str] = []
+        for k in [*self.known_maps,
+                  *(r.map_key for r in [*self.routes, *self.globals])]:
+            k = self.canon(k)
+            if k and k not in keys:
+                keys.append(k)
         return keys
 
     def grouped(self) -> dict[str, list[RouteRecord]]:
@@ -1243,7 +1364,7 @@ class RouteStore:
         out: dict[str, list[RouteRecord]] = {}
         for key in self.ordered_map_keys():
             rows = sorted(
-                (r for r in self.routes if r.map_key == key),
+                (r for r in self.routes if self.canon(r.map_key) == key),
                 key=lambda r: r.created_at, reverse=True,
             )
             if rows:
@@ -1253,11 +1374,16 @@ class RouteStore:
     # ------------------------------------------------------------------ 战区/模式
     # ------------------------------------------------------------------ 地图校准
     def calib_of(self, map_key: str) -> MapCalib | None:
-        """取这张图的校准(没有/无效返回 None)。"""
+        """取这张图的校准(没有/无效返回 None)。
+
+        入口先归一到图片哈希 —— 这样回放导入时拿 `wrpl_<关卡代号>` 也查得到
+        用户在「地图管理」里给那张图装的校准。
+        """
         if not map_key:
             return None
+        key = self.canon(map_key)
         with self._lock:
-            raw = self.map_calib.get(map_key)
+            raw = self.map_calib.get(key)
         if not isinstance(raw, dict):
             return None
         calib = MapCalib.from_dict(raw)
@@ -1267,6 +1393,7 @@ class RouteStore:
         """记下这张图的校准并写盘。返回是否真的变了。"""
         if not map_key or calib is None or not calib.valid:
             return False
+        map_key = self.canon(map_key)
         data = calib.to_dict()
         with self._lock:
             if self.map_calib.get(map_key) == data:
@@ -1280,6 +1407,7 @@ class RouteStore:
 
     def clear_calib(self, map_key: str) -> bool:
         """删掉这张图的校准(底图/轨迹都不动)。"""
+        map_key = self.canon(map_key)
         with self._lock:
             if map_key not in self.map_calib:
                 return False
@@ -1363,6 +1491,7 @@ class RouteStore:
         """版本显示名: 用户命名优先, 否则自动编号(区域 N / 点位 N)。"""
         if not signature:
             return "未知位置"
+        map_key = self.canon(map_key)
         user = (self.layout_names.get(map_key) or {}).get(signature, "").strip()
         if user:
             return user
@@ -1373,12 +1502,14 @@ class RouteStore:
 
     def name_of_layout(self, map_key: str, signature: str) -> str:
         """用户给这个版本起的名字(没起过则为空串)。"""
+        map_key = self.canon(map_key)
         return ((self.layout_names.get(map_key) or {}).get(signature) or "").strip()
 
     def rename_layout(self, map_key: str, signature: str, name: str) -> None:
         """给“模式版本(战区布局)”命名; 空名字 = 恢复自动编号。"""
         if not map_key or not signature:
             return
+        map_key = self.canon(map_key)
         with self._lock:
             names = self.layout_names.setdefault(map_key, {})
             name = (name or "").strip()
@@ -1392,14 +1523,14 @@ class RouteStore:
 
     def layout_info(self, map_key: str, signature: str) -> dict | None:
         """取某个版本的布局(含战区列表/跨度), 供提示文字用。"""
-        for layout in self.map_zones.get(map_key) or []:
+        for layout in self.map_zones.get(self.canon(map_key)) or []:
             if str(layout.get("sig") or "") == signature:
                 return layout
         return None
 
     def zone_layouts(self, map_key: str) -> list[dict]:
         """某地图已见过的战区布局(新的在前)。"""
-        return list(self.map_zones.get(map_key) or [])
+        return list(self.map_zones.get(self.canon(map_key)) or [])
 
     def layout_for(self, map_key: str, signature: str = "") -> dict | None:
         """取某地图的战区布局: 优先精确匹配指纹, 否则用**最近见过**的那张。
@@ -1409,7 +1540,7 @@ class RouteStore:
         于是用户先录一张单路的“区域 1”再录 AB 队的“区域 2”(区域 2 历史上见过),
         回放 AB 队时却拿到“区域 1”的战区位置。改为按 `seen_at` 取最新的。
         """
-        layouts = self.map_zones.get(map_key) or []
+        layouts = self.map_zones.get(self.canon(map_key)) or []
         if signature:
             for item in layouts:
                 if item.get("sig") == signature:

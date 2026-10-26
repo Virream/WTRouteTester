@@ -312,7 +312,7 @@ class RouteTesterWindow(QMainWindow):
     def _build_menu(self) -> None:
         """顶部菜单栏: 「地图」(管理/缓存) / 「设置」(显示开关) / 「帮助」。"""
         menu = self.menuBar().addMenu("地图(&M)")
-        self.act_manage = QAction("地图管理(命名/预览/删除缓存)…", self)
+        self.act_manage = QAction("地图管理(命名/关联回放关卡代号/校准)…", self)
         self.act_manage.triggered.connect(self._open_map_manager)
         menu.addAction(self.act_manage)
         menu.addSeparator()
@@ -647,10 +647,10 @@ class RouteTesterWindow(QMainWindow):
                      if self.store.is_map_hidden(k))
         tail = f", 已隐藏 {hidden} 张" if hidden else ""
         if dlg.renamed:
-            self._set_status(f"已保存 {dlg.renamed} 处地图名称改动(左侧列表已同步{tail})",
+            self._set_status(f"已保存 {dlg.renamed} 处地图改动(侧栏已同步{tail})",
                              sticky=3.0)
         else:
-            self._set_status(f"地图管理已关闭(名称/隐藏改动都会立即保存{tail})", sticky=2.0)
+            self._set_status(f"地图管理已关闭(名字/关卡代号关联都会立即保存{tail})", sticky=2.0)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -950,8 +950,8 @@ class RouteTesterWindow(QMainWindow):
         return out
 
     def _life_map_keys(self) -> dict[str, str]:
-        """{线路 id: 所属地图键} —— 换图时用它判断哪些全局线路已经不属于当前地图。"""
-        return {life.life_id: g.map_key
+        """{线路 id: 所属地图键(已按图片哈希归并)} —— 换图时用它判断哪些全局线路已不属于当前地图。"""
+        return {life.life_id: self.store.canon(g.map_key)
                 for g in self.store.globals for side in GLOBAL_SIDES
                 for life in g.lives(side)}
 
@@ -2326,9 +2326,8 @@ class RouteTesterWindow(QMainWindow):
         if uncalibrated:
             tail += ("\n\n⚠ 这些地图还没有校准, 线路位置/比例是估算的:\n"
                      + "\n".join(f"· {lv}" for lv in uncalibrated)
-                     + "\n解决办法: 进一局这张图, 用 tools/wrpl/capture_8111.py 抓一次 "
-                       "8111 数据, 再在菜单「地图管理」里给这张图导入校准 — "
-                       "校准与底图一起装进去, 以后同一张图的回放都准了。")
+                     + "\n解决办法: 进一局这张图(不用开录制), 软件会自己把底图与外框存下来; "
+                       "再到菜单「地图管理」里点「校准地图位置」确认一下即可。")
         if len(done) == 1 and not failed and not cancelled and not uncalibrated:
             self._set_status(f"已导入: {lines[0].lstrip('· ')}", sticky=10.0)
             return
@@ -2906,13 +2905,13 @@ class RouteTesterWindow(QMainWindow):
 
     # ------------------------------------------------------- 地图图片(缓存/切换)
     def _current_view_key(self) -> str | None:
-        """当前在看的轨迹属于哪张地图(显示的 → 选中的 → 刚录制的)。"""
+        """当前在看的轨迹属于哪张地图(显示的 → 选中的 → 刚录制的)。已归一到图片哈希。"""
         for rec in self.map_view.visible_tracks:
-            return rec.map_key
+            return self.store.canon(rec.map_key)
         for rec in self._selection_tracks():
-            return rec.map_key
+            return self.store.canon(rec.map_key)
         if self._last_record is not None:
-            return self._last_record.map_key
+            return self.store.canon(self._last_record.map_key)
         if self._visible_lives:
             keys = self._life_map_keys()
             for lid in self._visible_lives:
@@ -2924,6 +2923,7 @@ class RouteTesterWindow(QMainWindow):
         """把地图切成指定地图的**本地缓存图片**(没有缓存返回 False)。"""
         if not key or key == "unknown":
             return False
+        key = self.store.canon(key)         # 回放身份 → 实际那张图的哈希
         if self.map_view.map_key == key:
             return True
         data = self.map_cache.load(key)
@@ -2933,7 +2933,8 @@ class RouteTesterWindow(QMainWindow):
 
     def _ensure_map_for(self, recs: list[RouteRecord]) -> None:
         """让地图改成这批轨迹所属的那张图(游戏没开时就靠本地缓存)。"""
-        keys = {r.map_key for r in recs if r.map_key and r.map_key != "unknown"}
+        keys = {self.store.canon(r.map_key) for r in recs
+                if r.map_key and r.map_key != "unknown"}
         if len(keys) != 1:
             return
         key = keys.pop()
@@ -2969,26 +2970,30 @@ class RouteTesterWindow(QMainWindow):
         """
         key = self.recorder.map_key
         recording = self.recorder.recording
-        dropped = self.map_view.drop_tracks_for_other_map(key, keep_live=recording)
-        if self._last_record is not None and self._last_record.map_key != key:
+        canon = self.store.canon
+        dropped = self.map_view.drop_tracks_for_other_map(
+            key, keep_live=recording, norm=canon)
+        if self._last_record is not None \
+                and canon(self._last_record.map_key) != canon(key):
             self._last_record = None
             dropped.append("上次录制")
         recs = self.player.records
-        if recs and any(r.map_key != key for r in recs):
+        if recs and any(canon(r.map_key) != canon(key) for r in recs):
             self.player.pause()
             self.player.load(None)
             self.lbl_play.setText("回放: --")
         if dropped:
             # 眼睛点亮的轨迹也要跟着换图规则走: 不属于当前地图的一律隐藏
             stale = {rid for rid in self._visible_ids
-                     if (r := self.store.get(rid)) is None or r.map_key != key}
+                     if (r := self.store.get(rid)) is None
+                     or canon(r.map_key) != canon(key)}
             if stale:
                 self._visible_ids -= stale
                 self._reload_tree()      # 重建侧栏(顺便刷新眼睛图标与地图)
         # 全局线路同理: 只保留属于当前地图的那些
         life_keys = self._life_map_keys()
         stale_lives = {lid for lid in self._visible_lives
-                       if life_keys.get(lid) != key}
+                       if canon(life_keys.get(lid)) != canon(key)}
         if stale_lives:
             self._visible_lives -= stale_lives
             self._reload_tree()

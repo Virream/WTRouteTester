@@ -38,6 +38,7 @@ from .config import WT_BASE_URL
 from .global_record import DEFAULT_MAP_SIZE, GlobalTracker, extract_units
 from . import kill_timeline
 from .map_cache import MapCache
+from .map_calib import build_from_live
 from .route_store import (
     GLOBAL_SIDES, PLACEHOLDER_MAP_KEY, PLACEHOLDER_MAP_SHA1, GlobalRecord, RouteMark,
     RoutePoint, RouteRecord, RouteStore, pretty_vehicle,
@@ -222,6 +223,8 @@ class RouteRecorder(QObject):
         self._map_digest: str | None = None
         self._map_key = "unknown"
         self._map_thread: threading.Thread | None = None
+        # 已经尝试过“录制时顺手存校准”的地图键(不重复试, 也不覆盖已有校准)
+        self._calib_tried: set[str] = set()
         # “已回车库”判定用的计数(见 MAP_MISS_STOP / DISCONNECT_STOP)
         self._map_miss = 0              # 连续几次拿不到 /map.img
         self._disconnected_since = 0.0  # 8111 开始拿不到 /indicators 的时刻(0=正常)
@@ -677,6 +680,42 @@ class RouteRecorder(QObject):
                 self._spawns_saved = sstate
             except Exception as exc:  # noqa: BLE001 - 存盘失败不应影响录制
                 log.warning("保存战区/重生位置失败: %s", exc)
+            # 顺手把“校准所需的数据”也存下来(见 _remember_calib)
+            self._remember_calib(objects)
+
+    def _remember_calib(self, objects: list) -> None:
+        """把这张图的**校准所需的数据**提前存下来(用户 2026-10-26 要求)。
+
+        **为什么必须在录制时就存**: 回放解析只能拿到关卡代号(`avg_finland`),
+        既没有图片、也没有 `map_min` / `map_max` —— 这两样只有 8111 给。而用户在
+        「地图管理」里把两者关联起来时, 早就退出对局了, 没地方再抓。
+
+        所以只要 8111 里看清了这张图(有地图图片 + `map_info` 有效), 就先存一份:
+        图片本来已经进底图缓存了, 这里补上世界外框与战区/重生点。**一张图存一次**,
+        且**绝不覆盖**已有校准(用户手工导入的/之前录的更好)。
+
+        跳过两种不可靠的时机: 空中视角(坐标系被换算过, 外框不是这张图的)
+        和还没出地图图片时。
+        """
+        key = self._map_key
+        if not key or key == PLACEHOLDER_MAP_KEY or key in self._calib_tried:
+            return
+        if self._frame_fit() is not None:
+            return                     # 观战者上了飞机: 8111 切成空战图, 外框不能用
+        if self.store.calib_of(key) is not None:
+            self._calib_tried.add(key)  # 已经有校准了, 以后也不用再试
+            return
+        try:
+            info = self.client.map_info()
+            img = self.map_cache.load(key)
+            calib = build_from_live(info, img, objects,
+                                    source="8111 录制时自动记录")
+        except Exception as exc:  # noqa: BLE001 - 拿不到就算了, 不影响录制
+            log.info("录制时缓存地图校准失败(%s): %s", key, exc)
+            return
+        self._calib_tried.add(key)
+        if self.store.set_calib(key, calib):
+            log.info("录制时已缓存地图校准: %s (%s)", key, calib.describe())
 
     def _stamp_record(self, rec: RouteRecord) -> None:
         """把当前战局的战区信息写进记录(模式名/数量/指纹)。"""

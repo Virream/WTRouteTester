@@ -642,31 +642,38 @@ class RouteMapView(QWidget):
         return list(self._playback_recs)
 
     def drop_tracks_for_other_map(self, map_key: str,
-                                  keep_live: bool = False) -> list[str]:
+                                  keep_live: bool = False, norm=None) -> list[str]:
         """清除不属于 map_key 的轨迹(换图/退出战局时调用)。
 
         录制中轨迹的 map_key 就是开始录制那一刻的地图, 因此换图后它会被清掉。
         keep_live=True 时保留实时轨迹(正在录制中, 清掉会让轨迹直接消失)。
+
+        `norm` 是地图身份的归一化函数(一般是 `RouteStore.canon`) —— 回放导入的
+        `wrpl_<关卡代号>` 被用户关联到某个图片哈希之后, 两者算同一张图, 不该被清。
         返回被清除的项目名(用于提示文案)。
         """
+        same = norm or (lambda k: k)
         dropped: list[str] = []
-        if not keep_live and self._live is not None and self._live.map_key != map_key:
+        if (not keep_live and self._live is not None
+                and same(self._live.map_key) != same(map_key)):
             self._live = None
             dropped.append("实时轨迹")
-        keep = [r for r in self._visible if r.map_key == map_key]
+        keep = [r for r in self._visible if same(r.map_key) == same(map_key)]
         if len(keep) != len(self._visible):
             self._visible = keep
             dropped.append("显示的轨迹")
         if not keep_live and self._live_multi:
-            keep_lm = [r for r in self._live_multi if getattr(r, "map_key", "") == map_key]
+            keep_lm = [r for r in self._live_multi
+                       if same(getattr(r, "map_key", "")) == same(map_key)]
             if len(keep_lm) != len(self._live_multi):
                 self._live_multi = keep_lm
                 dropped.append("实时轨迹")
-        if self._playback_recs and any(r.map_key != map_key for r in self._playback_recs):
+        if self._playback_recs and any(same(r.map_key) != same(map_key)
+                                       for r in self._playback_recs):
             self._playback_recs = []
             self._playhead = 0.0
             dropped.append("回放")
-        keep_hi = [r for r in self._highlight if r.map_key == map_key]
+        keep_hi = [r for r in self._highlight if same(r.map_key) == same(map_key)]
         if len(keep_hi) != len(self._highlight):
             self._highlight = keep_hi
             dropped.append("高亮")
