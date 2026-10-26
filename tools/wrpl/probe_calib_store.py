@@ -65,7 +65,7 @@ def main() -> None:
     print("旧 `wrpl:` 键迁移 OK →", st3.globals[0].map_key, "| is_replay =",
           st3.globals[0].is_replay)
 
-    st3.save()
+    st3.save_now()
     st4 = RouteStore(path)
     assert "wrpl:avg_finland" not in st4.known_maps and "wrpl_avg_finland" in st4.known_maps
     print("迁移后写盘 OK, known_maps =", st4.known_maps)

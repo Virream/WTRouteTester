@@ -64,6 +64,14 @@ from .zones import spawns_to_json, zones_from_signature, zones_to_json
 
 log = logging.getLogger("route_store")
 
+# 后台写盘: 收到保存请求后先等这么久再动手, 把连续请求(比如"标记 + 结束录制"
+# 连着两下)合并成一次写。80 ms 对人眼是瞬时的, 但不至于每次点儿都写一遍硬盘。
+SAVE_DEBOUNCE_S = 0.08
+
+# **测试/探针用**: 置 True 时 `save()` 改回同步写盘。
+# 它们有大量“写完立刻重读”的断言, 不置的话每处都得自己叫 `save_now()`。
+SYNC_SAVE = False
+
 
 def _read_payload(path: str) -> dict | None:
     """读数据文件: **gzip 压缩的 JSON**。
@@ -215,32 +223,83 @@ def _pack_point(p) -> list:
 
     `hold` 只在非 0 时写第五个数 —— 移动点和旧数据都还是 4 个数的样子,
     读回来完全兼容。
+
+    ⚠ **只 round `t`**: 它是逐帧累加出来的, 会带出 `0.30000000000000004` 这种长尾;
+    而 `x`/`y`/`speed` 在**采样时就 round 过**(录制器与回放导入都做了),
+    这里再 round 一遍要 80 万 × 3 次调用 = **0.8 秒**(实测)。
     """
-    row = [round(p.t, 2), round(p.x, 5), round(p.y, 5), round(p.speed, 1)]
-    hold = float(getattr(p, "hold", 0.0) or 0.0)
+    row = [round(p.t, 2), p.x, p.y, p.speed]
+    hold = p.hold or 0.0
     if hold > 0.0:
         row.append(round(hold, 2))
     return row
 
 
 def _unpack_point(row) -> TrackPoint | None:
-    """紧凑数组 → `TrackPoint`(坏行返回 None, 由调用方过滤)。"""
+    """紧凑数组 → `TrackPoint`(坏行返回 None, 由调用方过滤)。
+
+    位置参数 + 长度快路径: 80 万点时要跑 80 万次, 关键字参数与多余的 `float()`
+    在这里能差 0.3 秒(实测 0.82 → 0.52 s)。
+    """
     try:
-        t, x, y = float(row[0]), float(row[1]), float(row[2])
+        if len(row) == 4:
+            return TrackPoint(row[1], row[2], row[0], row[3])
+        return TrackPoint(row[1], row[2], row[0], row[3],
+                          hold=max(0.0, row[4]))
     except (IndexError, TypeError, ValueError):
         return None
-    speed = hold = 0.0
-    if len(row) > 3:
+
+
+# rels/回放导入的单条轨迹点 —— 同样打成数组, 理由见 `UnitLife.to_json` 的注释:
+# 一个点写成一个 dict 时, `{"t":..,"x":..,"y":..,"speed":..,"dx":..,"dy":..}`
+# 光键名就占 40 个字符。80 万点时这是 **3300 万 → 1300 万字符** 的差别,
+# `json.dumps` 也跟着快一倍(2026-10-26 用户报“保存要卡好几秒”)。
+def _pack_route_point(p) -> list:
+    """`RoutePoint` → `[t, x, y, speed, dx, dy]`(与 `TrackPoint` 的数组同序)。
+
+    同样只 round `t`, 理由见 `_pack_point`。
+    """
+    return [round(p.t, 2), p.x, p.y, p.speed, p.dx, p.dy]
+
+
+def _unpack_route_point(row) -> RoutePoint | None:
+    """数组或**旧版 dict** → `RoutePoint`(坏行返回 None)。
+
+    ⚠ 两种格式都要认: 1.3.1 之前的文件里点是 `{"x":..,"y":..,...}` 的 dict。
+    第一次 `save()` 之后就会全部写成新数组格式, 所以这只是“读一次旧文件”的过渡。
+    """
+    if isinstance(row, dict):
         try:
-            speed = float(row[3])
-        except (TypeError, ValueError):
-            speed = 0.0
-    if len(row) > 4:
+            return RoutePoint(row["x"], row["y"], row["t"],
+                              row.get("speed") or 0.0,
+                              row.get("dx") or 0.0, row.get("dy") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            return None
+    try:
+        return RoutePoint(row[1], row[2], row[0], row[3], row[4], row[5])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _pack_mark(m) -> list:
+    """`RouteMark` → `[x, y, t, kind]`。"""
+    return [m.x, m.y, round(m.t, 2), m.kind or "mark"]
+
+
+def _unpack_mark(row) -> RouteMark | None:
+    if isinstance(row, dict):
         try:
-            hold = max(0.0, float(row[4]))
-        except (TypeError, ValueError):
-            hold = 0.0
-    return TrackPoint(x=x, y=y, t=t, speed=speed, hold=hold)
+            return RouteMark(x=float(row["x"]), y=float(row["y"]),
+                             t=float(row.get("t") or 0.0),
+                             kind=str(row.get("kind") or "mark"))
+        except (KeyError, TypeError, ValueError):
+            return None
+    try:
+        return RouteMark(x=float(row[0]), y=float(row[1]),
+                         t=float(row[2]) if len(row) > 2 else 0.0,
+                         kind=str(row[3]) if len(row) > 3 else "mark")
+    except (IndexError, TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -767,10 +826,17 @@ def pretty_vehicle(key: str) -> str:
 
 class RouteStore:
     """线路记录读写(原子写, 线程安全)。"""
-
     def __init__(self, path: str | None = None):
         self.path = path or os.path.join(data_dir(), "routes.json")
         self._lock = threading.RLock()
+        # 后台写盘(见 `request_save`): 界面只置个标志, 真正的序列化/压缩在另一个
+        # 线程里做 —— 1.3.0 起一局回放就几十万点, 同步写要 1~4 秒。
+        self._save_pending = False
+        self._closing = False
+        # 有没有“自上次成功写盘之后又改过东西”—— 退出时据此决定要不要真写一次
+        self._dirty = False
+        self._save_wake = threading.Event()
+        self._save_thread: threading.Thread | None = None
         self.map_names: dict[str, str] = {}
         # 用户在「地图管理」里勾了“隐藏”的地图: 只是**不在左侧列表里显示**,
         # 轨迹数据/名称/缓存图片都不动(空战地图永迹不会用到, 留着只碍事)
@@ -797,6 +863,7 @@ class RouteStore:
         # 全局录制条目(整局所有玩家的线路, 分 A/B 两队)
         self.globals: list[GlobalRecord] = []
         self._load()
+        # 写盘线程**惰性启动**(见 `request_save`): 只读的 store(探针/测试)不该占线程
 
     # ------------------------------------------------------------------
     def _load(self) -> None:
@@ -829,8 +896,8 @@ class RouteStore:
                                    for k, v in ml.items() if str(k) and str(v).strip()}
             for item in data.get("routes") or []:
                 try:
-                    pts = [RoutePoint(**p) for p in item.get("points") or []]
-                    mks = [RouteMark(**m) for m in item.get("marks") or []]
+                    pts = [_unpack_route_point(p) for p in item.get("points") or []]
+                    mks = [_unpack_mark(m) for m in item.get("marks") or []]
                     self.routes.append(RouteRecord(
                         route_id=str(item["route_id"]),
                         map_key=str(item.get("map_key", "unknown")),
@@ -840,7 +907,8 @@ class RouteStore:
                         duration=float(item.get("duration", 0.0)),
                         start_x=float(item.get("start_x", 0.0)),
                         start_y=float(item.get("start_y", 0.0)),
-                        points=pts, marks=mks,
+                        points=[p for p in pts if p is not None],
+                        marks=[m for m in mks if m is not None],
                         # 旧版本的记录没有这三个字段 → 默认 0/空 → 归为“未知模式”
                         zone_count=int(item.get("zone_count") or 0),
                         zone_signature=str(item.get("zone_signature") or ""),
@@ -963,16 +1031,15 @@ class RouteStore:
             log.info("从轨迹指纹补回了缺失的战区布局")
         return changed
 
-    def save(self) -> None:
-        """原子写盘(tmp + os.replace), 强杀不残留半截文件。
+    def _snapshot(self) -> dict:
+        """把当前数据转成可序列化的纯 Python 数据(**在锁内**, 拿一致快照)。
 
-        写的是**紧凑 JSON + gzip**(不带缩进): 缩进本身占文件体积的 ~40%, 而
-        gzip 又能再压到 14% —— 合起来 3.49MB → 0.47MB。压缩后加载反而更快:
-        磁盘少读 7.4 倍, 省下的时间多于解压(实测 80ms → 63ms)。
+        点全部走数组打包(见 `_pack_route_point` / `_pack_point`), **不用 `asdict`** ——
+        `asdict` 会递归深拷贝每个字段, 80 万点要 1.8 秒; 手写列表推导不到 0.3 秒。
         """
         with self._lock:
-            payload = {
-                "version": 1,
+            return {
+                "version": 2,
                 "map_names": self.map_names,
                 "hidden_maps": self.hidden_maps,
                 # 存**原始** known_maps(不按 canon 去重): 回放键 `wrpl_<关卡>` 即使
@@ -983,25 +1050,123 @@ class RouteStore:
                 "map_levels": self.map_levels,
                 "routes": [
                     {
-                        **{k: v for k, v in asdict(r).items()
-                           if k not in ("points", "marks")},
-                        "points": [asdict(p) for p in r.points],
-                        "marks": [asdict(m) for m in r.marks],
+                        "route_id": r.route_id,
+                        "map_key": r.map_key,
+                        "map_name": r.map_name,
+                        "vehicle": r.vehicle,
+                        "created_at": r.created_at,
+                        "duration": r.duration,
+                        "start_x": r.start_x,
+                        "start_y": r.start_y,
+                        "zone_count": r.zone_count,
+                        "zone_signature": r.zone_signature,
+                        "mode_name": r.mode_name,
+                        "points": [_pack_route_point(p) for p in r.points],
+                        "marks": [_pack_mark(m) for m in r.marks],
                     }
                     for r in self.routes
                 ],
                 "globals": [g.to_json() for g in self.globals],
             }
-            tmp = self.path + ".tmp"
+
+    def save(self) -> None:
+        """**请求**落盘(异步, 立即返回) —— 真正的写盘在后台线程里做。
+
+        为什么改成异步(用户 2026-10-26): 1.3.0 起一局回放就是几十万点, 一次
+        全量写盘要 1~4 秒 —— 点 F6 保存、开始录制、选关卡代号、关窗口全在那儿等,
+        叠加层都要等它写完才消失、卡得连提示音都听不到。
+
+        ⚠ 调用后**不保证**文件已经写好; 要确定落盘用 `save_now()`, 退出前用 `flush()`。
+        """
+        if SYNC_SAVE:                  # 测试/探针: 保持旧的同步语义
+            self.save_now()
+            return
+        self.request_save()
+
+    def save_now(self) -> None:
+        """同步写盘, 会阻塞调用方(**后台线程与 `flush()` 用这个**)。
+
+        写的是**紧凑 JSON + gzip**: `gzip(level=1)` 而不是 6 —— 体积只大 ~50%
+        (8.3 MB → 12.7 MB), 但压缩耗时从 0.6 s 降到 0.1 s, 而**读回来**的 gzip
+        解压速度几乎一样(实测 load 不受影响)。数据是自己的, 体积不是瓶颈。
+        """
+        payload = self._snapshot()
+        tmp = self.path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            blob = gzip.compress(text.encode("utf-8"), compresslevel=1)
+            with open(tmp, "wb") as f:
+                f.write(blob)
+            os.replace(tmp, self.path)
+            self._dirty = False
+        except (OSError, ValueError) as exc:
+            log.error("保存线路数据失败: %s", exc)
+
+    # ------------------------------------------------------ 后台写盘(界面不等)
+    def request_save(self) -> None:
+        """请求落盘, **立即返回**。多次请求会合并成一次写。
+
+        为什么要这个(用户 2026-10-26): 1.3.0 起一局回放就是几十万点, 一次全量
+        写盘要 1~4 秒 —— 点 F6 保存、开始录制、选关卡代号、关窗口全在那儿等,
+        叠加层都要等它写完才消失。
+        """
+        self._save_pending = True
+        self._dirty = True
+        if self._save_thread is None:
+            self._save_thread = threading.Thread(
+                target=self._save_worker, name="route-store-save", daemon=True)
+            self._save_thread.start()
+        self._save_wake.set()
+
+    def _save_worker(self) -> None:
+        """后台线程: 攒 `SAVE_DEBOUNCE_S` 把连续请求合并成一次写。"""
+        while True:
+            self._save_wake.wait()
+            self._save_wake.clear()
+            if not self._closing:
+                time.sleep(SAVE_DEBOUNCE_S)      # 合并: 这期间来的请求只算一次
+                self._save_wake.clear()
+            if not self._save_pending:
+                if self._closing:
+                    return
+                continue
+            self._save_pending = False
             try:
-                os.makedirs(os.path.dirname(self.path), exist_ok=True)
-                text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                blob = gzip.compress(text.encode("utf-8"), compresslevel=6)
-                with open(tmp, "wb") as f:
-                    f.write(blob)
-                os.replace(tmp, self.path)
-            except (OSError, ValueError) as exc:
-                log.error("保存线路数据失败: %s", exc)
+                self.save_now()
+            except Exception:  # noqa: BLE001 - 后台线程不能把异常抛出去
+                log.exception("后台保存线路数据失败")
+            if self._closing:
+                return
+
+    def flush(self, timeout: float = 20.0) -> None:
+        """关窗口前调用: 把还在排队的写盘做完(**同步等它**)。
+
+        不等的话, 后台线程会被进程退出直接干掉 —— 用户刚录的那条就没了。
+        已经写完(没有新改动)时**直接返回** —— 大多数时候关窗口是瞬时的。
+        """
+        if not self._dirty and not self._save_pending:
+            self._closing = True
+            th = self._save_thread
+            if th is not None and th.is_alive():
+                self._save_wake.set()       # 叫醒它让它自己退出
+                th.join(timeout)
+            return
+        self._save_pending = True
+        self._closing = True
+        th = self._save_thread
+        if th is None:                 # 一次都没请求过 → 直接同步写一次
+            try:
+                self.save_now()
+            except Exception:  # noqa: BLE001
+                log.exception("退出时保存线路数据失败")
+            return
+        self._save_wake.set()
+        if th.is_alive():
+            th.join(timeout)
+
+    def __getstate__(self):    # pragma: no cover - 只为避免意外 pickle 出线程
+        raise TypeError("RouteStore 不可序列化")
 
     # ------------------------------------------------------------------
     def new_route(self, map_key: str, map_name: str, vehicle: str,

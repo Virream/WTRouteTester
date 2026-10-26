@@ -92,9 +92,8 @@ def _create_map_view(parent) -> RouteMapView:
 # 轮询推到上限、调得太大轨迹会变稀疏出怪结果。所以它从信息区下拉框收进了
 # 菜单「设置 → 轮询间隔」, 主界面只留一个很小的只读频率提示。
 INTERVAL_CHOICES_MS = (20, 25, 30, 40, 50, 75, 100)
-# `/hudmsg` 的轮询选项(毫秒): 8111 官方页面自己就是 500ms; 调大很危险
-# (damage 是滚动窗口), 所以上限只给到 2 秒。
-HUD_CHOICES_MS = (200, 300, 500, 800, 1000, 2000)
+# `/hudmsg` 的轮询选项(毫秒): 1.3.0 改用回放文件后已不再使用。
+# （保留常量只是为了让旧设置项能被认出来删掉，见 `__init__` 里的清理）
 
 # 设置版本: **改了某一项的“默认值”就递增**。
 # QSettings 会记住用户上次选的值, 不重置的话新默认对老用户永远不生效。
@@ -199,11 +198,11 @@ class RouteTesterWindow(QMainWindow):
 
         self._saved_ms = _saved_int("interval_ms", DEFAULT_INTERVAL_MS,
                                     INTERVAL_CHOICES_MS)
-        self._saved_global_ms = _saved_int("global_interval_ms",
-                                           DEFAULT_GLOBAL_INTERVAL_MS,
-                                           INTERVAL_CHOICES_MS)
-        self._saved_hud_ms = _saved_int("hud_interval_ms", DEFAULT_HUD_INTERVAL_MS,
-                                        HUD_CHOICES_MS)
+        # 1.3.0 改用回放文件之后, “全局录制轮询率”与“hudmsg 轮询率”已经没用了
+        # (用户 2026-10-26 要求只留单条的那一档) —— 旧的设置项顺手清掉。
+        for _stale in ("global_interval_ms", "hud_interval_ms"):
+            if self._settings.contains(_stale):
+                self._settings.remove(_stale)
         # “以速度从零变化时刻作为起始时间点”是**非默认开启**的功能: 每次启动都不勾选。
         # 不写入 QSettings —— 否则上次勾选的状态会被带到下次启动, 看起来就像默认开启。
         self._saved_on_move = False
@@ -281,8 +280,6 @@ class RouteTesterWindow(QMainWindow):
         if start_recorder:
             self.recorder.start()
         self.recorder.set_interval_ms(self._saved_ms)
-        self.recorder.set_global_interval_ms(self._saved_global_ms)
-        self.recorder.set_hud_interval_ms(self._saved_hud_ms)
         self.lbl_rate.setText(f"轮询 {1000 // int(self._saved_ms)} Hz")
 
         # 轨迹回放(按倍速推进 playhead)
@@ -369,31 +366,28 @@ class RouteTesterWindow(QMainWindow):
         # ---- 轮询间隔: 从信息区挪到菜单(2026-10-23)。
         # 用户口径: “采样设置不该让用户经常改, 最好是定在一个合适的数值, 现在这项功能
         # 在主界面太显眼, 用户可能没事干就会调得过高或过低导致 bug。”
-        # 之后又要求**三档拆开**: 单条录制 / 全局录制 / hudmsg 各一个轮询率。
+        # 曾经拆成三档(单条 / 全局 / hudmsg); 1.3.0 改用回放文件之后后两档已经
+        # 没有用武之地, 用户 2026-10-26 要求**只留单条录制**这一档。
         setting.addSeparator()
         rate_menu = setting.addMenu("轮询间隔(&R)")
         rate_menu.setToolTip(
-            "三档独立的轮询率(单条录制 / 全局录制 / hudmsg)。\n"
-            "一般不用改: 前两个 40 ms(25 Hz)与 8111 陆战数据的更新率一致;\n"
-            "hudmsg 500 ms 就是 8111 官方网页自己的频率。")
-        self._rate_actions = self._build_rate_submenu(
-            rate_menu, "单条录制轮询率", self._saved_ms, INTERVAL_CHOICES_MS,
-            self._set_record_rate_ms,
-            "单条线路录制的轮询间隔: 决定主循环频率与单条轨迹的采样密度。")
-        self._rate_global_actions = self._build_rate_submenu(
-            rate_menu, "全局录制轮询率", self._saved_global_ms, INTERVAL_CHOICES_MS,
-            self._set_global_rate_ms,
-            "全局录制(整局所有玩家)的轮询间隔: 只影响全场单位数据的采样密度,\n"
-            "与上面的单条录制互不影响。")
-        self._rate_hud_actions = self._build_rate_submenu(
-            rate_menu, "hudmsg 轮询率", self._saved_hud_ms, HUD_CHOICES_MS,
-            self._set_hud_rate_ms,
-            "`/hudmsg`(击毁消息)的轮询间隔。500 ms 就是 8111 官方网页自己的频率;\n"
-            "⚠ 不要调太大: damage 是滚动窗口, 太慢会被挤掉(实测 15 秒会整段丢失)。")
-        rate_menu.addSeparator()
-        act_rate_hint = QAction("建议: 单条/全局 40 ms、hudmsg 500 ms —— 一般不用改", self)
-        act_rate_hint.setEnabled(False)
-        rate_menu.addAction(act_rate_hint)
+            "单条线路录制的轮询间隔: 决定主循环频率与单条轨迹的采样密度。\n"
+            "一般不用改: 40 ms(25 Hz)与 8111 陆战数据的更新率一致。")
+        self._rate_actions = []
+        _rate_group = QActionGroup(self)
+        _rate_group.setExclusive(True)
+        for _ms in INTERVAL_CHOICES_MS:
+            _text = (f"{_ms} ms({1000 // _ms} Hz)" if _ms < 1000
+                     else f"{_ms} ms({_ms / 1000:g} s)")
+            _act = QAction(_text, self)
+            _act.setCheckable(True)
+            _act.setChecked(int(_ms) == int(self._saved_ms))
+            _act.setToolTip(rate_menu.toolTip())
+            _act.triggered.connect(
+                lambda _c=False, v=int(_ms): self._set_record_rate_ms(v))
+            _rate_group.addAction(_act)
+            rate_menu.addAction(_act)
+            self._rate_actions.append(_act)
 
         # ---- 叠加层(录制时浮在屏幕角落的小窗)
         setting.addSeparator()
@@ -2647,33 +2641,6 @@ class RouteTesterWindow(QMainWindow):
         self._set_status(
             f"单条录制轮询率已设为 {int(ms)} ms(≈{1000 // int(ms)} Hz)", sticky=2.0)
 
-    def _set_global_rate_ms(self, ms: int) -> None:
-        """菜单「设置 → 轮询间隔 → 全局录制轮询率」。"""
-        ms = rate_choice_ms(ms, INTERVAL_CHOICES_MS)
-        rec = getattr(self, "recorder", None)
-        if rec is not None:
-            rec.set_global_interval_ms(float(ms))
-        self._settings.setValue("global_interval_ms", int(ms))
-        self._saved_global_ms = int(ms)
-        self._sync_rate_actions(getattr(self, "_rate_global_actions", ()),
-                                INTERVAL_CHOICES_MS, ms)
-        self._set_status(
-            f"全局录制轮询率已设为 {int(ms)} ms(≈{1000 // int(ms)} Hz)", sticky=2.0)
-
-    def _set_hud_rate_ms(self, ms: int) -> None:
-        """菜单「设置 → 轮询间隔 → hudmsg 轮询率」。"""
-        ms = rate_choice_ms(ms, HUD_CHOICES_MS)
-        rec = getattr(self, "recorder", None)
-        if rec is not None:
-            rec.set_hud_interval_ms(float(ms))
-        self._settings.setValue("hud_interval_ms", int(ms))
-        self._saved_hud_ms = int(ms)
-        self._sync_rate_actions(getattr(self, "_rate_hud_actions", ()),
-                                HUD_CHOICES_MS, ms)
-        self._set_status(
-            f"hudmsg 轮询率已设为 {int(ms)} ms"
-            + ("(8111 官方网页就是 500 ms)" if int(ms) == 500 else ""), sticky=2.0)
-
     def _set_status(self, text: str, sticky: float = 0.0) -> None:
         """写状态栏。sticky>0 时该文字在这么多秒内不会被刷新的状态覆盖
         (否则提示类信息 80ms 后就没了)。"""
@@ -2706,10 +2673,8 @@ class RouteTesterWindow(QMainWindow):
         # 等待移动期间还没定下起点, 标记没有意义
         self.btn_mark.setEnabled(recording and not armed)
         self.chk_start_on_move.setEnabled(not busy and not in_play)
-        # 三档轮询率都在菜单里: 录制/回放期间同样不允许改
-        for act in (list(getattr(self, "_rate_actions", ()))
-                    + list(getattr(self, "_rate_global_actions", ()))
-                    + list(getattr(self, "_rate_hud_actions", ()))):
+        # 轮询率在菜单里: 录制/回放期间同样不允许改
+        for act in getattr(self, "_rate_actions", ()):
             act.setEnabled(not busy and not in_play)
         self.tree.setEnabled(not in_play and not busy)   # 含眼睛点击与右键菜单
         # 从录像导入: 录制/回放期间不允许(会抢主界面)
@@ -3156,7 +3121,9 @@ class RouteTesterWindow(QMainWindow):
             self.player.pause()
             self.recorder.stop()
             self.overlay.close()          # 叠加层是独立顶层窗, 不关会留在屏幕上
-            self.store.save()
+            # 写盘在后台线程里做(见 `RouteStore.request_save`), 这里**等它做完** ——
+            # 不等的话进程一退, 用户刚录的那条就没了。
+            self.store.flush()
         except Exception as exc:  # noqa: BLE001 - 退出时尽力清理
             log.warning("退出清理异常: %s", exc)
         super().closeEvent(event)

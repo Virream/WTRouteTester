@@ -181,7 +181,7 @@ def main() -> int:
 
     print("\n--- 7) 重启后依然记得(落盘 + 重读) ---")
     store.set_map_level(HASH_KEY, LEVEL)
-    store.save()
+    store.save_now()          # 探针要立刻重读 → 用同步版(save() 现在是异步请求)
     again = RouteStore(os.path.join(root, "routes.json"))
     check("关联从盘上读回来", again.level_of_hash(HASH_KEY) == LEVEL,
           f"={again.level_of_hash(HASH_KEY)!r}")
@@ -199,7 +199,7 @@ def main() -> int:
     replay.sides["A"].append(life)
     replay.norm_rect = list(old_rect)
     store.set_map_level(HASH_KEY, "")          # 先退回"未关联"
-    store.save()
+    store.save_now()
 
     dlg2 = MapManagerDialog(store, cache)
     row2 = next(r for r in range(dlg2.table.rowCount())

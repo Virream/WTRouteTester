@@ -21,6 +21,10 @@ from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import QApplication
 
 import wt81111g.route_window as rw
+import wt81111g.route_store as _store_mod
+
+# 1.3.1 起 `save()` 是异步请求, 而测试里到处是“写完立刻重读” → 改回同步
+_store_mod.SYNC_SAVE = True
 from wt81111g.global_record import (
     EMPTY_STOP, VIEW_CHANGE_GRACE, GlobalTracker, extract_units, fit_frame,
     frame_anchors, is_drone, recordable,
@@ -594,7 +598,7 @@ def test_full_rate_and_hold(tmpdir: str):
     g = store.new_global("HOLD", "地图 H")
     g.sides["A"] = [life]
     store.add_global(g)
-    store.save()
+    store.save_now()               # 测试要立刻读回 → 用同步版(save() 是异步请求)
     got = RouteStore(path).get_global(g.route_id)
     l2 = got.lives("A")[0]
     assert len(l2.points) == len(life.points), (len(l2.points), len(life.points))

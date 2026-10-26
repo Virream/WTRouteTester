@@ -21,6 +21,11 @@ from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QAbstractItemView, QApplication
 
 import wt81111g.route_window as rw
+from wt81111g import route_store as _route_store
+
+# 1.3.1 起 `save()` 是**异步请求**(几十万点的写盘不能让界面等), 而测试里到处
+# 是“写完立刻重读”的断言 —— 这里把它改回同步, 免得每处都手动 `save_now()`。
+_route_store.SYNC_SAVE = True
 from wt81111g.map_cache import MapCache
 from wt81111g.icons import ICON_SIZE, circle_icon, eye_icon
 from wt81111g.route_map_view import (
@@ -153,6 +158,9 @@ def test_store(tmpdir: str):
     store.rename_map("abc123", "波兰·西风农场")
     assert store.display_name("abc123") == "波兰·西风农场"
 
+    # `save()` 现在是**异步请求**(1.3.1 起, 几十万点的全量写盘不能让界面等),
+    # 测试要确定落盘所以显式用同步版
+    store.save_now()
     again = RouteStore(path)          # 持久化往返
     assert len(again.routes) == 1
     assert again.routes[0].map_name == "波兰·西风农场"
@@ -160,6 +168,7 @@ def test_store(tmpdir: str):
     assert again.routes[0].points[0].speed == 45.0
 
     assert store.remove(rec.route_id) is True
+    store.save_now()
     assert RouteStore(path).routes == []
     results.append("RouteStore 新增/分组/重命名/持久化/删除 OK")
 
@@ -216,6 +225,7 @@ def test_recorder(tmpdir: str):
     assert saved.duration >= 0.0
     assert saved.marks[-1].kind == "stop"
     assert len(store.routes) == 1
+    store.save_now()                  # save() 是异步请求, 测试要立刻读回
     assert RouteStore(store.path).routes[0].route_id == saved.route_id
     results.append("RouteRecorder 开始/采样/标记/结束 + 落盘 OK")
 
@@ -996,6 +1006,7 @@ def test_spawns(tmpdir: str):
     assert store.remember_zones("m1", zones, spawns=spawns) is False
     layout = store.layout_for("m1", sig)
     assert len(layout["spawns"]) == 6
+    store.save_now()                                             # save() 是异步请求
     again = RouteStore(os.path.join(tmpdir, "spawns.json"))
     assert len(again.layout_for("m1", sig)["spawns"]) == 6       # 持久化往返
     # 同一布局、重生位置变了(同一张图的另一个版本) → 更新进去, 不新增布局
@@ -1808,6 +1819,7 @@ def test_store_bom(tmpdir: str):
     rec.duration = 5.0
     rec.points = [RoutePoint(0.2, 0.2, 0.0, 0.0), RoutePoint(0.3, 0.3, 5.0, 30.0)]
     store.add(rec)
+    store.save_now()                  # save() 是异步请求, 这里要立刻看到文件
 
     raw = open(path, "rb").read()
     assert raw[:2] == b"\x1f\x8b", "save() 应该写 gzip"
@@ -1900,8 +1912,7 @@ def test_rate_menu(tmpdir: str):
     在主界面太显眼, 用户可能没事干就会调得过高或过低导致 bug”。
     所以这里同时断言: 默认就是 40 ms、菜单只勾一项、改动立即生效、非法值能归一。
     """
-    from wt81111g.route_window import (HUD_CHOICES_MS, INTERVAL_CHOICES_MS,
-                                       rate_choice_ms)
+    from wt81111g.route_window import INTERVAL_CHOICES_MS, rate_choice_ms
 
     assert int(rw.DEFAULT_INTERVAL_MS) in INTERVAL_CHOICES_MS
     assert rate_choice_ms(0) == INTERVAL_CHOICES_MS[0]
@@ -1917,38 +1928,25 @@ def test_rate_menu(tmpdir: str):
     app.processEvents()
     try:
         assert not hasattr(win, "cmb_rate"), "主界面不应再有采样间隔下拉框"
-        # 三档各自一组互斥单选项, 且各自勾中的就是 recorder 当前实际值
-        for acts, choices, get in (
-                (win._rate_actions, INTERVAL_CHOICES_MS,
-                 win.recorder.target_interval_ms),
-                (win._rate_global_actions, INTERVAL_CHOICES_MS,
-                 win.recorder.target_global_interval_ms),
-                (win._rate_hud_actions, HUD_CHOICES_MS,
-                 win.recorder.target_hud_interval_ms)):
-            assert len(acts) == len(choices), (len(acts), len(choices))
-            checked = [a.text() for a in acts if a.isChecked()]
-            assert len(checked) == 1, checked
-            assert checked[0].startswith(f"{int(get())} ms"), (checked, get())
+        # 2026-10-26: 只剩「单条录制」一组(全局/hudmsg 两档随 A/B 实况录制一起退场)
+        assert len(win._rate_actions) == len(INTERVAL_CHOICES_MS)
+        checked = [a.text() for a in win._rate_actions if a.isChecked()]
+        assert len(checked) == 1, checked
+        assert checked[0].startswith(f"{int(win.recorder.target_interval_ms())} ms"), \
+            (checked, win.recorder.target_interval_ms())
+        for gone in ("_rate_global_actions", "_rate_hud_actions",
+                     "_set_global_rate_ms", "_set_hud_rate_ms"):
+            assert not hasattr(win, gone), f"{gone} 应该随 A/B 实况录制一起删掉"
 
-        # 三档必须**互不影响**
         win._set_record_rate_ms(75)
-        win._set_global_rate_ms(50)
-        win._set_hud_rate_ms(1000)
         assert abs(win.recorder.target_interval_ms() - 75.0) < 1e-6
-        assert abs(win.recorder.target_global_interval_ms() - 50.0) < 1e-6
-        assert abs(win.recorder.target_hud_interval_ms() - 1000.0) < 1e-6
-        for acts, want in ((win._rate_actions, "75 ms"),
-                           (win._rate_global_actions, "50 ms"),
-                           (win._rate_hud_actions, "1000 ms")):
-            checked = [a.text() for a in acts if a.isChecked()]
-            assert len(checked) == 1 and checked[0].startswith(want), checked
+        checked = [a.text() for a in win._rate_actions if a.isChecked()]
+        assert len(checked) == 1 and checked[0].startswith("75 ms"), checked
     finally:
         # 别把用户设置留在测试值上
         win._set_record_rate_ms(int(rw.DEFAULT_INTERVAL_MS))
-        win._set_global_rate_ms(int(rw.DEFAULT_GLOBAL_INTERVAL_MS))
-        win._set_hud_rate_ms(int(rw.DEFAULT_HUD_INTERVAL_MS))
         win.close()
-    results.append("轮询率在菜单里且三档独立(单条 / 全局 / hudmsg) OK")
+    results.append("轮询率在菜单里(只保留单条录制一档) OK")
 
 
 def test_sound(tmpdir: str):
@@ -2338,6 +2336,7 @@ def test_map_merge_old_duplicates(tmpdir: str):
     store.add(rec1)
     store.add(rec2)
     store.rename_map(key_big, "货运港口")          # 名字在“大图”那个键上
+    store.save_now()        # 合并前得先有真实文件, merge_duplicates 要给它留 .bak
     # 再放一张**长得有点像但确实是另一张**的图: 不该被并进来
     near = png_pattern(256, shift=1)
     key_near, _ = cache.save(near)
@@ -2829,7 +2828,8 @@ def test_map_manager(tmpdir: str):
     assert "诺曼底" in [win.tree.topLevelItem(i).text(1)
                         for i in range(win.tree.topLevelItemCount())]
     assert win.store.get(rec.route_id).map_name == "诺曼底"
-    # 重建 store 后名字应仍在(落盘)
+    # 重建 store 后名字应仍在(落盘) —— save() 是异步请求, 这里先同步写一次
+    win.store.save_now()
     again = RouteStore(os.path.join(tmpdir, "manager.json"))
     assert again.name_of(key) == "诺曼底"
     assert key in again.known_maps
@@ -2960,6 +2960,7 @@ def test_zones_and_modes(tmpdir: str):
     assert [x["mode"] for x in store.zone_layouts("m1")] == ["战区控制"]
     assert store.layout_for("m1", sig3)["count"] == 3
     assert store.layout_for("m1", "X@0,0")["mode"] == "战区控制"   # 匹配不到就用最新的
+    store.save_now()                                               # save() 是异步请求
     again = RouteStore(os.path.join(tmpdir, "zones.json"))
     assert len(again.zone_layouts("m1")) == 1                     # 持久化往返
 

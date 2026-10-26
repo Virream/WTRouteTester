@@ -501,12 +501,14 @@ def build_record(data: ReplayData, source_path: str = "",
                             # 亚米级噪声 / uid 复用), 沿用上一个有效值而不是造尖峰
                             if kmh <= 150.0:
                                 speed = last_speed = kmh
-                pts.append(TrackPoint(t=max(0.0, t - t0),
+                pts.append(TrackPoint(t=round(max(0.0, t - t0), 2),
                                       # **不夹到 0~1** —— 夹了会在边框上拉出一条假直线；
                                       # 真超出范围的点就让它画到画布外（自然被裁掉）
-                                      x=nx,
-                                      y=ny,
-                                      speed=speed))
+                                      # ⚠ 这里 round 一次就够: 保存时不再 round
+                                      # (80 万点 × 4 次 round 要 1 秒, 见 route_store._pack_point)
+                                      x=round(nx, 5),
+                                      y=round(ny, 5),
+                                      speed=round(speed, 1)))
                 prev = (t, x, z)
             side = _side(uid)
             veh = seg_src[si - 1]           # 上面已按段首时刻解析好
@@ -652,9 +654,9 @@ def build_record(data: ReplayData, source_path: str = "",
             if _k not in _air_base:
                 _air_base[_k] = len(rec.sides[side]) + 1
             _segn[_k] = _segn.get(_k, 0) + 1
-            pts = [TrackPoint(t=max(0.0, t - t0),
-                              x=(x - minx) / spanx,
-                              y=(maxz - z) / spanz,
+            pts = [TrackPoint(t=round(max(0.0, t - t0), 2),
+                              x=round((x - minx) / spanx, 5),
+                              y=round((maxz - z) / spanz, 5),
                               speed=0.0)
                    for t, x, _y, z in seg]
             # 速度：飞机按相邻点位移算（不设上限，超音速很正常）
@@ -728,13 +730,14 @@ def renormalize_map_records(store, map_key: str, calib) -> int:
         spanx, spanz = old[1] - old[0], old[3] - old[2]
         if spanx <= 0 or spanz <= 0:
             continue
+        # 80 万点时要跑几十万次内层循环: 把属性/索引都提到循环外(实测快约 30%)
+        ox, otop, sx, sz = old[0], old[3], spanx, spanz
+        nx0, ntop, nsx, nsz = new_rect[0], new_rect[3], nspanx, nspanz
         for side in ("A", "B"):
             for life in rec.lives(side):
                 for pt in life.points:
-                    wx = old[0] + pt.x * spanx
-                    wz = old[3] - pt.y * spanz
-                    pt.x = (wx - new_rect[0]) / nspanx
-                    pt.y = (new_rect[3] - wz) / nspanz
+                    pt.x = (ox + pt.x * sx - nx0) / nsx
+                    pt.y = (ntop - (otop - pt.y * sz)) / nsz
         rec.norm_rect = new_rect
         changed += 1
     if changed:

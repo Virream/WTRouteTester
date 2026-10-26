@@ -701,7 +701,8 @@ class GlobalTracker:
             side=self.side,
             watched=is_watcher_unit(u.icon, u.color),
         )
-        life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=0.0))
+        life.points.append(TrackPoint(x=round(u.x, 5), y=round(u.y, 5),
+                                      t=round(t, 2), speed=0.0))
         self.lives.append(life)
         # 起点校验: 刚重生的车会在某个重生点上; 离得很远说明它是“中途才被上报”的
         # (8111 漏报过 >end_gap 秒, 或这辆车本就不从重生点出生, 例如 AI 单位)。
@@ -741,8 +742,9 @@ class GlobalTracker:
         if moved >= MIN_MOVE:
             speed = self._speed(last.x, last.y, lv.x, lv.y,
                                 max(1e-6, lv.last_seen - depart))
-            lv.life.points.append(TrackPoint(x=lv.x, y=lv.y, t=lv.last_seen,
-                                             speed=speed))
+            lv.life.points.append(TrackPoint(x=round(lv.x, 5), y=round(lv.y, 5),
+                                             t=round(lv.last_seen, 2),
+                                             speed=round(speed, 1)))
             return
         last.hold = round(lv.last_seen - last.t, 2)
 
@@ -818,7 +820,8 @@ class GlobalTracker:
             depart = last.t + float(getattr(last, "hold", 0.0) or 0.0)
             dt = max(1e-3, t - min(depart, t))
             speed = self._speed(lv.last_x, lv.last_y, u.x, u.y, dt)
-            lv.life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=speed))
+            lv.life.points.append(TrackPoint(x=round(u.x, 5), y=round(u.y, 5),
+                                             t=round(t, 2), speed=round(speed, 1)))
             lv.last_x, lv.last_y = u.x, u.y
             lv.last_store = t
 
