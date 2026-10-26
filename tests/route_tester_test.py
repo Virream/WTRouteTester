@@ -2587,6 +2587,8 @@ def test_implied_selection_marks(tmpdir: str):
     assert {id(it) for it in lifes} <= {id(it) for it in win._implied_items}
     assert all(not win._is_item_selected(it) for it in lifes), "被动标记 ≠ 真选中"
     assert len(win._selection_lives()) == 4, "仍然按“整局 4 条”回放"
+    # 信息区要说明“这 4 条是整局带进来的”, 折叠状态下也能一眼看出
+    assert "整局 4 条" in win.lbl_play.text(), win.lbl_play.text()
 
     # ② 只选一条线路 → 它自己由 Qt 高亮, 不再算“被动”; 其余三条不该有标记
     win.tree.clearSelection()
@@ -2606,6 +2608,25 @@ def test_implied_selection_marks(tmpdir: str):
                 it.text(rw._COL_NAME)
     assert find("global", g.route_id).flags() & Qt.ItemFlag.ItemIsSelectable, \
         "全局条目行本身是可选的"
+
+    # ④ 「单条轨迹 + 整局」混选 → 措辞改成“其中整局 N 条”(用户单独点的那条不算)
+    rec = win.store.new_route(key, "地图", "T", 0.2, 0.2)
+    rec.points = [TrackPoint(0.2, 0.2, 0.0, 0.0), TrackPoint(0.3, 0.3, 4.0, 30.0)]
+    rec.duration = 4.0
+    rec.zone_count, rec.mode_name = 3, "战区控制"
+    rec.zone_signature = "A@0.30,0.70;B@0.50,0.50;C@0.70,0.30"
+    win.store.add(rec)
+    win._reload_tree()
+    win.tree.expandAll()
+    app.processEvents()
+    win.tree.clearSelection()
+    app.processEvents()
+    find("route", rec.route_id).setSelected(True)
+    find("global", g.route_id).setSelected(True)
+    app.processEvents()
+    assert len(win._selection_tracks()) == 1
+    assert len(win._selection_lives()) == 4
+    assert "其中整局 4 条" in win.lbl_play.text(), win.lbl_play.text()
 
     win.close()
     results.append("侧栏: 被动选中的全局线路行也显示选中高亮 OK")

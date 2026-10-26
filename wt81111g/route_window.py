@@ -1732,8 +1732,8 @@ class RouteTesterWindow(QMainWindow):
         if not playables:
             self._sel_ids = set()
             self._sel_groups = set()
-            self._update_play_label()
             self._refresh_implied_marks()   # 清空选中时把“被动选中”的底色也清掉
+            self._update_play_label()
             self._refresh_map_tracks()   # 选中全局线路时也要把高亮刷出来
             return                       # 清空选中时保留基准(图钉不消失)
         groups = {self._playable_group(r) for r in playables}
@@ -1777,8 +1777,8 @@ class RouteTesterWindow(QMainWindow):
         if grp != self._anchor:
             self._anchor = grp          # 基准跟着当前选中走
             self._refresh_anchor_icon()
-        self._update_play_label()
         self._refresh_implied_marks()   # 父项选中 → 子行也要看得出“会被回放”
+        self._update_play_label()       # 所以先算标记, 再算“其中整局占几条”
         self._refresh_map_tracks()      # 高亮层 = 选中的那几条 → 选中变了要重画
 
     def _on_tree_double_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
@@ -1848,14 +1848,28 @@ class RouteTesterWindow(QMainWindow):
                 self._refresh_anchor_icon_in(ch)
 
     def _update_play_label(self) -> None:
-        """信息区“回放”那一栏: 显示基准分组 + 待回放条数(含选中的全局线路)。"""
+        """信息区“回放”那一栏: 显示基准分组 + 待回放条数(含选中的全局线路)。
+
+        条数后面会补一句「(含整局 N 条)」—— N = 被**全局条目带进来**的线路数。
+        为什么要它(用户 2026-10-26): 全局条目行**折叠着**的时候, 它下面那些被动
+        选中的高亮根本看不见, 「待回放 100 条」就成了唯一线索; 但只给个总数仍然
+        看不出“我明明只点了 4 条”。分开写一下, 一眼就知道是怎么回事。
+        """
         n = len(self._selection_playables())
+        n_implied = sum(1 for it in self._implied_items
+                        if it.data(0, _ROLE_KIND) == "glife")
+        if not n_implied:
+            extra = ""
+        elif n_implied >= n:            # 全是整局带进来的(用户一条都没单独点)
+            extra = f"（整局 {n_implied} 条）"
+        else:
+            extra = f"（其中整局 {n_implied} 条）"
         if self._anchor is not None:
             base = self._group_name(*self._anchor)
-            self.lbl_play.setText(f"基准 {base} | 待回放 {n} 条" if n
+            self.lbl_play.setText(f"基准 {base} | 待回放 {n} 条{extra}" if n
                                   else f"基准 {base} | 未选轨迹")
         else:
-            self.lbl_play.setText(f"待回放: {n} 条" if n else "回放: --")
+            self.lbl_play.setText(f"待回放: {n} 条{extra}" if n else "回放: --")
 
     def _show_all_tracks(self, shown: bool) -> None:
         """一键显示/隐藏轨迹(**只限同一地图同一模式** —— 不同模式的线路不可比)。
