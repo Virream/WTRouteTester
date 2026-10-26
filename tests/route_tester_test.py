@@ -2402,6 +2402,10 @@ def test_map_manager(tmpdir: str):
         fh.write(blob)
     rec = win.store.new_route(key, "地图 1", "T", 0.2, 0.2)
     rec.duration = 3.0
+    # 本地 8111 录制那一局也是 3 战区 → 与下面那条回放**同一个模式**
+    # (用户 2026-10-26: 以前按战区坐标指纹分组, 同一模式会被拆成两个「战区控制」)
+    rec.zone_count, rec.mode_name = 3, "战区控制"
+    rec.zone_signature = "A@0.30,0.70;B@0.50,0.50;C@0.70,0.30"
     win.store.add(rec)
     # 回放侧: 同一张图的另一重身份(有轨迹、没底图、没校准)
     rep = win.store.new_global(map_key="wrpl_avg_finland", map_name="avg_finland",
@@ -2462,6 +2466,15 @@ def test_map_manager(tmpdir: str):
     app.processEvents()
     assert win.tree.topLevelItemCount() == 1, "关联后应只剩一张地图"
     assert win.tree.topLevelItem(0).text(1) == "诺曼底", "侧栏用的是用户起的名字"
+    # 回放(zone_signature 为空) 与 本地录制(真实战区坐标) 都是 3 战区 →
+    # **同一个「战区控制」**, 不再拆成两行(用户 2026-10-26 报的问题)
+    only_map = win.tree.topLevelItem(0)
+    assert only_map.childCount() == 1, [
+        only_map.child(i).text(1) for i in range(only_map.childCount())]
+    assert only_map.child(0).text(1) == "战区控制"
+    kinds = [only_map.child(0).child(i).data(0, rw._ROLE_KIND)
+             for i in range(only_map.child(0).childCount())]
+    assert kinds.count("route") == 1 and kinds.count("global") == 1, kinds
     assert rep.map_key == "wrpl_avg_finland", "记录的 map_key 不该被搬走"
 
     # ---- 选错了要能改: 换成别的关卡代号 → 立刻分开; 换回来 → 又合并 ----
@@ -2597,23 +2610,24 @@ def test_zones_and_modes(tmpdir: str):
     recorder._tick()
     assert recorder.zones == [] and recorder.zones_signature == ""
 
-    # 侧栏四层树: 地图 → 模式 → 版本(战区布局) → 轨迹
+    # 侧栏三层树: 地图 → 模式 → 轨迹(用户 2026-10-26: 不再细分“区域1/区域2”)
     win = make_window(tmpdir, "zonetree.json")
     win.recorder.stop()
     win.hotkeys.stop()
     win.show()
     app = QApplication.instance()
     app.processEvents()
-    # 记录里带战区指纹(但 map_zones 没存过布局) → 从指纹还原出布局, 版本也能自动编号
-    # 造 3 个版本: 攻陷/sig1 两条(用于同版本多选), 争夺/sig2、sig3 各一条
-    plan = [("战区攻陷", "A@0.10,0.10;B@0.20,0.20"),
-            ("战区攻陷", "A@0.10,0.10;B@0.20,0.20"),
-            ("战区争夺", "A@0.50,0.50"),
-            ("战区争夺", "A@0.70,0.70")]
-    for i, (mode, sig) in enumerate(plan):
+    # 记录里带战区指纹(但 map_zones 没存过布局) → 从指纹还原出布局(画战区用)
+    # 造两个模式: 攻陷(2 战区)两条、争夺(1 战区)两条且**战区位置不同** ——
+    # 后者以前会被当成两个“点位”, 现在都归在同一个「战区争夺」下
+    plan = [("战区攻陷", "A@0.10,0.10;B@0.20,0.20", 2),
+            ("战区攻陷", "A@0.10,0.10;B@0.20,0.20", 2),
+            ("战区争夺", "A@0.50,0.50", 1),
+            ("战区争夺", "A@0.70,0.70", 1)]
+    for i, (mode, sig, zc) in enumerate(plan):
         rec = win.store.new_route("m2", "地图 2", "T-90M", 0.3, 0.3)
         rec.duration = 10.0
-        rec.zone_count, rec.zone_signature, rec.mode_name = 2, sig, mode
+        rec.zone_count, rec.zone_signature, rec.mode_name = zc, sig, mode
         # 时间戳**固定**(与 plan 反序 → 攻陷最新 → 侧栏里排前面)。
         # 不能用 new_route 默认的“当前秒”: 造数据跨过整秒边界时, 侧栏按时间倒序排,
         # 模式的先后会翻转 → 下面“前两条同版本”就会偶发失败(2026-10-08 修)
@@ -2627,27 +2641,24 @@ def test_zones_and_modes(tmpdir: str):
     assert top.text(2) == "4 条" and top.childCount() == 2      # 2 个模式
     assert {top.child(i).text(1) for i in range(top.childCount())} == {"战区攻陷", "战区争夺"}
     by_mode = {top.child(i).text(1): top.child(i) for i in range(top.childCount())}
-    # 2 战区模式 → 单版本“区域 1”(里面 2 条); 1 战区模式 → 两个随机点位“点位 1/2”
-    assert [by_mode["战区攻陷"].child(i).text(1)
-            for i in range(by_mode["战区攻陷"].childCount())] == ["区域 1"]
-    assert by_mode["战区攻陷"].child(0).childCount() == 2
-    spots = [by_mode["战区争夺"].child(i).text(1)
-             for i in range(by_mode["战区争夺"].childCount())]
-    assert sorted(spots) == ["点位 1", "点位 2"], spots
-    assert all(by_mode["战区争夺"].child(i).childCount() == 1
-               for i in range(by_mode["战区争夺"].childCount()))
-    assert len(list(win._iter_route_items())) == 4        # 四层下仍能遍历到轨迹
+    # 每个模式下面**直接**就是轨迹行(不再有“区域 1 / 点位 1”那一层)
+    assert by_mode["战区攻陷"].childCount() == 2
+    assert all(by_mode["战区攻陷"].child(i).data(0, rw._ROLE_KIND) == "route"
+               for i in range(2))
+    assert by_mode["战区争夺"].childCount() == 2
+    assert all(by_mode["战区争夺"].child(i).data(0, rw._ROLE_KIND) == "route"
+               for i in range(2))
+    assert len(list(win._iter_route_items())) == 4        # 三层下仍能遍历到轨迹
     rows = list(win._iter_route_items())
     assert win._group_of(win.store.get(rows[0].data(0, rw._ROLE_ID))) == \
         win._group_of(win.store.get(rows[1].data(0, rw._ROLE_ID)))       # 前两条同版本
     assert win._group_of(win.store.get(rows[2].data(0, rw._ROLE_ID))) != \
         win._group_of(win.store.get(rows[0].data(0, rw._ROLE_ID)))
 
-    # 层级行(地图/模式/版本)是分组标题: **不能被选中**(多选时不能把它们也选进去)
+    # 层级行(地图/模式)是分组标题: **不能被选中**(多选时不能把它们也选进去)
     top_node = win.tree.topLevelItem(0)
     mode_node = top_node.child(0)
-    var_node = mode_node.child(0)
-    for node in (top_node, mode_node, var_node):
+    for node in (top_node, mode_node):
         assert not (node.flags() & Qt.ItemFlag.ItemIsSelectable), node.text(1)
         assert node.flags() & Qt.ItemFlag.ItemIsEnabled, "仍要能展开/折叠、能右键"
     assert rows[0].flags() & Qt.ItemFlag.ItemIsSelectable
@@ -2655,7 +2666,6 @@ def test_zones_and_modes(tmpdir: str):
     app.processEvents()
     top_node.setSelected(True)
     mode_node.setSelected(True)
-    var_node.setSelected(True)
     app.processEvents()
     assert win.tree.selectedItems() == [], "层级行不能被选中"
     assert win._sel_ids == set()
@@ -2699,16 +2709,13 @@ def test_zones_and_modes(tmpdir: str):
     assert any(r.route_id == rows[2].data(0, rw._ROLE_ID)
                for r in win.map_view.visible_tracks)
 
-    # 图钉: 只标在“基准版本”那一行, 换基准时跟着走
+    # 图钉: 只标在“基准所在的模式”那一行, 换基准时跟着走
     top_now = win.tree.topLevelItem(0)
-    mode_rows = {top_now.child(i).text(1): top_now.child(i)
-                 for i in range(top_now.childCount())}
-    variant_rows = [mode_rows[m].child(i) for m in mode_rows
-                    for i in range(mode_rows[m].childCount())]
-    pinned = [it for it in variant_rows if not it.icon(0).isNull()]
+    mode_rows = [top_now.child(i) for i in range(top_now.childCount())]
+    pinned = [it for it in mode_rows if not it.icon(0).isNull()]
     assert len(pinned) == 1, [it.text(1) for it in pinned]
-    base_sig = win.store.get(rows[2].data(0, rw._ROLE_ID)).zone_signature
-    assert pinned[0].data(0, rw._ROLE_SIG) == base_sig, pinned[0].text(1)
+    base_mode = win.store.get(rows[2].data(0, rw._ROLE_ID)).mode_label
+    assert pinned[0].text(1) == base_mode, pinned[0].text(1)
 
     # 没选中任何条目时: 第一个点到的路线就把它的版本定为基准
     win.tree.clearSelection()
@@ -2730,18 +2737,6 @@ def test_zones_and_modes(tmpdir: str):
     assert win._visible_ids == set(), "录制开始时应清掉之前预览的轨迹"
     win._update_buttons(False)
     assert win.tree.isEnabled() and win.act_manage.isEnabled()
-
-    # 右键重命名版本 → 树里立刻换成新名字
-    win.store.rename_layout("m2", "A@0.10,0.10;B@0.20,0.20", "大地图")
-    win._reload_tree()
-    app.processEvents()
-    names = [win.tree.topLevelItem(0).child(0).child(i).text(1)
-             for i in range(win.tree.topLevelItem(0).child(0).childCount())]
-    assert names == ["大地图"], names
-    assert win.store.layout_display_name("m2", "A@0.10,0.10;B@0.20,0.20") == "大地图"
-    # 名字落盘(重建 store 仍在)
-    again_store = RouteStore(os.path.join(tmpdir, "zonetree.json"))
-    assert again_store.layout_display_name("m2", "A@0.10,0.10;B@0.20,0.20") == "大地图"
 
     # 地图上的战区: 归属色变化要刷新, blink>0 时跑闪烁定时器
     view = win.map_view

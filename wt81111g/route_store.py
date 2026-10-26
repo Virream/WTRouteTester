@@ -6,11 +6,11 @@
 模式: 8111 也不给模式名, 但 `/map_obj.json` 里的 `capture_zone`(战区)能决定它 ——
 详见 `zones.py`。同一张图会有多种模式, 所以:
 
-* 每条轨迹记录下当时的 **战区数量 + 战区坐标串(模式指纹)+ 模式名**;
+* 每条轨迹记录下当时的 **战区数量 + 战区坐标串(指纹)+ 模式名**;
 * `map_zones` 按地图保存见过的战区布局, 战局结束后依旧能在地图上画出战区;
-* **同一个模式还会有多个“版本”**(实测: 战区控制/攻陷分大地图与小地图、
-  战区争夺的单个战区会从 3 个位置里随机), 版本就是**战区坐标串**本身;
-  `layout_names` 存用户给版本起的名字(如“小地图”), 默认自动叫“区域 2 / 点位 3”。
+* 同一模式还会有多个「版本」(实测: 战区控制/攻陷分大地图与小地图、战区争夺的
+  单战区会从 3 个位置里随机), 但它们**不再分开归类** —— 侧栏只按战区数量分成
+  战区争夺(1)/战区攻陷(2)/战区控制(3)。
 
 数据文件: <data_dir>/routes.json
 **文件名叫 .json, 内容其实是 gzip 压缩的 JSON**(2026-10-22 起):
@@ -25,7 +25,6 @@
   "version": 1,
   "map_names": {"<地图指纹>": "地图名"},
   "hidden_maps": ["<地图指纹>", ...],
-  "layout_names": {"<地图指纹>": {"<战区坐标串>": "版本名"}},
   "known_maps": ["<地图指纹>", ...],
   "map_zones": {"<地图指纹>": [{"sig": .., "count": .., "mode": ..,
                                "zones": [{"label": .., "x": .., "y": ..}],
@@ -59,7 +58,6 @@ from dataclasses import asdict, dataclass, field
 from .config import data_dir
 from .garage import GARAGE_MAP_SHA1
 from .map_calib import MAP_KEY_PREFIX, MapCalib
-from .zones import layout_spread
 from .zones import mode_name as zone_mode_name
 from .zones import signature as zones_signature
 from .zones import spawns_to_json, zones_from_signature, zones_to_json
@@ -158,8 +156,17 @@ class RouteRecord:
 
     @property
     def mode_label(self) -> str:
-        """模式显示名(旧记录没有存过 → 按战区数量现推, 推不出就“未知模式”)。"""
-        return self.mode_name or zone_mode_name(self.zone_count)
+        """模式显示名 —— **优先按战区数量推**。
+
+        用户 2026-10-26: 「只按战区数量简单分类即可」, 所以 `zone_count` 有值时
+        一律按它算(3=控制/2=攻陷/1=争夺), 不看存过的 `mode_name` —— 否则旧记录里
+        那些五花八门的写法(带“大图/小图”之类后缀)会把同一模式拆成两组。
+        只有 zone_count 缺失的旧数据才回退到 `mode_name`。
+        """
+        by_count = zone_mode_name(self.zone_count)
+        if by_count and by_count != "未知模式":
+            return by_count
+        return self.mode_name or by_count
 
 
 # ====================================================================== 全局录制
@@ -253,7 +260,7 @@ class UnitLife:
     map_key: str = ""           # 所属地图(回放时用来判断底图对不对)
     points: list[TrackPoint] = field(default_factory=list)
     # 这条线是在哪一队录到的(`A` / `B`): 回放时阵亡标记的颜色靠它区分
-    # (A 队 = 蓝, B 队 = 红)。旧数据没这个字段 → 读取时按 life_id 里的队号补。
+    # (A 队 = 蓝, B 队 = 红)。
     side: str = ""
     # 这条线的单位是**被击毁**结束的(而不是录制结束时还活着)。
     # 用户口径(2026-10-21): “在 8111 中玩家对应的 icon 消失就是死了” ——
@@ -414,15 +421,9 @@ class GlobalRecord:
     # 所以只能拿“击毁事件之间的**时间差模式**”去和线路结束时刻对齐 ——
     # 摄像机挂着的那个玩家 icon 不会消失(实测), 他的死亡时刻只能靠这个反推。
     kills: list[dict] = field(default_factory=list)
-    # **录制时镜头挂在谁身上**: `{"A": "killflik", "B": "jjh67"}`(昵称)。
-    # 现已废弃 —— 「修正死亡时刻」功能已删除, 仅为兼容旧数据保留存放位。
-    watchers: dict[str, str] = field(default_factory=dict)
-    # 曾经是“死亡时刻待修正”标记(侧栏黄色感叹号)。功能已删, 仅为兼容旧数据保留。
-    fixed: bool = False
     # 本条目**归一化时用的世界矩形** `[min_x, max_x, min_z, max_z]`(米), 只对回放
     # 导入的记录有意义: `points` 里存的是 0~1, 有了这个矩形就能反推出世界米 ——
     # 于是“地图管理里换了/补了校准”以后可以把旧记录**重新对齐**, 不用重新导入。
-    # 旧数据/8111 录制的记录没有这个字段(空) → 不参与重算。
     norm_rect: list = field(default_factory=list)
 
     def zone_state_entry(self, t: float, side: str = "") -> dict | None:
@@ -480,7 +481,11 @@ class GlobalRecord:
 
     @property
     def mode_label(self) -> str:
-        return self.mode_name or zone_mode_name(self.zone_count)
+        """模式显示名 —— 优先按战区数量推(同 `RouteRecord.mode_label`)。"""
+        by_count = zone_mode_name(self.zone_count)
+        if by_count and by_count != "未知模式":
+            return by_count
+        return self.mode_name or by_count
 
     @property
     def is_replay(self) -> bool:
@@ -548,8 +553,6 @@ class GlobalRecord:
             # 写进 routes.json 会让人第二天莫名其妙地录到旧的条目上。
             "zone_states": self.zone_states,
             "kills": self.kills,
-            "watchers": dict(self.watchers),
-            "fixed": 1 if self.fixed else 0,
             "norm_rect": list(self.norm_rect or []),
             "sides": {side: [life.to_json() for life in self.lives(side)]
                       for side in GLOBAL_SIDES},
@@ -567,11 +570,6 @@ class GlobalRecord:
                 zone_signature=str(data.get("zone_signature") or ""),
                 mode_name=str(data.get("mode_name") or ""),
                 duration=float(data.get("duration") or 0.0),
-                # 旧文件里可能还存着 marks —— 一律忽略(标记不跨会话保留)
-                watchers={str(k): str(v) for k, v in
-                          (data.get("watchers") or {}).items()
-                          if str(k) in GLOBAL_SIDES and str(v or "").strip()},
-                fixed=bool(data.get("fixed")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("跳过损坏的全局录制记录: %s", exc)
@@ -611,40 +609,10 @@ class GlobalRecord:
                     continue
                 life = UnitLife.from_json(row)
                 if life is not None:
-                    # 早期版本没存 map_key → 用条目自己的(否则切图后会被当成“别的地图”)
-                    if not life.map_key:
-                        life.map_key = rec.map_key
                     if life.side not in GLOBAL_SIDES:
-                        life.side = side          # 早期版本没存 side → 用所在组的队号
+                        life.side = side          # 用所在组的队号
                     rec.sides[side].append(life)
-        _infer_legacy_deaths(rec, data)
         return rec
-
-
-# 旧数据推断“被击毁”的门槛(秒): 线路结束得比**整局末尾**早这么多, 才认为是中途阵亡。
-# 活到最后的那些线会在录制结束前 1~2 秒内陆续收尾(END_GAP), 用 10 秒足够安全。
-LEGACY_DEAD_MARGIN = 10.0
-
-
-def _infer_legacy_deaths(rec: GlobalRecord, data: dict) -> None:
-    """给**旧版本录的**全局条目补上 `dead` 标记(它们当年没存这个信息)。
-
-    判定: 某条线在整局末尾之前 `LEGACY_DEAD_MARGIN` 秒以上就结束了 → 当作中途阵亡。
-    只在“整份数据里没有任何一条线带 `dead` 字段”时推断 —— 新录的数据总会写
-    `dead: 0/1`, 所以不会把“这一局真的没人死”误判成旧数据。
-    """
-    rows: list[dict] = []
-    for side_rows in (data.get("sides") or {}).values():
-        if isinstance(side_rows, list):
-            rows.extend(r for r in side_rows if isinstance(r, dict))
-    if not rows or any("dead" in r for r in rows):
-        return                      # 新数据(或空) → 不推断
-    lives = [lf for side in GLOBAL_SIDES for lf in rec.lives(side) if lf.points]
-    if not lives:
-        return
-    last_t = max(lf.t1 for lf in lives)
-    for lf in lives:
-        lf.dead = lf.t1 < last_t - LEGACY_DEAD_MARGIN
 
 
 def fmt_time(seconds: float) -> str:
@@ -784,8 +752,6 @@ class RouteStore:
         # 用户在「地图管理」里勾了“隐藏”的地图: 只是**不在左侧列表里显示**,
         # 轨迹数据/名称/缓存图片都不动(空战地图永迹不会用到, 留着只碍事)
         self.hidden_maps: list[str] = []
-        # 用户给“模式版本(战区布局)”起的名字: {地图键: {战区坐标串: 名字}}
-        self.layout_names: dict[str, dict[str, str]] = {}
         # 见过的地图键(含**只缓存了图片、还没录过轨迹**的地图):
         # 侧栏与「地图管理」的默认编号都基于它, 保证两边一致且稳定
         self.known_maps: list[str] = []
@@ -824,13 +790,6 @@ class RouteStore:
             known = data.get("known_maps")
             if isinstance(known, list):
                 self.known_maps = [str(k) for k in known if str(k)]
-            lnames = data.get("layout_names")
-            if isinstance(lnames, dict):
-                for key, names in lnames.items():
-                    if isinstance(names, dict):
-                        self.layout_names[str(key)] = {
-                            str(s): str(v) for s, v in names.items() if str(v).strip()
-                        }
             mz = data.get("map_zones")
             if isinstance(mz, dict):
                 for key, layouts in mz.items():
@@ -874,7 +833,6 @@ class RouteStore:
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("读取线路数据失败: %s", exc)
         self._rebuild_levels()
-        self._migrate_replay_keys()
         self._recover_layouts()
 
     # ------------------------------------------------- 地图身份(哈希 ↔ 关卡代号)
@@ -951,40 +909,6 @@ class RouteStore:
                 out.append(level)
         return sorted(out)
 
-    def _migrate_replay_keys(self) -> bool:
-        """旧回放地图键 `wrpl:<level>` → `wrpl_<level>`(不写盘, 下次正常保存时落回)。
-
-        为什么要改: 底图缓存按 `<地图键>.<ext>` 存文件, 键里的冒号在 Windows 上是
-        **非法字符**, 于是回放导入的地图永远装不上底图。新键用下划线。
-        不迁移的话, 同一张图会在侧栏里出现两条(`wrpl:avg_finland` / `wrpl_avg_finland`)。
-        """
-        old_prefix = "wrpl:"
-        changed = False
-        for rec in self.globals:
-            key = rec.map_key or ""
-            if key.startswith(old_prefix):
-                new = "wrpl_" + key[len(old_prefix):]
-                rec.map_key = new
-                for side in GLOBAL_SIDES:
-                    for life in rec.lives(side):
-                        if (life.map_key or "").startswith(old_prefix):
-                            life.map_key = new
-                changed = True
-        if changed:
-            self.known_maps = ["wrpl_" + k[len(old_prefix):]
-                               if k.startswith(old_prefix) else k
-                               for k in self.known_maps]
-            for attr in ("map_names", "map_calib", "layout_names"):
-                src = getattr(self, attr)
-                for k in [k for k in src if k.startswith(old_prefix)]:
-                    src.setdefault("wrpl_" + k[len(old_prefix):], src[k])
-                    src.pop(k, None)
-            for k in [k for k in self.map_zones if k.startswith(old_prefix)]:
-                self.map_zones.setdefault("wrpl_" + k[len(old_prefix):], self.map_zones[k])
-                self.map_zones.pop(k, None)
-            log.info("已把旧的 `wrpl:` 地图键迁移成 `wrpl_`(共 %d 条回放记录)",
-                     sum(1 for r in self.globals if r.is_replay))
-        return changed
 
     def _recover_layouts(self) -> bool:
         """轨迹里有战区指纹、但 `map_zones` 没存过对应布局 → 从指纹还原出来。
@@ -1028,7 +952,6 @@ class RouteStore:
                 "version": 1,
                 "map_names": self.map_names,
                 "hidden_maps": self.hidden_maps,
-                "layout_names": self.layout_names,
                 # 存**原始** known_maps(不按 canon 去重): 回放键 `wrpl_<关卡>` 即使
                 # 当前被某个哈希认领掉了, 也要留在盘上 —— 用户撤销关联后它得立刻回来。
                 "known_maps": [k for k in self.known_maps if k],
@@ -1184,15 +1107,16 @@ class RouteStore:
             if target is not None:
                 target.marks.clear()
 
-    def globals_by_group(self) -> dict[tuple[str, str], list[GlobalRecord]]:
-        """{(地图键, 战区指纹): [全局录制条目...]} —— 新的在前(按录制时间倒序)。
+    def globals_by_mode(self) -> dict[tuple[str, str], list[GlobalRecord]]:
+        """{(地图键, 模式名): [全局录制条目...]} —— 新的在前(按录制时间倒序)。
 
-        地图键已按图片哈希归并, 所以回放导入和 8111 录制的同图条目会落在同一组。
+        侧栏只按**模式**分组(用户 2026-10-26: 不再细分"区域1/区域2"),
+        所以这里按 `mode_label`(由战区数量推出)归并, 不按战区指纹拆。
         """
         out: dict[tuple[str, str], list[GlobalRecord]] = {}
         for g in self.globals:
             out.setdefault((self.canon(g.map_key or ""),
-                            g.zone_signature or ""), []).append(g)
+                            g.mode_label or ""), []).append(g)
         for rows in out.values():
             rows.sort(key=lambda g: g.created_at, reverse=True)
         return out
@@ -1274,8 +1198,7 @@ class RouteStore:
         moved = [r for r in self.routes if r.map_key == drop]
         moved_g = [g for g in self.globals if g.map_key == drop]
         has_data = bool(moved) or bool(moved_g) or drop in self.known_maps \
-            or bool(self.name_of(drop)) \
-            or bool(self.map_zones.get(drop)) or bool(self.layout_names.get(drop))
+            or bool(self.name_of(drop)) or bool(self.map_zones.get(drop))
         if not has_data:
             return False
         try:
@@ -1320,14 +1243,6 @@ class RouteStore:
                     merged.values(), key=lambda x: str(x.get("seen_at") or ""),
                     reverse=True)[:12]
             self.map_zones.pop(drop, None)
-            # 用户给“区域/点位”起的名字
-            names = self.layout_names.pop(drop, None)
-            if names:
-                tgt = self.layout_names.setdefault(keep, {})
-                for sig, name in names.items():
-                    tgt.setdefault(sig, name)
-            if not self.layout_names.get(keep):
-                self.layout_names.pop(keep, None)
             # 地图校准: keep 没有就用 drop 的(同一张图, 矩形是一样的)
             drop_calib = self.map_calib.pop(drop, None)
             if drop_calib and not self.map_calib.get(keep):
@@ -1460,74 +1375,7 @@ class RouteStore:
         self.save()
         return is_new
 
-    # ------------------------------------------------------------------ 版本(战区布局)
-    def _layout_auto_names(self, map_key: str) -> list[tuple[str, str]]:
-        """[(坐标串, 自动名)] —— 按模式分组编号, 顺序稳定(同一个地图每次算出来一样)。
-
-        * 多战区模式: 按**跨度**降序 → `区域 1` 就是交战区最大的那个(通常是大地图);
-        * 单战区模式: 按坐标排序 → `点位 1/2/3`(那 3 个随机位置)。
-        """
-        by_count: dict[int, list[dict]] = {}
-        for layout in self.map_zones.get(map_key) or []:
-            by_count.setdefault(int(layout.get("count") or 0), []).append(layout)
-        out: list[tuple[str, str]] = []
-        for count in sorted(by_count, reverse=True):      # 3 战区 → 2 → 1, 与侧栏一致
-            group = by_count[count]
-            if count <= 1:
-                def _xy(item: dict) -> tuple[float, float]:
-                    zones = item.get("zones") or [{}]
-                    return (float(zones[0].get("x") or 0.0), float(zones[0].get("y") or 0.0))
-                group.sort(key=lambda item: (*_xy(item), str(item.get("sig"))))
-                prefix = "点位"
-            else:
-                group.sort(key=lambda item: (-layout_spread(item.get("zones")),
-                                             str(item.get("sig"))))
-                prefix = "区域"
-            for i, layout in enumerate(group, start=1):
-                out.append((str(layout.get("sig") or ""), f"{prefix} {i}"))
-        return out
-
-    def layout_display_name(self, map_key: str, signature: str) -> str:
-        """版本显示名: 用户命名优先, 否则自动编号(区域 N / 点位 N)。"""
-        if not signature:
-            return "未知位置"
-        map_key = self.canon(map_key)
-        user = (self.layout_names.get(map_key) or {}).get(signature, "").strip()
-        if user:
-            return user
-        for sig, auto in self._layout_auto_names(map_key):
-            if sig == signature:
-                return auto
-        return "未知位置"
-
-    def name_of_layout(self, map_key: str, signature: str) -> str:
-        """用户给这个版本起的名字(没起过则为空串)。"""
-        map_key = self.canon(map_key)
-        return ((self.layout_names.get(map_key) or {}).get(signature) or "").strip()
-
-    def rename_layout(self, map_key: str, signature: str, name: str) -> None:
-        """给“模式版本(战区布局)”命名; 空名字 = 恢复自动编号。"""
-        if not map_key or not signature:
-            return
-        map_key = self.canon(map_key)
-        with self._lock:
-            names = self.layout_names.setdefault(map_key, {})
-            name = (name or "").strip()
-            if name:
-                names[signature] = name
-            else:
-                names.pop(signature, None)
-                if not names:
-                    self.layout_names.pop(map_key, None)
-        self.save()
-
-    def layout_info(self, map_key: str, signature: str) -> dict | None:
-        """取某个版本的布局(含战区列表/跨度), 供提示文字用。"""
-        for layout in self.map_zones.get(self.canon(map_key)) or []:
-            if str(layout.get("sig") or "") == signature:
-                return layout
-        return None
-
+    # ------------------------------------------------------------------ 战区布局
     def zone_layouts(self, map_key: str) -> list[dict]:
         """某地图已见过的战区布局(新的在前)。"""
         return list(self.map_zones.get(self.canon(map_key)) or [])
@@ -1567,28 +1415,4 @@ class RouteStore:
                     order.append(name)
                 buckets[name].append(rec)
             out[key] = [(name, buckets[name]) for name in order]
-        return out
-
-    def grouped_by_variant(self) -> dict[str, list[tuple[str, list[tuple[str, str, list[RouteRecord]]]]]]:
-        """{地图键: [(模式名, [(战区坐标串, 版本名, [轨迹...]), ...]), ...]}
-
-        侧栏四层树(地图 → 模式 → 版本 → 轨迹)用。版本就是**战区坐标串**:
-        同一个模式下的不同交战区域(大地图/小地图)或不同随机点位会自然分开。
-        """
-        out: dict[str, list[tuple[str, list[tuple[str, str, list[RouteRecord]]]]]] = {}
-        for key, modes in self.grouped_by_mode().items():
-            rows: list[tuple[str, list[tuple[str, str, list[RouteRecord]]]]] = []
-            for mode_label, recs in modes:
-                buckets: dict[str, list[RouteRecord]] = {}
-                order: list[str] = []
-                for rec in recs:        # recs 已按时间倒序 → 最近跑的版本排前面
-                    sig = rec.zone_signature or ""
-                    if sig not in buckets:
-                        buckets[sig] = []
-                        order.append(sig)
-                    buckets[sig].append(rec)
-                rows.append((mode_label,
-                             [(sig, self.layout_display_name(key, sig), buckets[sig])
-                              for sig in order]))
-            out[key] = rows
         return out

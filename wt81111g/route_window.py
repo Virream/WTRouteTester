@@ -112,8 +112,8 @@ def rate_choice_ms(ms, choices=INTERVAL_CHOICES_MS) -> int:
 
 _ROLE_KIND = Qt.ItemDataRole.UserRole
 _ROLE_ID = Qt.ItemDataRole.UserRole + 1
-_ROLE_SIG = Qt.ItemDataRole.UserRole + 2      # 版本(战区布局)的坐标指纹
-# 分组行的稳定标识(地图/模式/版本): 侧栏重建后用它对上“原来折起来的是哪几个分组”
+_ROLE_SIG = Qt.ItemDataRole.UserRole + 2      # 全局线路行的队别(A/B)
+# 分组行的稳定标识(地图/模式): 侧栏重建后用它对上“原来折起来的是哪几个分组”
 _ROLE_KEY = Qt.ItemDataRole.UserRole + 3
 
 # 层级行(地图/模式/版本)只当“分组标题”: 可点击展开、可右键, 但**不可被选中** ——
@@ -955,33 +955,33 @@ class RouteTesterWindow(QMainWindow):
                 for g in self.store.globals for side in GLOBAL_SIDES
                 for life in g.lives(side)}
 
-    def _tree_variants(self):
-        """把「单条路线」与「全局录制条目」合并成统一三层结构(地图 → 模式 → 版本)。
+    def _tree_modes(self):
+        """把「单条路线」与「全局录制条目」合并成 **地图 → 模式** 两层。
 
-        返回 `[(地图键, [(模式名, [(战区指纹, 版本名, [路线...], [全局条目...])])])]`。
-        全局条目按 `(地图键, 战区指纹)` 归到对应版本下; 如果某个版本**只有**全局条目
-        (还没录过单条路线), 也会单独补一组出来, 否则它就没地方可放了。
+        用户 2026-10-26 定的地图结构(不要再去细分区域了):
+            一张地图 = 3 个模式 —— **战区控制(3 点) / 战区攻陷(2 点) / 战区争夺(1 点)**;
+            控制与攻陷再分大图/小图, 争夺是从 3 个战区里随机抽一个 ——
+            它们都是**同一张图的同一个模式**, 只是作战范围不同, 不该拆成两行。
+
+        返回 `[(地图键, [(模式名, [路线...], [全局条目...])])]`。
+        全局条目按 `(地图键, 模式名)` 归到对应模式; 某个模式**只有**全局条目
+        (还没录过单条路线)也会补一组, 否则它就没地方放。
         """
-        routes = self.store.grouped_by_variant()
-        glob = self.store.globals_by_group()
-        out: list[tuple[str, list[tuple[str, list[tuple[str, str, list, list]]]]]] = []
+        routes = self.store.grouped_by_mode()
+        glob = self.store.globals_by_mode()
+        out: list[tuple[str, list[tuple[str, list, list]]]] = []
         for key in self.store.ordered_map_keys():
             if self.store.is_map_hidden(key):
                 continue                     # 用户在「地图管理」里勾了隐藏
-            modes: list[tuple[str, list[tuple[str, str, list, list]]]] = []
+            modes: list[tuple[str, list, list]] = []
             used: set[str] = set()
-            for mode_label, variants in routes.get(key, []):
-                rows: list[tuple[str, str, list, list]] = []
-                for sig, vname, recs in variants:
-                    rows.append((sig, vname, list(recs), glob.get((key, sig), [])))
-                    used.add(sig)
-                modes.append((mode_label, rows))
-            for (mk, sig), items in glob.items():
-                if mk != key or sig in used:
+            for mode_label, recs in routes.get(key, []):
+                modes.append((mode_label, list(recs), glob.get((key, mode_label), [])))
+                used.add(mode_label)
+            for (mk, mode_label), items in glob.items():
+                if mk != key or mode_label in used:
                     continue
-                vname = self.store.layout_display_name(key, sig)
-                mode_label = items[0].mode_label if items else ""
-                modes.append((mode_label, [(sig, vname, [], list(items))]))
+                modes.append((mode_label, [], list(items)))
             if modes:
                 out.append((key, modes))
         return out
@@ -1118,11 +1118,12 @@ class RouteTesterWindow(QMainWindow):
         self.tree.clear()
         alive: set[str] = set()          # 仍存在于侧栏的轨迹 id(用于修剪显示集合)
         alive_lives: set[str] = set()    # 仍存在于侧栏的全局线路 id
-        # 四层: 地图 → 模式(由战区数量推出) → 版本(战区布局) → 轨迹/全局条目
-        variants_all = self._tree_variants()
-        for map_key, modes in variants_all:
-            n_route = sum(len(rows) for _m, vs in modes for _s, _n, rows, _g in vs)
-            n_glob = sum(len(g) for _m, vs in modes for _s, _n, _r, g in vs)
+        # 三层: 地图 → 模式(由战区数量推出) → 轨迹 / 全局条目
+        # (用户 2026-10-26: 同一模式的大图/小图/不同战区都不再拆成"区域1/2")
+        modes_all = self._tree_modes()
+        for map_key, modes in modes_all:
+            n_route = sum(len(r) for _m, r, _g in modes)
+            n_glob = sum(len(g) for _m, _r, g in modes)
             top = QTreeWidgetItem(["", self.store.display_name(map_key),
                                    self._count_text(n_route, n_glob)])
             top.setData(0, _ROLE_KIND, "map")
@@ -1133,65 +1134,38 @@ class RouteTesterWindow(QMainWindow):
             f.setBold(True)
             top.setFont(_COL_NAME, f)
             self.tree.addTopLevelItem(top)
-            for mode_label, vs in modes:
-                n_mode = sum(len(rows) for _s, _n, rows, _g in vs)
-                g_mode = sum(len(g) for _s, _n, _r, g in vs)
+            for mode_label, routes, globs in modes:
                 mid = QTreeWidgetItem(["", mode_label,
-                                       self._count_text(n_mode, g_mode)])
+                                       self._count_text(len(routes), len(globs))])
                 mid.setData(0, _ROLE_KIND, "mode")
                 mid.setData(0, _ROLE_ID, map_key)
                 mid.setData(0, _ROLE_KEY, f"mode|{map_key}|{mode_label}")
                 mid.setFlags(GROUP_ITEM_FLAGS)
-                mid.setToolTip(_COL_NAME,
-                               f"{self.store.display_name(map_key)} · {mode_label}\n"
-                               f"模式由 8111 的战区(capture_zone)数量推出: "
-                               f"3 个=战区控制, 2 个=战区攻陷, 1 个=战区争夺")
+                mid.setToolTip(_COL_NAME, self._mode_tip(map_key, mode_label))
                 top.addChild(mid)
-                for sig, vname, routes, globs in vs:
-                    # 回放导入的条目**没有战区坐标**(回放里 `cz_circle` 是占位变换),
-                    # 所以“战区位置细分”这一层对它没有意义 —— 直接挂在模式层下。
-                    # 否则会多一层无信息的“未知位置”(用户 2026-10-26 反馈层级不对)。
-                    if (not sig and not routes and globs
-                            and all(getattr(g, "is_replay", False) for g in globs)):
-                        for g in globs:
-                            self._add_global_item(mid, g)
-                            alive_lives.update(
-                                life.life_id for side in GLOBAL_SIDES
-                                for life in g.lives(side))
-                        continue
-                    var = QTreeWidgetItem(["", vname,
-                                           self._count_text(len(routes), len(globs))])
-                    var.setData(0, _ROLE_KIND, "variant")
-                    var.setData(0, _ROLE_ID, map_key)
-                    var.setData(0, _ROLE_SIG, sig)
-                    var.setData(0, _ROLE_KEY, f"variant|{map_key}|{sig}")
-                    var.setFlags(GROUP_ITEM_FLAGS)
-                    var.setToolTip(_COL_NAME, self._variant_tip(map_key, sig, vname))
-                    mid.addChild(var)
-                    for rec in routes:
-                        child = QTreeWidgetItem(
-                            ["", rec.label, fmt_time(rec.duration)])
-                        child.setData(0, _ROLE_KIND, "route")
-                        child.setData(0, _ROLE_ID, rec.route_id)
-                        child.setIcon(_COL_EYE, eye_icon(rec.route_id in self._visible_ids))
-                        child.setToolTip(_COL_EYE, "点击显示 / 隐藏该轨迹")
-                        child.setToolTip(_COL_NAME,
-                                         f"{rec.map_name} · {rec.mode_label} · {vname} | "
-                                         f"{rec.vehicle} | 用时 {fmt_time(rec.duration)}")
-                        var.addChild(child)
-                        alive.add(rec.route_id)
-                    # 全局录制条目排在单条路线之后(用户要求: 加在这一级的末尾)
-                    for g in globs:
-                        self._add_global_item(var, g)
-                        alive_lives.update(
-                            life.life_id for side in GLOBAL_SIDES
-                            for life in g.lives(side))
+                for rec in routes:
+                    child = QTreeWidgetItem(
+                        ["", rec.label, fmt_time(rec.duration)])
+                    child.setData(0, _ROLE_KIND, "route")
+                    child.setData(0, _ROLE_ID, rec.route_id)
+                    child.setIcon(_COL_EYE, eye_icon(rec.route_id in self._visible_ids))
+                    child.setToolTip(_COL_EYE, "点击显示 / 隐藏该轨迹")
+                    child.setToolTip(_COL_NAME,
+                                     f"{rec.map_name} · {rec.mode_label} | "
+                                     f"{rec.vehicle} | 用时 {fmt_time(rec.duration)}")
+                    mid.addChild(child)
+                    alive.add(rec.route_id)
+                # 全局录制条目排在单条路线之后(用户要求: 加在这一级的末尾)
+                for g in globs:
+                    self._add_global_item(mid, g)
+                    alive_lives.update(
+                        life.life_id for side in GLOBAL_SIDES
+                        for life in g.lives(side))
         # 展开/折叠统一放在重建末尾恢复(见 _restore_folded)
         # 已缓存图片、但还没录过轨迹的地图也列出来(灰色, 用时列写“仅缓存”):
         # 否则在「地图管理」里给它们改完名字, 主界面根本看不到任何变化。
-        # 顺便把它们**已见过的模式版本**也挂上(0 条) —— 还没录到轨迹时就能右键
-        # 把“区域 1/2”改成自己认得的名字(大地图/小地图…)。
-        listed = {key for key, _modes in variants_all}
+        # 顺便把它们**已经见过的模式**挂上(0 条) —— 还没录到轨迹时就看得见有哪些模式。
+        listed = {key for key, _modes in modes_all}
         for map_key in self.store.ordered_map_keys():
             if map_key in listed or not self.map_cache.has(map_key):
                 continue
@@ -1206,28 +1180,24 @@ class RouteTesterWindow(QMainWindow):
             f.setBold(True)
             top.setFont(_COL_NAME, f)
             top.setForeground(_COL_NAME, QBrush(Qt.GlobalColor.gray))
-            layouts = self.store.zone_layouts(map_key)
-            modes = "、".join(
-                f"{x.get('mode') or '?'}({self.store.layout_display_name(map_key, x.get('sig') or '')})"
-                for x in layouts) or "(还没见过战区)"
+            seen_modes: list[str] = []
+            for layout in self.store.zone_layouts(map_key):
+                mode = str(layout.get("mode") or "")
+                if mode and mode not in seen_modes:
+                    seen_modes.append(mode)
             top.setToolTip(_COL_NAME,
                            "这张地图只缓存了图片, 还没录过轨迹\n"
-                           f"见过的模式/版本: {modes}\n"
+                           f"见过的模式: {'、'.join(seen_modes) or '(还没见过战区)'}\n"
                            "右键可重命名地图, 或菜单「地图 → 地图管理…」")
             self.tree.addTopLevelItem(top)
-            for layout in layouts:
-                sig = str(layout.get("sig") or "")
-                if not sig:
-                    continue
-                vname = self.store.layout_display_name(map_key, sig)
-                var = QTreeWidgetItem(["", f"{layout.get('mode') or '?'} · {vname}", "0 条"])
-                var.setData(0, _ROLE_KIND, "variant")
+            for mode in seen_modes:
+                var = QTreeWidgetItem(["", mode, "0 条"])
+                var.setData(0, _ROLE_KIND, "mode")
                 var.setData(0, _ROLE_ID, map_key)
-                var.setData(0, _ROLE_SIG, sig)
-                var.setData(0, _ROLE_KEY, f"variant|{map_key}|{sig}")
+                var.setData(0, _ROLE_KEY, f"mode|{map_key}|{mode}")
                 var.setFlags(GROUP_ITEM_FLAGS)
                 var.setForeground(_COL_NAME, QBrush(Qt.GlobalColor.gray))
-                var.setToolTip(_COL_NAME, self._variant_tip(map_key, sig, vname))
+                var.setToolTip(_COL_NAME, self._mode_tip(map_key, mode))
                 top.addChild(var)
         self._restore_folded(folded, collapse_all=first_build)
         self._tree_built = True
@@ -1792,32 +1762,31 @@ class RouteTesterWindow(QMainWindow):
             f"基准已锁定: {self._group_name(*self._anchor)} · {rec.label}; "
             f"已切到该地图并显示这条轨迹", sticky=4.0)
 
-    # --------------------------------------------------- 分组(地图 + 版本)
-    @staticmethod
-    def _group_of(rec: RouteRecord) -> tuple[str, str]:
-        """一条轨迹属于哪个分组: (地图键, 战区坐标指纹) —— 版本 = 战区位置。"""
-        return (getattr(rec, "map_key", "") or "",
-                getattr(rec, "zone_signature", "") or "")
+    # --------------------------------------------------- 分组(地图 + 模式)
+    def _group_of(self, rec: RouteRecord) -> tuple[str, str]:
+        """一条轨迹属于哪个分组: (地图键, 模式名) —— 模式由战区数量推出。
 
-    def _group_name(self, map_key: str, signature: str) -> str:
-        """分组的可读名字(地图 · 模式 · 版本)。"""
-        layout = self.store.layout_info(map_key, signature) or {}
-        mode = str(layout.get("mode") or "") or (
-            "未知模式" if not signature else "")
-        version = self.store.layout_display_name(map_key, signature)
-        parts = [self.store.display_name(map_key), mode, version]
+        不再带战区指纹: 同一模式的“大地图/小地图/不同战区”都算同一组
+        (用户 2026-10-26: 只按战区数量简单分类即可)。
+        """
+        return (self.store.canon(getattr(rec, "map_key", "") or ""),
+                getattr(rec, "mode_label", "") or "")
+
+    def _group_name(self, map_key: str, mode_label: str) -> str:
+        """分组的可读名字(地图 · 模式)。"""
+        parts = [self.store.display_name(map_key), mode_label]
         return " · ".join(p for p in parts if p)
 
     def _refresh_anchor_icon(self) -> None:
-        """把图钉图标标到“当前基准版本”那一行(其它版本行清掉图标)。"""
+        """把图钉图标标到“当前基准模式”那一行(其它模式行清掉图标)。"""
         for i in range(self.tree.topLevelItemCount()):
             self._refresh_anchor_icon_in(self.tree.topLevelItem(i))
 
     def _refresh_anchor_icon_in(self, item: QTreeWidgetItem) -> None:
         for i in range(item.childCount()):
             ch = item.child(i)
-            if ch.data(0, _ROLE_KIND) == "variant":
-                grp = (ch.data(0, _ROLE_ID), ch.data(0, _ROLE_SIG) or "")
+            if ch.data(0, _ROLE_KIND) == "mode":
+                grp = (ch.data(0, _ROLE_ID), ch.text(_COL_NAME))
                 ch.setIcon(_COL_EYE, pin_icon() if grp == self._anchor else QIcon())
             else:
                 self._refresh_anchor_icon_in(ch)
@@ -1881,18 +1850,12 @@ class RouteTesterWindow(QMainWindow):
             act_del.triggered.connect(lambda: self._delete_route(item))
             menu.addAction(act_del)
         else:
-            if kind == "variant":     # 版本(交战区域/随机点位)
-                act_var = QAction("重命名此版本…", self)
-                act_var.triggered.connect(
-                    lambda: self._rename_variant(item.data(0, _ROLE_ID),
-                                                 item.data(0, _ROLE_SIG)))
-                menu.addAction(act_var)
-                menu.addSeparator()
-                act_show_var = QAction("显示本版本全部轨迹", self)
+            if kind == "mode":     # 模式(战区控制 / 战区攻陷 / 战区争夺)
+                act_show_var = QAction("显示本模式全部轨迹", self)
                 act_show_var.triggered.connect(
                     lambda: self._show_tracks_of(item, True))
                 menu.addAction(act_show_var)
-                act_hide_var = QAction("隐藏本版本全部轨迹", self)
+                act_hide_var = QAction("隐藏本模式全部轨迹", self)
                 act_hide_var.triggered.connect(
                     lambda: self._show_tracks_of(item, False))
                 menu.addAction(act_hide_var)
@@ -1998,35 +1961,43 @@ class RouteTesterWindow(QMainWindow):
         self._reload_tree()
         self._set_status("已删除全局录制条目", sticky=3.0)
 
-    def _variant_tip(self, map_key: str, signature: str, name: str) -> str:
-        """版本行的提示: 战区字母/坐标 + 跨度(辨认“大地图/小地图”)."""
-        layout = self.store.layout_info(map_key, signature)
-        if not layout:
-            return (f"{name}\n旧记录(当时还没存战区信息), 无法归属到具体交战区域\n"
-                    "右键可重命名")
-        zones = layout.get("zones") or []
-        where = "、".join(f"{z.get('label')}({float(z.get('x') or 0):.3f},"
-                          f"{float(z.get('y') or 0):.3f})" for z in zones)
-        spread = layout_spread(zones)
+    def _mode_tip(self, map_key: str, mode_label: str) -> str:
+        """模式行的提示: 这个模式见过的作战范围(大图/小图)与战区位置。
+
+        用户 2026-10-26 定的结构: 一张地图就 3 个模式, 大图/小图、从哪个战区抽的
+        都只是**同一个模式的不同作战范围**, 所以它们列在提示里而不占树上一行。
+        """
+        layouts = [x for x in self.store.zone_layouts(map_key)
+                   if str(x.get("mode") or "") == mode_label]
         lines = [
-            f"{name} —— {layout.get('mode')} 的一个版本",
-            f"战区 {len(zones)} 个: {where}",
-            (f"跨度 {spread:.3f}(战区间最大距离, 越大越像“大地图”)" if len(zones) > 1
-             else "单战区模式: 每局的战区会在这几个位置里随机"),
-            f"指纹 {signature}" if signature else "没有战区信息",
-            "右键可重命名(例如改成“大地图/小地图”)",
+            f"{self.store.display_name(map_key)} · {mode_label}",
+            "模式由 8111 的战区(capture_zone)数量推出: "
+            "3 个=战区控制, 2 个=战区攻陷, 1 个=战区争夺",
         ]
+        if not layouts:
+            lines.append("旧记录(当时还没存战区信息), 无法画战区位置")
+            return "\n".join(lines)
+        lines.append(f"见过的作战范围: {len(layouts)} 种(大图/小图、不同战区都归在本模式下)")
+        for x in layouts[:4]:
+            zones = x.get("zones") or []
+            where = "、".join(
+                f"{z.get('label')}({float(z.get('x') or 0):.0f},"
+                f"{float(z.get('z') or z.get('y') or 0):.0f})" for z in zones)
+            spread = layout_spread(zones) if zones else 0.0
+            lines.append(f"  · {len(zones)} 战区 {where} 跨度 {spread:.3f}")
+        if len(layouts) > 4:
+            lines.append(f"  · …还有 {len(layouts) - 4} 种")
         return "\n".join(lines)
 
     def _show_tracks_of(self, item: QTreeWidgetItem, shown: bool) -> None:
-        """把某一层(地图/模式/版本)下面的轨迹全部显示或隐藏。
+        """把某一层(地图/模式)下面的轨迹全部显示或隐藏。
 
-        显示时同样只保留**同一版本**: 从“版本”行点就是该版本全部轨迹;
-        从地图/模式行点则只取其中第一个版本(树木顺序=最新在前)。
+        侧栏只剩三层了, 所以从模式行点就是该模式全部轨迹; 从地图行点则只取
+        其中第一个模式(树的顺序 = 最新在前)。
         """
         rows = [it.data(0, _ROLE_ID) for it in self._iter_route_items_of(item)]
         if shown:
-            # 这一分支里只保留一个版本(与 _show_all_tracks 同一规则)
+            # 这一分支里只保留一个分组(与 _show_all_tracks 同一规则)
             groups: list[tuple[str, str]] = []
             keep: tuple[str, str] | None = None
             for rid in rows:
@@ -2041,7 +2012,7 @@ class RouteTesterWindow(QMainWindow):
                    if (rec := self.store.get(rid)) is not None
                    and keep is not None and self._group_of(rec) == keep]
             self._visible_ids = set(ids)
-            extra = "(该分支含多个版本, 只显示了最新那个)" if len(groups) > 1 else ""
+            extra = "(该分支含多个模式, 只显示了最新那个)" if len(groups) > 1 else ""
         else:
             ids = rows
             for rid in ids:
@@ -2154,28 +2125,6 @@ class RouteTesterWindow(QMainWindow):
             return
         self.store.rename_map(map_key, name)
         self._reload_tree()
-
-    def _rename_variant(self, map_key: str, signature: str) -> None:
-        """给模式版本(交战区域/随机点位)命名, 例如“大地图/小地图”。
-
-        默认名是自动编号(区域 2 / 点位 3), 留空即恢复自动编号。
-        """
-        current = self.store.layout_display_name(map_key, signature)
-        layout = self.store.layout_info(map_key, signature) or {}
-        zones = layout.get("zones") or []
-        info = "、".join(f"{z.get('label')}({float(z.get('x') or 0):.3f},"
-                         f"{float(z.get('y') or 0):.3f})" for z in zones)
-        name, ok = QInputDialog.getText(
-            self, "重命名战区版本",
-            f"{self.store.display_name(map_key)} · {layout.get('mode') or '未知模式'}\n"
-            f"战区: {info or '(无)'}\n\n版本名称(留空 = 恢复自动编号「{current}」):",
-            text=current)
-        if not ok:
-            return
-        self.store.rename_layout(map_key, signature, name)
-        self._reload_tree()
-        shown = self.store.layout_display_name(map_key, signature)
-        self._set_status(f"已把该版本命名为「{shown}」", sticky=3.0)
 
     # ------------------------------------------------------------- 全局录制
     def _import_replay_local(self) -> None:

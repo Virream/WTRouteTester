@@ -821,10 +821,10 @@ def test_store(tmpdir: str):
     again.clear_marks(g.route_id)
     assert again.get_global(g.route_id).marks == []
 
-    # 分组: 按 (地图, 战区指纹) 归组
-    grp = again.globals_by_group()
-    assert ("MAP1", "sig") in grp, list(grp)
-    assert ("MAP1", "") in grp, list(grp)
+    # 分组: 按 (地图, 模式) 归组
+    grp = again.globals_by_mode()
+    assert ("MAP1", "战区控制") in grp, list(grp)
+    assert ("MAP1", "未知模式") in grp, list(grp)
 
     # 删除
     assert again.remove_global(g2.route_id)
@@ -892,10 +892,10 @@ def test_window(tmpdir: str):
     # 1) 全局条目挂在“存放路线的那一级”的**末尾**, 与单条路线同级
     items = _global_items(win)
     assert len(items) == 1, items
-    variant = items[0].parent()
-    assert variant.data(0, rw._ROLE_KIND) == "variant"
-    kinds = [variant.child(i).data(0, rw._ROLE_KIND)
-             for i in range(variant.childCount())]
+    mode_node = items[0].parent()
+    assert mode_node.data(0, rw._ROLE_KIND) == "mode", mode_node.text(rw._COL_NAME)
+    kinds = [mode_node.child(i).data(0, rw._ROLE_KIND)
+             for i in range(mode_node.childCount())]
     assert kinds[-1] == "global", f"全局条目应在末尾: {kinds}"
     assert "route" in kinds, kinds
     assert items[0].text(rw._COL_NAME).startswith("全局"), items[0].text(rw._COL_NAME)
@@ -1144,9 +1144,7 @@ def test_only_global(tmpdir: str):
     mid = top.child(0)
     assert mid.data(0, rw._ROLE_KIND) == "mode"
     assert mid.text(rw._COL_NAME) == "战区攻陷", mid.text(rw._COL_NAME)
-    var = mid.child(0)
-    assert var.data(0, rw._ROLE_KIND) == "variant"
-    items = _children_kind(var, "global")
+    items = _children_kind(mid, "global")
     assert len(items) == 1, "只有全局录制的地图也要挂出条目"
     # 信息列: “0 条 · 1 局”
     assert "1 局" in top.text(rw._COL_TIME), top.text(rw._COL_TIME)

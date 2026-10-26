@@ -110,8 +110,8 @@ def main() -> int:
     check("校准就是哈希那份",
           bar is not None and abs(bar.max_x - 2048.0) < 1e-6)
 
-    groups = store.globals_by_group()
-    check("回放记录归到哈希这张图下", (HASH_KEY, "") in groups,
+    groups = store.globals_by_mode()
+    check("回放记录归到哈希这张图下", any(k[0] == HASH_KEY for k in groups),
           f"keys={list(groups)}")
     check("回放记录原 map_key 没被改动", replay.map_key == REPLAY_KEY,
           f"={replay.map_key!r}")
