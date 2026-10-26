@@ -91,6 +91,15 @@ SPAWN_HALF = 3.4          # 方块半边长(px): 一个位置一个小方块, �
 SPAWN_PEN = 1.0
 SPAWN_DARK_PEN = 2.0
 
+# 机场跑道 / 直升机坪(**示意**, 不是量具): 长条形 + 中心虚线 + 两端横杠。
+# 数据来自回放里「机场防空」阵地的分布(见 `replay_import._airfields_from_ecs`),
+# 长度/朝向都是估的。颜色跟着该队的线路走 —— 回放导入时 A/B 就是真实阵营,
+# 不像“两次实况录制”那样会翻转, 所以这里的默认配色就是蓝/红。
+AIRFIELD_SIDE_COLORS = {"A": QColor("#174DFF"), "B": QColor("#FF4D4D")}
+AIRFIELD_FILL_ALPHA = 55         # 填充很淡: 下面是地图, 不能盖住
+AIRFIELD_EDGE_ALPHA = 200
+AIRFIELD_DASH = 40.0             # 中心虚线一段的长度(px)
+
 
 def _blend(color: QColor, rgb: tuple[int, int, int], k: float) -> QColor:
     """从 color 按 k 比例拉向 rgb(k=0 不变, k=1 完全变成 rgb)。"""
@@ -365,6 +374,13 @@ class RouteMapView(QWidget):
         self._spawn_key: tuple | None = None
         self._spawn_cache: dict[str, QPainterPath] = {}
         self._show_spawns = True
+        # 机场跑道(已换算成归一化坐标): [{"side", "kind", "c": (nx,ny),
+        #                                  "u": 半个跑道长的向量, "v": 半个宽度的向量}]
+        # 由 `set_airfields()` 从世界米换算而来 —— 存向量而不是像素长度,
+        # 因为 x/y 两个方向的世界尺度不同, 斜跑道用单一长度会画歪。
+        self._airfields: list[dict] = []
+        self._airfield_ver = 0
+        self._show_airfields = True
         # 离屏缓存层: 轨迹/重生方块(半透明)。每帧重画几千个线段太贵(见 _seg_cache 说明),
         # 而这部分内容在“只动玩家点”“战区闪烁”“拖动地图”时并没有变 —— 缓存后每帧只剩两次贴图。
         # (底图不缓存: 缩放贴图本身只要 ~0.5ms, 还省掉了一张窗口大小的位图)
@@ -579,6 +595,61 @@ class RouteMapView(QWidget):
     @property
     def show_spawns(self) -> bool:
         return self._show_spawns
+
+    def set_airfields(self, rows: list[dict] | None,
+                      norm_rect: list | tuple | None = None) -> None:
+        """设置机场跑道(`rows` 是**世界米**, 由回放里的机场防空阵地估出来的)。
+
+        `norm_rect` = `[min_x, max_x, min_z, max_z]`, 取自那条回放记录的
+        `GlobalRecord.norm_rect` —— 线路的 `points` 就是用它归一化的, 机场用同一个
+        矩形才能和线路对得上。没有它(8111 实时录制的条目)就直接清空: 那种数据里
+        压根没有机场信息。
+        """
+        rect = [float(v) for v in (norm_rect or [])]
+        out: list[dict] = []
+        if len(rect) == 4 and rect[1] > rect[0] and rect[3] > rect[2]:
+            minx, maxx, minz, maxz = rect
+            spanx, spanz = maxx - minx, maxz - minz
+            for row in rows or []:
+                try:
+                    x, z = float(row["x"]), float(row["z"])
+                    dx = float(row.get("dx") or 1.0)
+                    dz = float(row.get("dz") or 0.0)
+                    hw = float(row.get("length") or 0.0) / 2.0
+                    hh = float(row.get("width") or 0.0) / 2.0
+                except (KeyError, TypeError, ValueError):
+                    continue
+                # 与线路完全同一套归一化: ny 用 (maxz - z) —— 北在图上方。
+                # `u`(沿跑道) / `v`(垂直跑道) 是**归一化向量**, x 与 y 分别除以
+                # 各自的跨度: 只用一个长度会让斜跑道变形(图幅通常不是正方形)。
+                out.append({
+                    "side": str(row.get("side") or "A"),
+                    "kind": str(row.get("kind") or "runway"),
+                    "c": ((x - minx) / spanx, (maxz - z) / spanz),
+                    "u": (dx * hw / spanx, -dz * hw / spanz),
+                    "v": (-dz * hh / spanx, dx * hh / spanz),
+                })
+        if out == self._airfields:
+            return
+        self._airfields = out
+        self._airfield_ver += 1
+        self.update()
+
+    def set_show_airfields(self, show: bool) -> None:
+        """是否把机场跑道画在地图上(菜单开关, 持久化在窗口侧)。"""
+        show = bool(show)
+        if show == self._show_airfields:
+            return
+        self._show_airfields = show
+        self.update()
+
+    @property
+    def show_airfields(self) -> bool:
+        return self._show_airfields
+
+    @property
+    def airfields(self) -> list[dict]:
+        return list(self._airfields)
 
     @property
     def spawns(self) -> list[dict]:
@@ -890,8 +961,10 @@ class RouteMapView(QWidget):
             # 其余内容都画在“地图本地坐标”里(见 _to_px) → 平移只动画笔, 不改几何缓存
             self._paint_dpr = p.device().devicePixelRatio() or 1.0
             p.translate(r.left(), r.top())
-            # 战区会闪烁 → 不进缓存层, 每帧现画(几个菱形, 便宜); 位置在轨迹之下
-            self._draw_zones(p)
+            # 层次(底 → 顶): 底图 → 轨迹/回放 → 标记与光标 → **机场跑道 → 重生方块
+            # → 战区** → 玩家位置 → 悬浮信息。
+            # 战区和重生方块都是“地图标记”, 必须压在线路之上 —— 以前它们画在轨迹
+            # **之下**, 线路密的地方菱形直接被盖住看不见(用户 2026-10-26)。
             if self._playback_recs:
                 # 回放: 未播放底衬 + 已播放着色段都在**累加层**里, 每帧只补新段;
                 # 标记与光标每帧现画(几个圈, 便宜)
@@ -924,6 +997,14 @@ class RouteMapView(QWidget):
                     layer_live, live_scale = got
                     self._blit_layer(p, layer_live, self._live_anchor, live_scale,
                                      self._live_margin)
+            # 地图标记压在线路之上: 战区几个菱形 + 重生方块(已按归属色合成路径并缓存),
+            # 每帧现画不到 0.1ms; 战区还要闪烁, 本来也进不了缓存层。
+            # 先方块后菱形: 菱形带字母、信息量大, 重叠时让它在上。
+            self._draw_airfields(p)
+            if self._show_spawns:
+                self._draw_spawns(p)
+            self._draw_zones(p)
+
             self._draw_player(p)
 
             if self._hover_text:
@@ -990,10 +1071,10 @@ class RouteMapView(QWidget):
         p.drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5))
 
     def _draw_tracks(self, p: QPainter) -> None:
-        """轨迹层内容: 重生位置 + 轨迹(含时间标签)。战区和玩家位置不在这里画。"""
-        # 战区/重生位置画在轨迹下面(它们是背景信息, 不该盖住线路)
-        if self._show_spawns:
-            self._draw_spawns(p)
+        """轨迹层内容: 轨迹(含时间标签)。
+
+        重生位置与战区**不在这里**画 —— 它们要压在轨迹之上, 见 `_paint()`。
+        """
         # 显示中的轨迹: 灰色普通层 + 高亮层(选中的/正在录的)
         hi = list(self._highlight)
         if self._live is not None and all(r is not self._live for r in hi):
@@ -1337,8 +1418,7 @@ class RouteMapView(QWidget):
         return (sig(self._visible), sig(self._highlight),
                 (live.route_id, len(live.points), len(live.marks)) if live else None,
                 sig(self._playback_recs),
-                round(self._playhead, 3) if self._playback_recs else None,
-                self._show_spawns, self._spawns_ver)
+                round(self._playhead, 3) if self._playback_recs else None)
 
     def _build_track_layer(self) -> None:
         """(重)建轨迹层, 并记下建层时的几何/尺寸(之后缩放要按比例贴)。"""
@@ -1473,12 +1553,13 @@ class RouteMapView(QWidget):
         阵亡那一刻触发一次重建(与回拖重建同量级)。
         """
         return (tuple(r0.route_id for r0 in self._playback_recs),
-                self._show_spawns, self._spawns_ver,
                 tuple(r.route_id for r in self._playback_recs
                       if self._dead_now(r, self._playhead)))
 
     def _draw_play_static(self, p: QPainter) -> None:
-        """回放累加层的初始内容: 重生位置 + 已播放前缀(+ 阵亡后要变暗的整条灰)。
+        """回放累加层的初始内容: 已播放前缀(+ 阵亡后要变暗的整条灰)。
+
+        重生位置不在这里 —— 它要压在轨迹之上, 见 `_paint()`。
 
         2026-10-22 改动(用户要求): 回放**不再画未播放的全长底衬** —— 以前一按播放
         就看得到所有线路的整条灰影。现在:
@@ -1490,8 +1571,6 @@ class RouteMapView(QWidget):
         ⚠ 第三条例以前写成了“什么都不画(等于直接清除)” —— 那不是“不变暗”,
         而是整条线凭空消失(2026-10-23 用户实测: 一条短轨迹播到阵亡时刻就像没了)。
         """
-        if self._show_spawns:
-            self._draw_spawns(p)
         for rec in self._playback_recs:
             dead = self._dead_now(rec, self._playhead)
             if dead and self._dead_dim:
@@ -1969,6 +2048,74 @@ class RouteMapView(QWidget):
         # 注意: QRect 只接受 int, 坐标必须用 QRectF(否则运行期 TypeError)
         p.drawText(QRectF(x, y, tw, th),
                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
+
+    def _draw_airfields(self, p: QPainter) -> None:
+        """画机场(示意): 跑道 = 长条形 + 中心虚线 + 两端横杠; 直升机坪 = 小方块 + H。
+
+        **这不是量具**: 坐标和朝向取自回放里「机场防空」阵地的分布, 长度是按主轴跨度
+        估的(见 `replay_import._airfields_from_ecs`)。用来看“机场在那一侧、跑道朝哪个
+        方向、大概多长”足够了。8111 实时录制的条目没有这个数据, 所以不会画。
+
+        颜色跟着该队的线路走(`_side_spawn_color`): 回放导入时 A/B 就是真实阵营。
+        """
+        if not self._show_airfields or not self._airfields:
+            return
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for a in self._airfields:
+            try:
+                cx, cy = a["c"]
+                ux, uy = a["u"]
+                vx, vy = a["v"]
+            except (KeyError, TypeError, ValueError):
+                continue
+            # 向量必须“换算后再相减”才是像素向量 —— 直接乘控件宽度会漏掉缩放/平移
+            c = self._to_px(cx, cy)
+            pa = self._to_px(cx + ux, cy + uy)      # 跑道一端
+            pb = self._to_px(cx - ux, cy - uy)      # 另一端
+            pv = self._to_px(cx + vx, cy + vy)
+            u_vec = QPointF(pa.x() - c.x(), pa.y() - c.y())
+            v_vec = QPointF(pv.x() - c.x(), pv.y() - c.y())
+            color = self._side_spawn_color(a["side"]) \
+                or AIRFIELD_SIDE_COLORS.get(a["side"], AIRFIELD_SIDE_COLORS["A"])
+            fill = QColor(color)
+            fill.setAlpha(AIRFIELD_FILL_ALPHA)
+            edge = QColor(color)
+            edge.setAlpha(AIRFIELD_EDGE_ALPHA)
+            if a.get("kind") == "helipad":
+                # 直升机坪: 一个小方块 + 中间两道竖线(像个 H)
+                box = QPolygonF([
+                    QPointF(pa.x() + v_vec.x(), pa.y() + v_vec.y()),
+                    QPointF(pa.x() - v_vec.x(), pa.y() - v_vec.y()),
+                    QPointF(pb.x() - v_vec.x(), pb.y() - v_vec.y()),
+                    QPointF(pb.x() + v_vec.x(), pb.y() + v_vec.y()),
+                ])
+                p.setBrush(QBrush(fill))
+                p.setPen(QPen(edge, 1.6))
+                p.drawPolygon(box)
+                continue
+            # 跑道: 四个角连成四边形(填充很淡, 底下地图还看得见)
+            quad = QPolygonF([
+                QPointF(pa.x() + v_vec.x(), pa.y() + v_vec.y()),
+                QPointF(pa.x() - v_vec.x(), pa.y() - v_vec.y()),
+                QPointF(pb.x() - v_vec.x(), pb.y() - v_vec.y()),
+                QPointF(pb.x() + v_vec.x(), pb.y() + v_vec.y()),
+            ])
+            p.setBrush(QBrush(fill))
+            p.setPen(QPen(edge, 2.0))
+            p.drawPolygon(quad)
+            # 中心虚线
+            dash = QPen(edge, 1.4, Qt.PenStyle.DashLine)
+            dash.setDashPattern([AIRFIELD_DASH, AIRFIELD_DASH * 0.7])
+            p.setPen(dash)
+            p.drawLine(pa, pb)
+            # 两端横杠
+            p.setPen(QPen(edge, 2.4))
+            for pt in (pa, pb):
+                p.drawLine(QPointF(pt.x() + 2 * v_vec.x(), pt.y() + 2 * v_vec.y()),
+                           QPointF(pt.x() - 2 * v_vec.x(), pt.y() - 2 * v_vec.y()))
+        p.restore()
 
     def _draw_spawns(self, p: QPainter) -> None:
         """画重生位置: **空心方块** —— 红 = 敌方, 蓝 = 我方(与战区同一套归属色)。

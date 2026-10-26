@@ -425,6 +425,13 @@ class GlobalRecord:
     # 导入的记录有意义: `points` 里存的是 0~1, 有了这个矩形就能反推出世界米 ——
     # 于是“地图管理里换了/补了校准”以后可以把旧记录**重新对齐**, 不用重新导入。
     norm_rect: list = field(default_factory=list)
+    # 两队的机场跑道(回放导入时从 ECS 的机场防空阵地估出来的, 见
+    # `replay_import._airfields_from_ecs`)。存的是**世界米**, 绘制时才用 `norm_rect`
+    # 归一化 —— 这样换校准时它跟着线路一起重算, 不用单独维护。
+    #   {"side": "A"/"B", "kind": "runway"/"helipad",
+    #    "x": 东, "z": 北, "dx": 朝向东分量, "dz": 朝向北分量,
+    #    "length": 米, "width": 米, "est": True}
+    airfields: list[dict] = field(default_factory=list)
 
     def zone_state_entry(self, t: float, side: str = "") -> dict | None:
         """取回放时刻 `t` 的战区快照**整条**(`{"t","side","zones"}`); 没有返回 None。
@@ -554,6 +561,7 @@ class GlobalRecord:
             "zone_states": self.zone_states,
             "kills": self.kills,
             "norm_rect": list(self.norm_rect or []),
+            "airfields": list(self.airfields or []),
             "sides": {side: [life.to_json() for life in self.lives(side)]
                       for side in GLOBAL_SIDES},
         }
@@ -580,6 +588,21 @@ class GlobalRecord:
                 rec.norm_rect = rect
         except (TypeError, ValueError):
             rec.norm_rect = []
+        for row in data.get("airfields") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                rec.airfields.append({
+                    "side": str(row.get("side") or "A"),
+                    "kind": str(row.get("kind") or "runway"),
+                    "x": float(row["x"]), "z": float(row["z"]),
+                    "dx": float(row.get("dx") or 1.0),
+                    "dz": float(row.get("dz") or 0.0),
+                    "length": float(row.get("length") or 3000.0),
+                    "width": float(row.get("width") or 300.0),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
         for row in data.get("zone_states") or []:
             if not isinstance(row, dict):
                 continue

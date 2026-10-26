@@ -123,6 +123,83 @@ def _time_from_name(path: str) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+AIRFIELD_MIN_UNITS = 3          # 少于这么多阵地就不认（不是机场防空）
+RUNWAY_LEN_SCALE = 1.5          # 主轴跨度 → 跑道长度（阵地只占跑道中段）
+RUNWAY_LEN_MIN = 1500.0
+RUNWAY_LEN_MAX = 4500.0
+RUNWAY_W_RATIO = 0.10           # 长宽比 10:1：真实跑道约 45 m，那样在图上只有 1px
+HELIPAD_SIZE = 320.0            # 直升机坪画成小方块（真实约 100 m，画小就看不见）
+
+
+def _airfields_from_ecs(data: ReplayData) -> list[dict]:
+    """从 ECS 里「机场防空」AI 的阵地估出两队机场跑道（用户 2026-10-26 要求）。
+
+    **为什么只能估**: 机场本体(`tN_airfield`)的坐标和跑道朝向在关卡对象包(`0xD039`)
+    里 —— 要解 36B 旋转矩阵 + 12B 平移才拿得到。而 `tN_airfield_aaa_*`（机场防空）
+    是普通 ECS 载具，位置现成。这些阵地是沿跑道两侧和两端摆的，于是：
+
+    * 它们的**质心** ≈ 跑道中心（实测与关卡对象里的机场坐标只差约 100 m）；
+    * 它们的**主轴**（协方差主特征向量）≈ 跑道朝向；
+    * 主轴上的**跨度**比跑道短（阵地只覆盖跑道中段），乘 `RUNWAY_LEN_SCALE` 补回来。
+
+    这些数字**都是估的**，只用来在图上示意"机场在那一侧、朝哪个方向"，不要当量具。
+
+    ⚠ `tN_` 前缀与队伍编号是**反的**（`t1_` 属 team 2），与 `_team_by_takeoff` 一致。
+    """
+    runway: dict[int, list[tuple[float, float]]] = {1: [], 2: []}
+    helipad: dict[int, list[tuple[float, float]]] = {1: [], 2: []}
+    for veh in getattr(data, "vehicles", ()):
+        cls = (getattr(veh, "cls", "") or "").lower()
+        m = re.match(r"^t([12])_", cls)
+        if not m or not cls:
+            continue
+        kind = "helipad" if "helipad" in cls else (
+            "airfield" if "airfield" in cls else "")
+        if not kind:
+            continue
+        rows = data.units.get(getattr(veh, "uid", 0))
+        if not rows:
+            continue
+        _t, x, _y, z = rows[0]
+        (helipad if kind == "helipad" else runway)[int(m.group(1))].append((x, z))
+
+    out: list[dict] = []
+    for prefix, pts in runway.items():
+        if len(pts) < AIRFIELD_MIN_UNITS:
+            continue
+        side = "B" if prefix == 1 else "A"        # t1_ 属 team 2
+        n = float(len(pts))
+        cx = sum(p[0] for p in pts) / n
+        cz = sum(p[1] for p in pts) / n
+        sxx = sum((p[0] - cx) ** 2 for p in pts) / n
+        szz = sum((p[1] - cz) ** 2 for p in pts) / n
+        sxz = sum((p[0] - cx) * (p[1] - cz) for p in pts) / n
+        theta = 0.5 * math.atan2(2.0 * sxz, sxx - szz)
+        dx, dz = math.cos(theta), math.sin(theta)
+        proj = [(p[0] - cx) * dx + (p[1] - cz) * dz for p in pts]
+        span = max(proj) - min(proj)
+        length = min(RUNWAY_LEN_MAX, max(RUNWAY_LEN_MIN, span * RUNWAY_LEN_SCALE))
+        mid = (max(proj) + min(proj)) / 2.0       # 阵地可能偏在一头，中心要跟着挪
+        out.append({
+            "side": side, "kind": "runway",
+            "x": cx + mid * dx, "z": cz + mid * dz,
+            "dx": dx, "dz": dz,
+            "length": length, "width": max(120.0, length * RUNWAY_W_RATIO),
+        })
+    for prefix, pts in helipad.items():
+        if not pts:
+            continue
+        side = "B" if prefix == 1 else "A"
+        n = float(len(pts))
+        out.append({
+            "side": side, "kind": "helipad",
+            "x": sum(p[0] for p in pts) / n, "z": sum(p[1] for p in pts) / n,
+            "dx": 1.0, "dz": 0.0,
+            "length": HELIPAD_SIZE, "width": HELIPAD_SIZE,
+        })
+    return out
+
+
 def build_record(data: ReplayData, source_path: str = "",
                  calib=None) -> tuple[GlobalRecord, ImportStats]:
     """`ReplayData` → `GlobalRecord`。
@@ -192,6 +269,9 @@ def build_record(data: ReplayData, source_path: str = "",
     # 记住归一化用的世界矩形: 以后这图补上/换了校准, 可以**原地重算**坐标
     # (见 `renormalize_map_records`), 不用让用户重新导入回放。
     rec.norm_rect = [minx, maxx, minz, maxz]
+    # 两队机场跑道(示意用, 见 `_airfields_from_ecs`)。存世界米, 绘制时才归一化 ——
+    # 这样换校准时它跟着线路一起重算。
+    rec.airfields = _airfields_from_ecs(data)
 
     t0 = data.t_first
     # ---- 玩家身份与真实分队 ------------------------------------------------

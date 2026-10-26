@@ -1072,6 +1072,139 @@ def test_spawns(tmpdir: str):
     results.append("重生位置(解析/归属色/落盘/画红蓝空心方块) OK")
 
 
+def test_airfields_from_ecs():
+    """机场跑道估算: 机场防空阵地 → 质心/朝向/长度; `t1_` 属 team 2(= B 队)。
+
+    回放里机场本体(`tN_airfield`)的坐标在关卡对象包里(要解 36B 旋转矩阵 + 12B
+    平移), 而 `tN_airfield_aaa_*` 是普通 ECS 载具、位置现成 —— 拿它们的分布估:
+    质心≈中心、主轴≈朝向、主轴跨度×1.5≈跑道长度(阵地只占跑道中段)。
+    """
+    from types import SimpleNamespace
+
+    from wt81111g.replay_import import (
+        HELIPAD_SIZE, RUNWAY_LEN_MAX, RUNWAY_LEN_MIN, _airfields_from_ecs,
+    )
+    from wt81111g.wrpl_reader import ReplayData
+
+    data = ReplayData()
+    uid = 100
+    # t2_ 的机场防空沿 +x 排开(跨 0~900 m) → team 1 → "A" 队
+    for i in range(6):
+        data.vehicles.append(SimpleNamespace(uid=uid, cls=f"t2_airfield_aaa_small_{i:02d}"))
+        data.units[uid] = [(0.0, i * 180.0, 50.0, 0.0)]
+        uid += 1
+    # t1_ 的沿 +z 排开(跨 5000~5750) → team 2 → "B" 队
+    for i in range(4):
+        data.vehicles.append(SimpleNamespace(uid=uid, cls=f"t1_airfield_aaa_big_{i:02d}"))
+        data.units[uid] = [(0.0, 3000.0, 60.0, 5000.0 + i * 250.0)]
+        uid += 1
+    data.vehicles.append(SimpleNamespace(uid=uid, cls="t2_helipad"))
+    data.units[uid] = [(0.0, -200.0, 40.0, 900.0)]
+
+    rows = _airfields_from_ecs(data)
+    runways = [r for r in rows if r["kind"] == "runway"]
+    pads = [r for r in rows if r["kind"] == "helipad"]
+    assert len(runways) == 2 and len(pads) == 1, rows
+    by_side = {r["side"]: r for r in runways}
+    assert set(by_side) == {"A", "B"}, by_side
+    a = by_side["A"]
+    assert abs(a["x"] - 450.0) < 1e-6 and abs(a["z"]) < 1e-6, a
+    assert abs(a["dx"] - 1.0) < 1e-6 and abs(a["dz"]) < 1e-6, a
+    assert RUNWAY_LEN_MIN <= a["length"] <= RUNWAY_LEN_MAX, a
+    assert abs(a["width"] - max(120.0, a["length"] * 0.10)) < 1e-6, a
+    b = by_side["B"]
+    assert abs(b["x"] - 3000.0) < 1e-6 and abs(b["z"] - 5375.0) < 1e-6, b
+    assert abs(abs(b["dz"]) - 1.0) < 1e-6, b
+    assert pads[0]["side"] == "A"
+    assert pads[0]["length"] == HELIPAD_SIZE == pads[0]["width"]
+
+    # 少于 3 个阵地不认(那不是机场防空)
+    thin = ReplayData()
+    thin.vehicles.append(SimpleNamespace(uid=1, cls="t1_airfield_aaa_small_01"))
+    thin.units[1] = [(0.0, 0.0, 0.0, 0.0)]
+    assert _airfields_from_ecs(thin) == [], _airfields_from_ecs(thin)
+    results.append("机场跑道估算(质心/主轴朝向/长度/队别/直升机坪) OK")
+
+
+def test_airfields_view():
+    """机场: 世界米 → 归一化(中心 / 半个跑道长 / 半个宽) + 开关 + 无矩形就清空。"""
+    app = QApplication.instance() or QApplication([])  # noqa: F841
+    view = RouteMapView()
+    view.resize(400, 400)
+    rect = [0.0, 4000.0, 0.0, 4000.0]
+    rows = [{"side": "A", "kind": "runway", "x": 2000.0, "z": 2000.0,
+             "dx": 1.0, "dz": 0.0, "length": 2000.0, "width": 200.0}]
+    view.set_airfields(rows, rect)
+    got = view.airfields
+    assert len(got) == 1, got
+    # 中心: (2000-0)/4000, (4000-2000)/4000 —— ny 用 maxz-z, 北在图上方
+    assert abs(got[0]["c"][0] - 0.5) < 1e-9, got[0]
+    assert abs(got[0]["c"][1] - 0.5) < 1e-9, got[0]
+    # 半个跑道长 1000 m / 4000 = 0.25; 半个宽 100 m / 4000 = 0.025
+    assert abs(got[0]["u"][0] - 0.25) < 1e-9, got[0]
+    assert abs(got[0]["u"][1]) < 1e-12, got[0]
+    assert abs(got[0]["v"][0]) < 1e-12, got[0]
+    assert abs(got[0]["v"][1] - 0.025) < 1e-9, got[0]
+    # 垂直跑道方向的半宽: 跑道沿 +z 时 v 应该在 x 方向
+    view.set_airfields([{"side": "B", "kind": "runway", "x": 0.0, "z": 0.0,
+                         "dx": 0.0, "dz": 1.0, "length": 2000.0, "width": 200.0}], rect)
+    got = view.airfields
+    assert abs(got[0]["u"][1] + 0.25) < 1e-9, got[0]   # 世界 +z = 图上方 = ny 变小
+    assert abs(got[0]["v"][0] + 0.025) < 1e-9, got[0]
+    # 开关
+    view.set_show_airfields(False)
+    assert view.show_airfields is False
+    view.set_show_airfields(True)
+    assert view.show_airfields is True
+    # 没有 norm_rect(8111 实时录制的条目) → 清空, 不炸
+    view.set_airfields(rows, None)
+    assert view.airfields == []
+    view.set_airfields(None, rect)
+    assert view.airfields == []
+
+    # 真的画得出来: 开关前后同一块画布必须有像素差异
+    view.set_map_bytes(png_solid("#202020"))
+    view.set_airfields([{"side": "A", "kind": "runway", "x": 2000.0, "z": 2000.0,
+                         "dx": 1.0, "dz": 0.0, "length": 2000.0, "width": 300.0},
+                        {"side": "B", "kind": "helipad", "x": 3500.0, "z": 3500.0,
+                         "dx": 1.0, "dz": 0.0, "length": 320.0, "width": 320.0}], rect)
+    canvas = QImage(400, 400, QImage.Format.Format_ARGB32)
+
+    def snap(show: bool) -> QImage:
+        view.set_show_airfields(show)
+        canvas.fill(QColor(0, 0, 0))
+        view.render(canvas)
+        return canvas.copy()
+
+    on, off = snap(True), snap(False)
+    diff = sum(1 for y in range(0, 400, 4) for x in range(0, 400, 4)
+               if on.pixel(x, y) != off.pixel(x, y))
+    assert diff > 40, f"机场跑道开关应改变画面像素, 实测差异 {diff}"
+    results.append("机场跑道: 世界米 → 归一化(中心/半长/半宽/方向) + 真能画出来 OK")
+
+
+def test_airfields_json():
+    """机场数据落盘往返; 坏行跳过而不是整条记录丢掉。"""
+    from wt81111g.route_store import GlobalRecord
+
+    g = GlobalRecord(route_id="g1", map_key="k", map_name="m", created_at="t")
+    g.norm_rect = [0.0, 100.0, 0.0, 100.0]
+    g.airfields = [{"side": "B", "kind": "runway", "x": 10.0, "z": 20.0,
+                    "dx": 0.0, "dz": 1.0, "length": 3000.0, "width": 300.0}]
+    back = GlobalRecord.from_json(g.to_json())
+    assert back is not None, "往返后不该变 None"
+    assert back.norm_rect == [0.0, 100.0, 0.0, 100.0]
+    assert len(back.airfields) == 1, back.airfields
+    assert back.airfields[0]["side"] == "B"
+    assert abs(back.airfields[0]["length"] - 3000.0) < 1e-9
+    assert abs(back.airfields[0]["dz"] - 1.0) < 1e-9
+    # 坏数据(缺 x/z)跳过, 其它字段照旧
+    bad = GlobalRecord.from_json({"route_id": "g2", "map_key": "k", "map_name": "m",
+                                  "created_at": "t", "airfields": [{"side": "A"}, 5]})
+    assert bad is not None and bad.airfields == [], bad
+    results.append("机场数据落盘往返(坏行跳过) OK")
+
+
 def test_multi_playback(tmpdir: str):
     """多条轨迹同时回放: 从 00:00 一起播放, **以最长的那条**结束;
     “到下一标记暂停”把多条轨迹的标记放在同一条时间轴上取**之后最近**的那个。
@@ -3295,9 +3428,13 @@ def test_playback_zoom_resumes(tmpdir: str):
     assert view._play_geom != view._geom_key(), "刚缩放完应是按比例贴(还没重建)"
 
     # 之后回放每帧都会渲染(几何“不再变化”但依旧 != 建层几何):
-    # 必须能在 GEOM_SETTLE_MS 之后重建一次 —— 不能每帧把时间戳顶回去
+    # 必须能在 GEOM_SETTLE_MS 之后重建一次 —— 不能每帧把时间戳顶回去。
+    # ⚠ 给足墙钟时间: `_geom_settle` 发现自己还在“缩放中”时会再等一轮(200ms),
+    # 而定时器若在上一轮就已激活则不会重启 —— 两轮叠加就可能超过 400ms(偶发红过)。
+    # 注意**不能靠增加循环次数**来拖时间: playhead 每轮 +1 秒, 推过记录时长后
+    # `_play_drawn` 就不增长了, 下面的“继续累加”断言会误报。
     for i in range(8):
-        QTest.qWait(50)
+        QTest.qWait(100)
         view.set_playback(recs, 10.0 + i)
         view.render(canvas)
     assert view._play_geom == view._geom_key(), \
@@ -3319,7 +3456,7 @@ def test_playback_zoom_resumes(tmpdir: str):
                                 Qt.KeyboardModifier.NoModifier,
                                 Qt.ScrollPhase.NoScrollPhase, False))
     for _ in range(8):
-        QTest.qWait(50)
+        QTest.qWait(100)
         view.render(canvas)
     assert view._track_geom == view._geom_key(), "轨迹层同样必须停手后重建"
     results.append("回放中缩放后自动恢复(延迟重建不会被每帧刷新时间戳顶掉) OK")
@@ -3692,6 +3829,9 @@ def main() -> int:
     test_playback()
     test_zones_and_modes(tmpdir)
     test_spawns(tmpdir)
+    test_airfields_from_ecs()
+    test_airfields_view()
+    test_airfields_json()
     test_multi_playback(tmpdir)
     test_map_render()
     test_player_heading()

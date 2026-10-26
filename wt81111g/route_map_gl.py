@@ -99,6 +99,7 @@ Z_TRACK = 0.0
 Z_UNDER = 0.004
 Z_PLAY = 0.008
 Z_SPAWN = 0.012
+Z_AIRFIELD = 0.014
 Z_ZONE = 0.016
 Z_MARK = 0.022
 Z_PLAYER = 0.026
@@ -111,10 +112,6 @@ Z_PLAYER = 0.026
 RENDER_QUEUE = 3000
 O_MAP = -100
 O_BORDER = -90
-O_ZONE = -80          # 战区填充(在轨迹**之下**, 与软件版一致)
-O_ZONE_EDGE = -79
-O_ZONE_LABEL = -78
-O_SPAWN = -70         # 重生方块(在轨迹之下)
 O_UNDER = 10          # 回放未播放底衬
 O_TRACK = 20          # 轨迹本体
 O_MARK = 30           # 起/终点圆环
@@ -125,6 +122,15 @@ O_LABEL_TEXT = 34     # 时间标签文字
 O_DEAD = 40           # 阵亡叉
 O_CURSOR_DOT = 50     # 回放光标白点
 O_CURSOR_DIR = 51     # 光标朝向线
+# 机场跑道(示意) —— 与软件版一致: 在轨迹之上、重生方块之下
+O_AIRFIELD = 51.5
+O_AIRFIELD_EDGE = 51.6
+# 地图标记(重生方块 / 战区)**压在轨迹之上**: 线路密的地方以前会把菱形盖住看不见
+# (用户 2026-10-26)。仍低于玩家点与悬浮信息 —— 那两个是“当前焦点”, 永远最上。
+O_SPAWN = 52          # 重生方块
+O_ZONE = 54           # 战区填充
+O_ZONE_EDGE = 55      # 战区描边
+O_ZONE_LABEL = 56     # 战区的 A/B/C 字母
 O_PLAYER_RING = 60
 O_PLAYER_DOT = 61
 O_PLAYER_DIR = 62
@@ -502,8 +508,9 @@ class RouteMapGlView(RouteMapView):
                 self._map_digest)
 
     def _icon_key(self) -> tuple:
-        """**图标层**的指纹(重生点/占位文字) —— 变了只换图标, 轨迹不动。"""
-        return (self._show_spawns, self._spawns_ver, self._status)
+        """**图标层**的指纹(重生点/机场/占位文字) —— 变了只换图标, 轨迹不动。"""
+        return (self._show_spawns, self._spawns_ver,
+                self._show_airfields, self._airfield_ver, self._status)
 
     def _zone_key(self) -> tuple:
         """**战区层**的指纹 —— 回放时它每几十秒就变一次, 所以单独一条最轻的路。"""
@@ -706,6 +713,7 @@ class RouteMapGlView(RouteMapView):
         self._clear_icons()
         self._icon_mode = True
         try:
+            self._build_airfields()
             self._build_spawns()
             self._build_zones()
             self._build_marks()
@@ -892,7 +900,55 @@ class RouteMapGlView(RouteMapView):
                     tr.drawn = max(tr.drawn, i1)
             tr.nseg = i1
 
-    # ---------------------------------------------------- 图元: 重生/战区/叉
+    # ---------------------------------------------------- 图元: 机场/重生/战区/叉
+    def _build_airfields(self) -> None:
+        """机场跑道(示意): 淡填充 + 描边 + 中心线; 直升机坪就是个小方块。
+
+        与软件版 `_draw_airfields` 对应。父类 `set_airfields()` 已经把世界米换算成
+        归一化的 `(c, u, v)` 三组向量, 这里只需换成 GPU 坐标系 —— **y 轴向上**,
+        所以中心点要 `1-y`、向量要取负(与 `_build_spawns` 同一套约定)。
+        """
+        if not self._show_airfields or not self._airfields:
+            return
+        for a in self._airfields:
+            try:
+                cx, cy = a["c"]
+                ux, uy = a["u"]
+                vx, vy = a["v"]
+            except (KeyError, TypeError, ValueError):
+                continue
+            cy = 1.0 - cy
+            uy, vy = -uy, -vy
+            color = self._side_spawn_color(str(a.get("side") or "A")) \
+                or rmv.AIRFIELD_SIDE_COLORS.get(str(a.get("side") or "A"),
+                                                rmv.AIRFIELD_SIDE_COLORS["A"])
+            quad = np.array([
+                (cx + ux + vx, cy + uy + vy, Z_AIRFIELD),
+                (cx + ux - vx, cy + uy - vy, Z_AIRFIELD),
+                (cx - ux - vx, cy - uy - vy, Z_AIRFIELD),
+                (cx - ux + vx, cy - uy + vy, Z_AIRFIELD),
+            ], dtype=np.float32)
+            fill = QColor(color)
+            fill.setAlpha(rmv.AIRFIELD_FILL_ALPHA)
+            self._add(gfx.Mesh(
+                gfx.Geometry(positions=quad,
+                             indices=np.array([[0, 1, 2], [0, 2, 3]], np.uint32)),
+                gfx.MeshBasicMaterial(color=_rgba(fill), side="both")), O_AIRFIELD)
+            edge = QColor(color)
+            edge.setAlpha(rmv.AIRFIELD_EDGE_ALPHA)
+            ring = np.vstack([quad, quad[:1]]).astype(np.float32)
+            self._add(gfx.Line(          # 四边描边
+                gfx.Geometry(positions=ring),
+                gfx.LineMaterial(thickness=2.0, thickness_space="screen",
+                                 color=_rgba(edge))), O_AIRFIELD_EDGE)
+            if str(a.get("kind") or "") != "helipad":
+                mid = np.array([(cx - ux, cy - uy, Z_AIRFIELD),
+                                (cx + ux, cy + uy, Z_AIRFIELD)], dtype=np.float32)
+                self._add(gfx.Line(      # 中心线(GPU 版画实线, 虚线要 clipper, 不值当)
+                    gfx.Geometry(positions=mid),
+                    gfx.LineMaterial(thickness=1.4, thickness_space="screen",
+                                     color=_rgba(edge))), O_AIRFIELD_EDGE)
+
     def _build_spawns(self) -> None:
         """重生方块: 深色垫底 + 归属色, 四条边直接用**实心四边形**拼出来。
 

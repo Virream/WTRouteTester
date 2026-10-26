@@ -228,6 +228,11 @@ class RouteTesterWindow(QMainWindow):
             self._show_spawns = int(self._settings.value("show_spawns", 1)) != 0
         except (TypeError, ValueError):
             self._show_spawns = True
+        # 「显示机场跑道」开关: 只有「从回放导入」的条目有数据(8111 录制的没有机场信息)
+        try:
+            self._show_airfields = int(self._settings.value("show_airfields", 1)) != 0
+        except (TypeError, ValueError):
+            self._show_airfields = True
         # 录制叠加层(独立透明置顶窗, 显示录制进度/实际采集率; 默认关闭)
         self._overlay_settings = self._load_overlay_settings()
 
@@ -246,6 +251,7 @@ class RouteTesterWindow(QMainWindow):
         self.overlay = RecordOverlay(self._overlay_settings, parent=None)
         self.map_view.set_show_zones(self._show_zones)
         self.map_view.set_show_spawns(self._show_spawns)
+        self.map_view.set_show_airfields(self._show_airfields)
         self.map_view.set_dead_style(dim=self._saved_dead_dim, mark=self._saved_dead_mark)
         self._reload_tree()
         if self._merged_maps:
@@ -347,6 +353,18 @@ class RouteTesterWindow(QMainWindow):
             "战局外/看缓存底图时, 画的是这张地图这个版本以前记下的重生位置。")
         self.act_spawns.toggled.connect(self._on_show_spawns)
         setting.addAction(self.act_spawns)
+
+        self.act_airfields = QAction("显示机场跑道(蓝/红长条, 示意)", self)
+        self.act_airfields.setCheckable(True)
+        self.act_airfields.setChecked(self._show_airfields)
+        self.act_airfields.setToolTip(
+            "把两队机场的跑道画成**长条**(直升机坪是小方块)。\n"
+            "坐标与朝向是从回放里「机场防空」阵地的分布估的, 长度按主轴跨度估 ——\n"
+            "**只是示意**, 不要用它量距离。\n"
+            "8111 实时录制的条目没有这些数据, 所以那种图上不会出现跑道。\n"
+            "机场常在底图图框**外面**, 缩小(滚轮)就能看到。")
+        self.act_airfields.toggled.connect(self._on_show_airfields)
+        setting.addAction(self.act_airfields)
 
         # ---- 轮询间隔: 从信息区挪到菜单(2026-10-23)。
         # 用户口径: “采样设置不该让用户经常改, 最好是定在一个合适的数值, 现在这项功能
@@ -617,6 +635,14 @@ class RouteTesterWindow(QMainWindow):
         self.map_view.set_show_spawns(self._show_spawns)
         self._set_status("已显示地图上的重生位置(红=敌方, 蓝=我方)" if checked
                          else "已隐藏地图上的重生位置", sticky=2.0)
+
+    def _on_show_airfields(self, checked: bool) -> None:
+        """菜单开关: 是否在地图上画机场跑道(回放导入的条目才有数据)。"""
+        self._show_airfields = bool(checked)
+        self._settings.setValue("show_airfields", 1 if checked else 0)
+        self.map_view.set_show_airfields(self._show_airfields)
+        self._set_status("已显示机场跑道(示意, 长度是估的)" if checked
+                         else "已隐藏机场跑道", sticky=2.0)
 
     def _open_sound_settings(self) -> None:
         """菜单「音效 → 音效设置」: 音量 / 自定义音效文件(改动立即生效)。"""
@@ -1508,6 +1534,31 @@ class RouteTesterWindow(QMainWindow):
             out.append(row)
         return out
 
+    def _apply_airfields(self) -> None:
+        """决定地图上画哪一局的机场跑道。
+
+        机场数据只有**从回放导入**的条目才有(见 `replay_import._airfields_from_ecs`),
+        8111 实时录制的没有。取舍顺序:
+
+        1. 正在回放某一局 → 就画那一局(和战区时间轴、线路保持一致);
+        2. 否则 → 画**当前这张图**最近导入的那一局(有机场数据的那几局里最新的)。
+
+        坐标要用**该条目自己的 `norm_rect`** 归一化 —— 线路的 `points` 就是用它算的,
+        用别的矩形会让跑道和线路错位。
+        """
+        g = self._playback_global() if self._in_playback() else None
+        if g is None or not g.airfields:
+            cur = self.store.canon(self.map_view.map_key or "")
+            cands = [x for x in self.store.globals
+                     if x.airfields
+                     and self.store.canon(x.map_key or "") == cur]
+            cands.sort(key=lambda x: x.created_at or "")
+            g = cands[-1] if cands else None
+        if g is None or not g.airfields:
+            self.map_view.set_airfields(None, None)
+            return
+        self.map_view.set_airfields(g.airfields, g.norm_rect)
+
     def _apply_zones(self, info: dict | None = None) -> None:
         """决定地图上画哪套战区(小菱形 + A/B/C)。
         1. **回放全局录制** → 用录像里记的战区状态时间轴(归属变化、占领中都能重现);
@@ -1519,6 +1570,8 @@ class RouteTesterWindow(QMainWindow):
         key = self.map_view.map_key
         if not key:
             return
+        # 机场跑道只跟“这是哪一局”有关, 与战区分支无关 —— 先独立更新掉
+        self._apply_airfields()
         recorder = getattr(self, "recorder", None)
         live = list((info or {}).get("zones") or [])
         live_spawns = list((info or {}).get("spawns") or [])
