@@ -121,8 +121,18 @@ def _zone_fill_color(z: dict) -> QColor:
 _SPEED_BUCKETS = 24  # 轨迹按速度量化的颜色档数(减少画笔切换)
 
 # 缩放/平移: zoom=1.0 即“适配窗口”(等比缩放居中), 与未启用缩放时行为一致
-MIN_ZOOM = 1.0
+#
+# ⚠ MIN_ZOOM 不能是 1.0(用户 2026-10-26): 8111 的机场、机场防空、各机型重生点
+# 本来就在**图框外 7~10 倍**处(实测 fighter/ucav 重生点在图框外 7~10 倍),
+# 1.0 就是“整张图刚好铺满窗口”, 再缩不了 —— 两侧机场永远看不到。
+# 0.05 = 1/20, 能把 ±20 倍图幅的范围一道装进窗口。
+MIN_ZOOM = 0.05
 MAX_ZOOM = 20.0
+
+# 允许平移到图框**外**多远(单位: 图幅倍数)。同样是为了看机场/远距重生点 ——
+# 只按“图片矩形”限制的话, 缩小后就走不动了。PAN_OUTSIDE 要与 MIN_ZOOM 配套:
+# MIN_ZOOM=1/20 时能装下 ±10 倍, PAN_OUTSIDE 取 12 留点余量。
+PAN_OUTSIDE = 12.0
 
 # 底图缩放档位:(放大倍数下限, 源图降采样倍数)
 #
@@ -811,12 +821,20 @@ class RouteMapView(QWidget):
         return QRectF(cx - dw / 2.0, cy - dh / 2.0, dw, dh)
 
     def _clamp_pan(self) -> None:
-        """限制平移幅度, 避免把地图整个拖出视野(至少保留 PAN_MARGIN 像素可见)。"""
+        """限制平移幅度: 允许拖到**图框外**, 但不许把图彻底拖丢。
+
+        以前的上限是“图片矩形 + 窗口”那一圈, 所以缩小到能看见全图之后就走不动了
+        —— 而 8111 的机场 / 机场防空 / 各机型重生点本来就在图框**外 7~10 倍**处,
+        用户根本拖不过去(2026-10-26 反馈)。现在按 `PAN_OUTSIDE` 倍图幅放宽,
+        仍然保证图至少有 `PAN_MARGIN` 像素留在窗口里(不会拖丢, 双击可复位)。
+        """
         dw, dh = self._map_size()
         if dw <= 0 or dh <= 0:
             return
-        max_x = max(0.0, (dw + self.width()) / 2.0 - PAN_MARGIN)
-        max_y = max(0.0, (dh + self.height()) / 2.0 - PAN_MARGIN)
+        max_x = max(0.0, self.width() / 2.0
+                    + (PAN_OUTSIDE - 0.5) * dw - PAN_MARGIN)
+        max_y = max(0.0, self.height() / 2.0
+                    + (PAN_OUTSIDE - 0.5) * dh - PAN_MARGIN)
         self._pan_x = max(-max_x, min(max_x, self._pan_x))
         self._pan_y = max(-max_y, min(max_y, self._pan_y))
 
