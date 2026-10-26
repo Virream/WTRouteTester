@@ -81,7 +81,8 @@ FMT_BASE = 1          # t/x/y/speed 各 float32
 FMT_DIR = 2           # + dx/dy 各 float32(单条录制才记朝向)
 FMT_HOLD = 4          # + hold 各 float32(全局录制的静止段时长)
 
-_CMP_LEVEL = 3        # zstd 级别: 一局 12 MB 原始数据, 3 级约 2.5~5 MB / 二三十毫秒
+_CMP_LEVEL = 3        # zstd 级别。实测一局 80 万点: 打包 ~200 ms + 压缩 ~100 ms,
+#                       产出比旧的 gzip6 略大(~12%), 但快得多 —— 用户要的是性能而不是省盘。
 _compressor = zstd.ZstdCompressor(level=_CMP_LEVEL, write_checksum=True) if zstd else None
 _decompressor = zstd.ZstdDecompressor() if zstd else None
 
