@@ -162,8 +162,9 @@ class RouteTesterWindow(QMainWindow):
         # 选中集合(决定回放播哪几条; 用于判断“本次新加进来的是哪张地图”)
         self._sel_ids: set[str] = set()
         self._sel_groups: set[tuple[str, str]] = set()
-        # “基准版本”: 双击某条轨迹后, 它的(地图键, 战区指纹)被锁为基准 ——
-        # 之后多选/回放只能在同一版本内进行(见 _group_of / _on_tree_selection_changed)
+        # “基准模式”: 双击某条轨迹后, 它的(地图键, 模式名)被锁为基准 ——
+        # 之后多选/回放只能在同一地图同一模式内进行
+        # (见 _group_of / _playable_group / _on_tree_selection_changed)
         self._anchor: tuple[str, str] | None = None
         self._reselecting = False
         # 侧栏是否已经建过一次: 首次构建(= 刚启动)默认**全部折叠**, 之后的重建
@@ -1632,11 +1633,15 @@ class RouteTesterWindow(QMainWindow):
         return self._selection_tracks() + self._selection_lives()
 
     def _playable_group(self, r) -> tuple[str, str]:
-        """一条**可播放线路**属于哪个分组 (地图, 战区指纹)。
+        """一条**可播放线路**属于哪个分组 (地图键, 模式名) —— 与 `_group_of` 同义。
 
-        单条轨迹自带 `zone_signature`; 全局线路(`UnitLife`)只有 map_key,
-        它的版本信息在**所属全局录制**上 —— 不这样取的话, 同一张地图不同版本的
-        全局条目会被当成同一组。
+        单条轨迹自带 `map_key` / `zone_count`, 直接走 `_group_of`。
+        全局线路(`UnitLife`)只有 map_key, 它的模式在**所属全局录制**上。
+
+        ⚠ 2026-10-26 修: 这里曾经返回 `(g.map_key, g.zone_signature)` —— 那是四层树
+        时代的“版本(战区指纹)”语义, 而单条轨迹那边早就改成了 `(canon(key), 模式名)`。
+        两边格式不同 ⇒ **同一张图同一模式的「单条轨迹 + 全局线路」混选时永远判成跨版本**,
+        一半选中会被默默取消, 图钉也永远标不到模式行上。
         """
         if isinstance(r, RouteRecord):
             return self._group_of(r)
@@ -1644,8 +1649,8 @@ class RouteTesterWindow(QMainWindow):
         if lid:
             for g in self.store.globals:
                 if any(l.life_id == lid for side in GLOBAL_SIDES for l in g.lives(side)):
-                    return (g.map_key or "", g.zone_signature or "")
-        return (getattr(r, "map_key", "") or "", "")
+                    return (self.store.canon(g.map_key or ""), g.mode_label or "")
+        return (self.store.canon(getattr(r, "map_key", "") or ""), "")
 
     def _item_groups(self, item: QTreeWidgetItem) -> set[tuple[str, str]]:
         """某个侧栏条目(任意层级)涉及哪些分组 —— 取消越界选中时按它判定。"""
@@ -1661,16 +1666,16 @@ class RouteTesterWindow(QMainWindow):
         return groups
 
     def _on_tree_selection_changed(self) -> None:
-        """选中项变化 → 回放将播放这几条; 同时**限制为同一张地图的同一版本**。
+        """选中项变化 → 回放将播放这几条; 同时**限制为同一张地图的同一模式**。
 
-        跨地图(底图只能是一张)/跨版本(战区位置不同, 线路本来就不可比)一起回放没有意义,
-        所以选中了多个版本时只保留一个:
+        跨地图(底图只能是一张)/跨模式(战区数量不同, 线路本来就不可比)一起回放没有意义,
+        所以选中了多个分组时只保留一个:
 
-        * 双击定过“基准”时, **基准优先** —— Ctrl 点到别的版本不会把基准换掉(锁住);
-        * 没定基准时保留“本次新加进来的那个版本”。
+        * 双击定过“基准”时, **基准优先** —— Ctrl 点到别处不会把基准换掉(锁住);
+        * 没定基准时保留“本次新加进来的那个分组”。
 
-        基准(图钉)还会**跟随当前选中所在的版本** —— 刚开始没选中任何条目时,
-        第一个点到的路线就把它的“地图·模式·版本”定为基准。
+        基准(图钉)还会**跟随当前选中所在的分组** —— 刚开始没选中任何条目时,
+        第一个点到的线路就把它的“地图·模式”定为基准。
 
         判定用 `_selection_playables()`(单条轨迹 + 全局线路)而不是只看单条轨迹:
         以前用 `_selection_tracks()`, 而它只认 `kind == "route"` 的条目 —— 选中
@@ -1719,7 +1724,7 @@ class RouteTesterWindow(QMainWindow):
             playables = [r for r in playables if self._playable_group(r) == keep]
             groups = {keep}
             self._set_status(
-                "同一张地图的同一版本才能一起回放/显示, 已只保留一个版本内的选中条目",
+                "同一张地图的同一个模式才能一起回放/显示, 已只保留一个分组内的选中条目",
                 sticky=3.0)
         self._sel_groups = groups
         self._sel_ids = {getattr(r, "route_id", "") for r in playables}
@@ -1796,7 +1801,7 @@ class RouteTesterWindow(QMainWindow):
                 self._refresh_anchor_icon_in(ch)
 
     def _update_play_label(self) -> None:
-        """信息区“回放”那一栏: 显示基准版本 + 待回放条数(含选中的全局线路)。"""
+        """信息区“回放”那一栏: 显示基准分组 + 待回放条数(含选中的全局线路)。"""
         n = len(self._selection_playables())
         if self._anchor is not None:
             base = self._group_name(*self._anchor)
@@ -1806,10 +1811,10 @@ class RouteTesterWindow(QMainWindow):
             self.lbl_play.setText(f"待回放: {n} 条" if n else "回放: --")
 
     def _show_all_tracks(self, shown: bool) -> None:
-        """一键显示/隐藏轨迹(**只限同一版本** —— 不同版本线路不可比)。
+        """一键显示/隐藏轨迹(**只限同一地图同一模式** —— 不同模式的线路不可比)。
 
         从树的第一个分组开始, 只点亮该分组内的轨迹(树的顺序是最新在前,
-        所以实际是“最新那个版本”); 想换版本就双击其它版本的轨迹改基准。
+        所以实际是“最新那个模式”); 想换分组就双击其它模式的轨迹改基准。
         """
         rows = list(self._iter_route_items())
         groups: list[tuple[str, str]] = []
@@ -1826,8 +1831,8 @@ class RouteTesterWindow(QMainWindow):
                         if keep is not None
                         and (rec := self.store.get(ch.data(0, _ROLE_ID))) is not None
                         and self._group_of(rec) == keep}
-            self._visible_ids = keep_ids       # 只显示这一个版本(其它版本一并隐掉)
-            self._set_status(f"已显示 {len(keep_ids)} 条轨迹(只限同一版本)", sticky=2.0)
+            self._visible_ids = keep_ids       # 只显示这一个分组(其它分组一并隐掉)
+            self._set_status(f"已显示 {len(keep_ids)} 条轨迹(只限同一模式)", sticky=2.0)
         else:
             self._visible_ids.clear()
             self._set_status("已隐藏全部轨迹", sticky=2.0)
@@ -2011,7 +2016,7 @@ class RouteTesterWindow(QMainWindow):
                 grp = self._group_of(rec)
                 if grp not in groups:
                     groups.append(grp)
-            keep = groups[0] if groups else None
+            keep = self._anchor if (self._anchor in groups) else (groups[0] if groups else None)
             ids = [rid for rid in rows
                    if (rec := self.store.get(rid)) is not None
                    and keep is not None and self._group_of(rec) == keep]
@@ -2054,8 +2059,8 @@ class RouteTesterWindow(QMainWindow):
         rec = self.store.get(route_id)
         if shown:
             self._visible_ids.add(route_id)
-            # **同一版本**才能一起显示(同一张地图不够): 版本 = 战区位置,
-            # 不同交战区域的线路叠在一起毫无意义。点亮别的版本时先把它们隐掉。
+            # **同一分组(地图 + 模式)**才能一起显示: 不同模式(战区数量不同)的线路
+            # 叠在一起毫无意义。点亮别处时先把其它分组的隐掉。
             if rec is not None:
                 grp = self._group_of(rec)
                 others = [rid for rid in self._visible_ids
@@ -2065,8 +2070,8 @@ class RouteTesterWindow(QMainWindow):
                 if others:
                     self._visible_ids -= set(others)
                     self._set_status(
-                        "同一版本(同一张图 + 同一战区布局)才能一起显示, "
-                        "已隐藏其它版本的轨迹", sticky=3.0)
+                        "同一张图同一个模式才能一起显示, 已隐藏其它分组的轨迹",
+                        sticky=3.0)
         else:
             self._visible_ids.discard(route_id)
         self._refresh_eye_icons()

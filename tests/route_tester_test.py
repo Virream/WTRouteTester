@@ -2409,7 +2409,7 @@ def test_cached_map_switch(tmpdir: str):
     app.processEvents()
     picked = [r.route_id for r in win._selection_tracks()]
     assert picked == [rec_a.route_id], picked
-    assert "同一版本" in win.lbl_status.text(), win.lbl_status.text()
+    assert "同一个模式" in win.lbl_status.text(), win.lbl_status.text()
     # 想真正换到 B: 直接点它(清空后选中) —— 基准会跟着换过去
     win.tree.clearSelection()
     app.processEvents()
@@ -2434,6 +2434,95 @@ def test_cached_map_switch(tmpdir: str):
     assert win.map_view.map_key in (key_a, key_b), win.map_view.map_key
     win.close()
     results.append("缓存底图自动切图 + 不跨地图混用 OK")
+
+
+def test_selection_group_mix(tmpdir: str):
+    """多选基准: 同一张图同一个模式的「单条轨迹 + 全局线路」必须能一起选。
+
+    用户 2026-10-26 让查这段。原 bug: `_playable_group()` 对全局线路返回
+    `(g.map_key, g.zone_signature)`(四层树时代的“版本指纹”), 而单条轨迹那边返回
+    `(canon(key), 模式名)` —— 两边口径不同 ⇒ 同图同模式混选时被判成跨分组,
+    一半选中被默默取消, 图钉也永远标不到模式行上。
+    """
+    from wt81111g.map_cache import map_key as mk
+    from wt81111g.route_store import TrackPoint, UnitLife
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "selmix.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.show()
+    app.processEvents()
+
+    blob_a, blob_b = png_solid("#2a4a3a"), png_solid("#4a2a3a")
+    key_a, key_b = mk(blob_a), mk(blob_b)
+
+    def add_route(key: str):
+        rec = win.store.new_route(key, "地图", "T", 0.2, 0.2)
+        rec.points = [TrackPoint(0.2, 0.2, 0.0, 0.0), TrackPoint(0.3, 0.3, 4.0, 30.0)]
+        rec.duration = 4.0
+        # 两条都是「3 战区 = 战区控制」, 但战区坐标不同(大小图) —— 仍是同一分组
+        rec.zone_count, rec.mode_name = 3, "战区控制"
+        rec.zone_signature = "A@0.30,0.70;B@0.50,0.50;C@0.70,0.30"
+        win.store.add(rec)
+        return rec
+
+    rec_a = add_route(key_a)
+    rec_b = add_route(key_b)
+    # 同一张图、同一个模式下的一个全局条目(带 1 条线路)
+    g = win.store.new_global(key_a, "地图", zone_count=3, mode_name="战区控制")
+    life = UnitLife(life_id="L1", icon="T", obj_type="ground_model",
+                    map_key=key_a, side="A")
+    life.points = [TrackPoint(0.2, 0.2, 0.0, 10.0), TrackPoint(0.3, 0.3, 1.0, 10.0)]
+    g.sides["A"].append(life)
+    win.store.add_global(g)
+    win._reload_tree()
+    win.tree.expandAll()
+    app.processEvents()
+
+    # ① 分组口径必须一致(这条断言直接盯住原 bug)
+    assert win._group_of(rec_a) == win._playable_group(life), \
+        (win._group_of(rec_a), win._playable_group(life))
+    assert win._playable_group(life) == (key_a, "战区控制"), win._playable_group(life)
+
+    def find(kind: str, ident: str):
+        for it in win._iter_all_items():
+            if it.data(0, rw._ROLE_KIND) == kind and it.data(0, rw._ROLE_ID) == ident:
+                return it
+        raise AssertionError(f"侧栏里没找到 {kind} {ident}")
+
+    item_a, item_b = find("route", rec_a.route_id), find("route", rec_b.route_id)
+    item_life = find("glife", "L1")
+
+    def picked() -> list[str]:
+        return [getattr(r, "route_id", "") for r in win._selection_playables()]
+
+    # ② 同图同模式的「轨迹 + 全局线路」混选 → 两条都留着, 不弹“只保留一个”
+    win.tree.clearSelection()
+    app.processEvents()
+    win.lbl_status.setText("")
+    item_a.setSelected(True)
+    item_life.setSelected(True)
+    app.processEvents()
+    assert set(picked()) == {rec_a.route_id, "L1"}, picked()
+    assert win._sel_groups == {win._group_of(rec_a)}, win._sel_groups
+    assert "已只保留" not in win.lbl_status.text(), win.lbl_status.text()
+
+    # ③ 再 Ctrl 点别的地图 → 只取消那一条(基准 = 上面那个分组)
+    item_b.setSelected(True)
+    app.processEvents()
+    assert rec_b.route_id not in picked(), picked()
+    assert {rec_a.route_id, "L1"} <= set(picked()), picked()
+    assert "已只保留" in win.lbl_status.text(), win.lbl_status.text()
+
+    # ④ 图钉标在「地图 A · 战区控制」那一行(而不是某个"版本"行)
+    pinned = {(it.data(0, rw._ROLE_ID), it.text(rw._COL_NAME))
+              for it in win._iter_all_items()
+              if it.data(0, rw._ROLE_KIND) == "mode" and not it.icon(0).isNull()}
+    assert pinned == {(key_a, "战区控制")}, pinned
+
+    win.close()
+    results.append("多选基准: 同图同模式的轨迹+全局线路可一起选, 跨图会被拦下 OK")
 
 
 def test_map_manager(tmpdir: str):
@@ -3514,6 +3603,7 @@ def main() -> int:
     test_map_resolution_alias(tmpdir)
     test_map_merge_old_duplicates(tmpdir)
     test_map_duplicate_strict(tmpdir)
+    test_selection_group_mix(tmpdir)
     test_map_smooth_zoom(tmpdir)
     test_zoom_reuses_layer(tmpdir)
     test_zoom_scaled_blit_offset(tmpdir)
