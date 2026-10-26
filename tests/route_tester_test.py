@@ -2049,6 +2049,82 @@ def test_import_wiring(tmpdir: str):
     results.append("导入: 多局走并行分支 / 单局走串行 / 失败照常汇报 OK")
 
 
+def test_column_points(tmpdir: str):
+    """点平时以**列数组**躺着(P3, 2026-10-26): 不物化也要能画对。
+
+    实测 44 万点一局: 逐点造 `TrackPoint` 要 **223 ms**, 列视图只要 **0.2 ms** ——
+    所以从会话文件读出来的点改成列存储, 用到哪个点才现造哪个。
+
+    风险全在“不物化”和“物化”两条路算出来的是不是同一件事, 所以这里逐桶比对:
+    同一条线, 一次走列快路径, 一次先物化成普通 list 再走老路径。
+    """
+    from wt81111g import route_map_view as rmv
+    from wt81111g.route_store import LazyPoints
+
+    path = os.path.join(tmpdir, "cols.json")
+    store = RouteStore(path)
+    rec = store.new_route("AAA", "地图 A", "T", 0.1, 0.1)
+    rec.points = [RoutePoint(0.1 + i * 0.001, 0.2 + (i % 7) * 0.01,
+                             i * 0.5, (i * 7) % 90) for i in range(600)]
+    rec.duration = 300.0
+    store.add(rec)
+    store.save_now()
+
+    again = RouteStore(path)
+    got = again.routes[0]
+    pts = got.points
+    assert isinstance(pts, LazyPoints) and not pts.loaded
+    assert len(pts) == 600                     # 只看点数不该加载
+    cols = pts.columns()
+    # 单条录制带朝向 → FMT_BASE|FMT_DIR = 6 列(t, x, y, speed, dx, dy)
+    assert cols is not None and cols[1].shape[1] == 600, cols
+    assert cols[1].shape[0] == 6, cols[1].shape
+    assert pts.columns() is not None, "取点数/列数组都不该物化"
+    # 单点访问: 现造一个对象, 值要对(float32 在 0~1 附近约 1e-8)
+    assert abs(pts[5].x - (0.1 + 5 * 0.001)) < 1e-6
+    assert abs(pts[-1].speed - ((599 * 7) % 90)) < 1e-3
+    assert pts.columns() is not None, "单点访问不该把整条线物化"
+
+    view = rmv.RouteMapView()
+    # 三个快路径都不物化
+    assert abs(view._vmax(got) - 89.0) < 0.5, view._vmax(got)
+    times = view._times(got)
+    assert len(times) == 600 and abs(times[1] - 0.5) < 1e-6
+    box = view._bbox(got)
+    assert abs(box[0] - 0.1) < 1e-6 and abs(box[3] - 0.26) < 1e-6, box
+    line = view._px_line(got)
+    assert line.size() == 600, line.size()
+    assert pts.columns() is not None, "vmax/时间表/包围盒/折线都不该物化"
+
+    # 分桶几何: 列分支 vs 老路径(先物化)必须**逐桶、逐点**一致
+    vmax = 95.0
+    col_seg = rmv.build_speed_segments(pts, vmax, rmv._normalized)
+    plain = list(pts)                          # 遍历 = 物化(改点才安全)
+    assert pts.columns() is None, "遍历之后就应该退回普通列表"
+    ref_seg = rmv.build_speed_segments(plain, vmax, rmv._normalized)
+    assert sorted(col_seg) == sorted(ref_seg), (sorted(col_seg), sorted(ref_seg))
+    for b in col_seg:
+        pa, pb = col_seg[b], ref_seg[b]
+        assert pa.size() == pb.size(), b
+        for k in range(0, pa.size(), 7):       # 抽样比对(全比也没问题, 抽点快点)
+            assert abs(pa.at(k).x() - pb.at(k).x()) < 1e-6, (b, k)
+            assert abs(pa.at(k).y() - pb.at(k).y()) < 1e-6, (b, k)
+
+    # 写操作仍然生效(物化的意义): “换校准重算坐标”就是这么改点的
+    assert abs(plain[3].x - (0.1 + 3 * 0.001)) < 1e-6
+    target = again.routes[0]
+    for p in target.points:                    # 已经物化了 → 改的是真对象
+        p.x += 0.5
+    again.mark_dirty(target)                   # 点数没变, 得显式标脏(同 renormalize)
+    assert abs(target.points[3].x - (0.6 + 3 * 0.001)) < 1e-6
+    again.save_now()
+    reloaded = RouteStore(path)
+    assert abs(reloaded.routes[0].points[3].x - (0.6 + 3 * 0.001)) < 1e-6, \
+        "改过之后写盘要真的带上新坐标"
+
+    results.append("性能: 点以列数组常驻(不物化也能画对 / 物化后改点能存对) OK")
+
+
 def test_playback_lock(tmpdir: str):
     """回放期间锁定其余功能, 必须点「■ 结束播放」才恢复。
 
@@ -4143,6 +4219,7 @@ def main() -> int:
     test_store_bom(tmpdir)
     test_adopt_and_import_pool(tmpdir)
     test_import_wiring(tmpdir)
+    test_column_points(tmpdir)
     test_recorder(tmpdir)
     test_recorder_placeholder()
     test_start_on_move(tmpdir)

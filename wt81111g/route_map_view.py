@@ -24,6 +24,11 @@ from .route_store import (
 )
 from .zones import BLINK_PERIODS
 
+try:                                    # numpy: 列数组快路径(没有就全走老路)
+    import numpy as _np
+except Exception:                       # pragma: no cover
+    _np = None
+
 log = logging.getLogger("route_map_view")
 
 # 起点/标记/终点配色
@@ -298,6 +303,17 @@ def cursor_dir_points(center: QPointF, ang: float, back: float = CURSOR_DIR_BACK
     return (pt(back), pt(back + length))
 
 
+def _columns_of(points):
+    """`(fmt, 列数组)` 或 None —— 这个点序列是不是**列存储**(见 `route_store._Cols`)。"""
+    cols_of = getattr(points, "columns", None)
+    if not callable(cols_of):
+        return None
+    got = cols_of()
+    if got is None or _np is None:
+        return None
+    return got
+
+
 def build_speed_segments(points: list[RoutePoint], vmax: float,
                          to_px) -> dict[int, QPolygonF]:
     """把轨迹按"线段中点速度"分桶, 每段独立存为"一对点"。
@@ -309,13 +325,51 @@ def build_speed_segments(points: list[RoutePoint], vmax: float,
     实现注意: 先往普通 list 里攒点、最后一次性构造 QPolygonF ——
     比反复 `QPolygonF.append()` 快 2~3 倍(每次 append 都是一次 Python→C++ 调用,
     5 条线 3766 个点原本要 30ms)。
+
+    **列存储的点走 numpy 分支**(2026-10-26): 分桶索引一次 `argsort` 算完,
+    既不为每个点造 `TrackPoint`, 也不调 44 万次 `bucket_index`。
+    实测 44 万点一局: 原本约 700 ms(含造对象 223 ms) → 约 180 ms ——
+    剩下的全是 88 万个 `QPointF` 构造, 那是 Qt 那边的硬成本。
     """
+    cols = _columns_of(points)
+    if cols is not None:
+        return _segments_from_columns(cols[1], vmax)
     tmp: dict[int, list[QPointF]] = {}
     for i in range(1, len(points)):
         a, b = points[i - 1], points[i]
         idx = bucket_index((a.speed + b.speed) / 2.0, vmax)
         tmp.setdefault(idx, []).extend((to_px(a.x, a.y), to_px(b.x, b.y)))
     return {idx: QPolygonF(pts) for idx, pts in tmp.items()}
+
+
+def _segments_from_columns(arr, vmax: float) -> dict[int, QPolygonF]:
+    """列数组 → 速度分桶折线(索引全在 numpy 里算, 只为输出造 `QPointF`)。"""
+    n = int(arr.shape[1])
+    if n < 2:
+        return {}
+    if vmax > 0:
+        ratio = _np.clip(arr[3] / vmax, 0.0, 1.0)
+        mid = (ratio[:-1] + ratio[1:]) * 0.5
+        idx = _np.minimum(_SPEED_BUCKETS - 1,
+                          (mid * _SPEED_BUCKETS).astype(_np.int32))
+    else:
+        idx = _np.zeros(n - 1, dtype=_np.int32)
+    order = _np.argsort(idx, kind="stable")      # 桶内保持原顺序(乱了线会抖)
+    sorted_idx = idx[order]
+    xs, ys = arr[1].tolist(), arr[2].tolist()    # 一次 C 级转换, 之后只查表
+    out: dict[int, QPolygonF] = {}
+    for b in range(_SPEED_BUCKETS):
+        s = int(_np.searchsorted(sorted_idx, b, side="left"))
+        e = int(_np.searchsorted(sorted_idx, b, side="right"))
+        if s >= e:
+            continue
+        pts: list[QPointF] = []
+        ap = pts.append
+        for i in order[s:e].tolist():            # `tolist` 是 C 级的, 比逐元素取值快
+            ap(QPointF(xs[i], ys[i]))
+            ap(QPointF(xs[i + 1], ys[i + 1]))
+        out[b] = QPolygonF(pts)
+    return out
 
 
 class RouteMapView(QWidget):
@@ -1731,6 +1785,13 @@ class RouteMapView(QWidget):
         got = self._vmax_cache.get(rec.route_id)
         if got is not None and got[0] == n:
             return got[1]
+        cols = _columns_of(rec.points)
+        if cols is not None and (got is None or got[0] < n):
+            # 列存储: 第 4 行最大值, 纯 C 算完, **不物化**几十万个点
+            sp = cols[1][3]
+            value = max(float(sp.max()) if sp.size else 0.0, 1.0)
+            self._vmax_cache[rec.route_id] = (n, value)
+            return value
         if got is not None and got[0] < n:
             # 增量: 只看新来的点(单条录制时点数也在涨)
             value = max(got[1], max((p.speed for p in rec.points[got[0]:]), default=0.0))
@@ -1762,7 +1823,14 @@ class RouteMapView(QWidget):
         n = len(rec.points)
         got = self._line_cache.get(rec.route_id)
         if got is None or got[0] != n:
-            got = (n, QPolygonF([QPointF(pt.x, pt.y) for pt in rec.points]))
+            cols = _columns_of(rec.points)
+            if cols is not None:
+                # 列存储: 直接查表造 QPointF, 省掉 44 万个中间点对象
+                xs, ys = cols[1][1].tolist(), cols[1][2].tolist()
+                poly = QPolygonF([QPointF(x, y) for x, y in zip(xs, ys)])
+            else:
+                poly = QPolygonF([QPointF(pt.x, pt.y) for pt in rec.points])
+            got = (n, poly)
             self._line_cache[rec.route_id] = got
         return got[1]
 
@@ -1774,7 +1842,12 @@ class RouteMapView(QWidget):
         n = len(rec.points)
         got = self._times_cache.get(rec.route_id)
         if got is None or got[0] != n:
-            got = (n, [pt.t for pt in rec.points])
+            cols = _columns_of(rec.points)
+            if cols is not None:
+                times = cols[1][0].tolist()      # C 级转换
+            else:
+                times = [pt.t for pt in rec.points]
+            got = (n, times)
             self._times_cache[rec.route_id] = got
         return got[1]
 
@@ -1785,7 +1858,15 @@ class RouteMapView(QWidget):
         if got is not None and got[0] == n:
             return got[1]
         pts = rec.points
-        if pts:
+        cols = _columns_of(pts)
+        if cols is not None:
+            xs, ys = cols[1][1], cols[1][2]
+            if xs.size:
+                box = (float(xs.min()), float(ys.min()),
+                       float(xs.max()), float(ys.max()))
+            else:
+                box = (0.0, 0.0, 0.0, 0.0)
+        elif pts:
             box = (min(p.x for p in pts), min(p.y for p in pts),
                    max(p.x for p in pts), max(p.y for p in pts))
         else:

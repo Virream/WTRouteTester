@@ -68,6 +68,55 @@ SAVE_DEBOUNCE_S = 0.08
 SYNC_SAVE = False
 
 
+class _Cols:
+    """一条线的点, 以**列数组**常驻(只读); 访问单个点时才现造对象。
+
+    `make(t, x, y, speed, dx, dy, hold)` 决定造 `RoutePoint` 还是 `TrackPoint`。
+    为什么要 `float()` 包一层: numpy 的 `float32` **不能**被 `json.dumps` 序列化,
+    万一有人把点拿去写 JSON(旧格式导出/调试)会直接抛错。
+    """
+    __slots__ = ("fmt", "arr", "n", "make")
+
+    def __init__(self, fmt: int, arr, n: int, make):
+        self.fmt, self.arr, self.n, self.make = fmt, arr, n, make
+
+    def at(self, i: int):
+        a = self.arr
+        if i < 0:
+            i += self.n
+        if not 0 <= i < self.n:
+            raise IndexError(f"点下标越界: {i} (共 {self.n} 点)")
+        dx = dy = hold = 0.0
+        if self.fmt & session_store.FMT_DIR:
+            dx, dy = float(a[4][i]), float(a[5][i])
+        if self.fmt & session_store.FMT_HOLD:
+            hold = float(a[-1][i])          # 最后一列一定是 hold
+        return self.make(float(a[0][i]), float(a[1][i]), float(a[2][i]),
+                         float(a[3][i]), dx, dy, hold)
+
+    def to_list(self) -> list:
+        """展开成真的点对象(**要改点之前**才调; 44 万点约 0.2 s)。"""
+        cols = [c.tolist() if hasattr(c, "tolist") else list(c) for c in self.arr]
+        ts, xs, ys, sp = cols[0], cols[1], cols[2], cols[3]
+        if self.fmt & session_store.FMT_DIR:
+            dxs, dys = cols[4], cols[5]
+        else:
+            dxs = dys = None
+        hos = cols[-1] if self.fmt & session_store.FMT_HOLD else None
+        make = self.make
+        if dxs is None and hos is None:
+            return [make(t, x, y, s, 0.0, 0.0, 0.0)
+                    for t, x, y, s in zip(ts, xs, ys, sp)]
+        if hos is None:
+            return [make(t, x, y, s, dx, dy, 0.0)
+                    for t, x, y, s, dx, dy in zip(ts, xs, ys, sp, dxs, dys)]
+        if dxs is None:
+            return [make(t, x, y, s, 0.0, 0.0, h)
+                    for t, x, y, s, h in zip(ts, xs, ys, sp, hos)]
+        return [make(t, x, y, s, dx, dy, h)
+                for t, x, y, s, dx, dy, h in zip(ts, xs, ys, sp, dxs, dys, hos)]
+
+
 class LazyPoints(list):
     """**占位点列表**: 第一次被访问时才真的从会话文件读出来。
 
@@ -75,18 +124,27 @@ class LazyPoints(list):
     `rec.points[...]` / `len(...)` / `for p in ...`, 继承 `list` 之后这些**一行都不用改**,
     也就不会出现“用到点却忘了先加载”(那类 bug 表现为线路画不出来, 极难查)。
 
-    只在 `RouteStore._load()` 里用它顶替真的点列表; 读出来之后就地把数据填充进自己
-    (引用不变), 后面的访问就是普通列表了。
+    **两种存储模式**(2026-10-26, P3):
+
+    * **列模式**(从会话文件读出来): 数据是 `(列, n)` 的 `float32` 数组, 常驻内存,
+      **不造对象**。实测 44 万点一局: 逐点造 `TrackPoint` 要 223 ms, 列视图 0.2 ms。
+      单个点用 `points[i]` 现造; 要**整批**遍历/修改先 `_flat()` 物化(见 `__iter__`)。
+    * **对象模式**(录制中/新建): 就是普通 list 行为。
+
+    快路径给热点消费者用: `columns()` 拿到列数组后, 绘制分桶、回放时间表、
+    包围盒、最高速、保存打包都不用物化(见 `route_map_view.build_speed_segments`、
+    `session_store.pack_points`)。
 
     `loaded` 供界面判断: 侧栏/悬停要的是“点数、首末时刻、最高速”这几项元数据,
     提前存在记录里, 不用为了显示它们把几十万点读进来。
     """
 
-    __slots__ = ("_loader", "loaded")
+    __slots__ = ("_loader", "_col", "loaded")
 
     def __init__(self, loader):
         super().__init__()
         self._loader = loader
+        self._col: _Cols | None = None
         self.loaded = False
 
     def _ensure(self) -> None:
@@ -99,32 +157,71 @@ class LazyPoints(list):
         except Exception:            # noqa: BLE001 - 读坏文件不能把界面炸掉
             log.exception("延迟加载线路点失败")
             data = None
-        if data:
+        if isinstance(data, _Cols):
+            self._col = data         # 列存储: **不搬对象**
+        elif data:
             list.extend(self, data)
 
-    # ---- 读(全部先确保加载)
+    # ---- 列快路径 / 物化
+    def columns(self):
+        """`(fmt, 列数组)`; 不是列存储(或没加载出东西)返回 None。
+
+        调用方**不要缓存**这个返回值 —— 点一旦被改就会物化成对象列表。
+        """
+        self._ensure()
+        col = self._col
+        return (col.fmt, col.arr) if col is not None else None
+
+    def point_count(self) -> int:
+        """点数(列存储时**不物化**)。"""
+        self._ensure()
+        return self._n()
+
+    def _n(self) -> int:
+        col = self._col
+        return col.n if col is not None else list.__len__(self)
+
+    def _flat(self) -> None:
+        """列 → 真点对象。**要改点/排序/比较之前必须调**(否则改的是临时对象)。"""
+        col = self._col
+        if col is not None:
+            self._col = None
+            list.extend(self, col.to_list())
+
+    # ---- 读
     def __len__(self):
         self._ensure()
-        return list.__len__(self)
+        return self._n()
 
     def __iter__(self):
         self._ensure()
+        # 遍历一律物化: 全项目有大量 `for p in points: p.x = ...`(换校准重算),
+        # 若给的是临时对象, 改了不生效且**没有任何报错** —— 那是最难查的一类 bug。
+        self._flat()
         return list.__iter__(self)
 
     def __getitem__(self, key):
         self._ensure()
-        return list.__getitem__(self, key)
+        col = self._col
+        if col is None:
+            return list.__getitem__(self, key)
+        if isinstance(key, slice):
+            return [col.at(i) for i in range(*key.indices(col.n))]
+        return col.at(key)
 
     def __contains__(self, item):
         self._ensure()
+        self._flat()
         return list.__contains__(self, item)
 
     def __reversed__(self):
         self._ensure()
+        self._flat()
         return list.__reversed__(self)
 
     def __eq__(self, other):
         self._ensure()
+        self._flat()
         return list.__eq__(self, other)
 
     def __ne__(self, other):
@@ -132,79 +229,98 @@ class LazyPoints(list):
 
     def __repr__(self):
         self._ensure()
+        self._flat()
         return list.__repr__(self)
 
     def __bool__(self):
         self._ensure()
-        return list.__len__(self) > 0
+        return self._n() > 0
 
     def __add__(self, other):
         self._ensure()
+        self._flat()
         return list.__add__(self, other)
 
     def __radd__(self, other):
         self._ensure()
+        self._flat()
         return list.__radd__(self, other)
 
     def __mul__(self, n):
         self._ensure()
+        self._flat()
         return list.__mul__(self, n)
 
     def __rmul__(self, n):
         self._ensure()
+        self._flat()
         return list.__rmul__(self, n)
 
     def copy(self):
         self._ensure()
+        self._flat()
         return list.copy(self)
 
     def count(self, item):
         self._ensure()
+        self._flat()
         return list.count(self, item)
 
     def index(self, *args):
         self._ensure()
+        self._flat()
         return list.index(self, *args)
 
-    # ---- 写(先加载再改, 否则会把还没读出来的点冲掉)
+    # ---- 写(先物化, 否则会把还没展开的列数据冲掉)
     def __setitem__(self, key, value):
         self._ensure()
+        self._flat()
         list.__setitem__(self, key, value)
 
     def __delitem__(self, key):
         self._ensure()
+        self._flat()
         list.__delitem__(self, key)
 
     def append(self, item):
         self._ensure()
+        self._flat()
         list.append(self, item)
 
     def extend(self, items):
         self._ensure()
+        self._flat()
         list.extend(self, items)
 
     def insert(self, index, item):
         self._ensure()
+        self._flat()
         list.insert(self, index, item)
 
     def pop(self, *args):
         self._ensure()
+        self._flat()
         return list.pop(self, *args)
 
     def remove(self, item):
         self._ensure()
+        self._flat()
         list.remove(self, item)
 
     def clear(self):
+        # 清空不需要物化: 列数据直接丢掉, 结果一样
         self._ensure()
+        self._col = None
         list.clear(self)
 
     def sort(self, *args, **kwargs):
         self._ensure()
+        self._flat()
         list.sort(self, *args, **kwargs)
 
     def reverse(self):
         self._ensure()
+        self._flat()
         list.reverse(self)
 
     def __iadd__(self, other):
@@ -213,7 +329,33 @@ class LazyPoints(list):
 
     def __imul__(self, n):
         self._ensure()
+        self._flat()
         return list.__imul__(self, n)
+
+
+def _vmax_of(pts) -> float:
+    """一条线里的最高速。列存储时直接取第 4 行最大值(**不物化**)。"""
+    cols_of = getattr(pts, "columns", None)
+    if callable(cols_of):
+        got = cols_of()
+        if got is not None:
+            arr = got[1]
+            try:
+                return float(arr[3].max()) if len(arr[3]) else 0.0
+            except (AttributeError, TypeError, ValueError):
+                pass
+    return max((p.speed for p in pts), default=0.0)
+
+
+def _has_hold(pts) -> bool:
+    """这条线要不要 `hold` 列。列存储时看它自带不带(不物化)。"""
+    cols_of = getattr(pts, "columns", None)
+    if callable(cols_of):
+        got = cols_of()
+        if got is not None:
+            return bool(int(got[0]) & session_store.FMT_HOLD)
+    return any(getattr(p, "hold", 0.0) for p in pts)
+
 
 
 def _read_payload(path: str) -> dict | None:
@@ -314,7 +456,7 @@ class RouteRecord:
         if isinstance(pts, LazyPoints) and not pts.loaded:
             return self.vmax_hint
         if not self.vmax_hint:
-            self.vmax_hint = max((p.speed for p in pts), default=0.0)
+            self.vmax_hint = _vmax_of(pts)      # 列存储: 取第 4 行最大值, 不物化
         return self.vmax_hint
 
     @property
@@ -568,7 +710,7 @@ class UnitLife:
         if isinstance(pts, LazyPoints) and not pts.loaded:
             return self.vmax_hint
         if not self.vmax_hint:
-            self.vmax_hint = max((p.speed for p in pts), default=0.0)
+            self.vmax_hint = _vmax_of(pts)      # 列存储: 取第 4 行最大值, 不物化
         return self.vmax_hint
 
     @property
@@ -1072,7 +1214,7 @@ def _pack_route(rec: RouteRecord) -> tuple[dict, list[bytes], list[dict] | None]
         "n": len(pts),
         "fmt": fmt,
         "raw": len(raw),
-        "vmax": round(max((p.speed for p in pts), default=0.0), 1),
+        "vmax": round(_vmax_of(pts), 1),
         "off": 0,
         "clen": len(blob),
     }
@@ -1125,8 +1267,8 @@ def _pack_global(rec: GlobalRecord) -> tuple[dict, list[bytes], list[dict]]:
         for life in rec.sides.get(side) or []:
             pts = life.points
             fmt = session_store.FMT_BASE
-            if any(getattr(p, "hold", 0.0) for p in pts):
-                fmt |= session_store.FMT_HOLD        # 只有静止段折叠过的点才多一列
+            if _has_hold(pts):                  # 只有静止段折叠过的点才多一列
+                fmt |= session_store.FMT_HOLD        # 列存储时看它自带不带, 不物化
             raw = session_store.pack_points(pts, fmt=fmt)
             entry = {
                 "id": life.life_id,
@@ -1143,7 +1285,7 @@ def _pack_global(rec: GlobalRecord) -> tuple[dict, list[bytes], list[dict]]:
                 # 侧栏/悬停要用的元数据(有它就不用为了显示去读点)
                 "t0": round(life.t0, 3),
                 "t1": round(life.t1, 3),
-                "vmax": round(max((p.speed for p in pts), default=0.0), 1),
+                "vmax": round(_vmax_of(pts), 1),
             }
             if life.death_t:
                 entry["death_t"] = round(life.death_t, 2)
@@ -1382,22 +1524,30 @@ class RouteStore:
 
     @staticmethod
     def _load_points(path: str, entry: dict, is_route: bool, dir_len: int = 0):
-        """把一条线路的点块读出来并还原成点对象(`LazyPoints` 第一次访问时调)。"""
+        """把一条线路的点块读出来并还原成**列视图**(`LazyPoints` 第一次访问时调)。
+
+        为什么不再直接造点对象(2026-10-26): 44 万点一局, `unpack_points` 逐点
+        `TrackPoint(...)` 要 **223 ms**, 而 `frombuffer` + reshape 只要 **0.2 ms**。
+        点对象改为**用到才造**(`_Cols.at`), 遍历/修改时再整批物化(`LazyPoints._flat`)。
+        """
         raw = session_store.read_block(path,
                                        int(entry.get("off") or 0),
                                        int(entry.get("clen") or 0),
                                        int(entry.get("raw") or 0),
                                        dir_len)
         if not raw:
-            return []
+            return None
         fmt = int(entry.get("fmt") or session_store.FMT_BASE)
+        n, arr = session_store.unpack_columns(raw, fmt=fmt)
+        if n <= 0 or arr is None:
+            return None
         if is_route:
-            def factory(t, x, y, speed, dx, dy, _hold):
+            def make(t, x, y, speed, dx, dy, _hold):
                 return RoutePoint(x, y, t, speed, dx, dy)
         else:
-            def factory(t, x, y, speed, _dx, _dy, hold):
+            def make(t, x, y, speed, _dx, _dy, hold):
                 return TrackPoint(x, y, t, speed, 0.0, 0.0, hold)
-        return session_store.unpack_points(raw, fmt=fmt, factory=factory)
+        return _Cols(fmt, arr, n, make)
 
     # ------------------------------------------------------------------ 迁移
     def _migrate_legacy(self, data: dict) -> None:

@@ -69,6 +69,11 @@ except Exception:                       # pragma: no cover - 兜底用 zlib
     zstd = None
     import zlib
 
+try:                                    # numpy: 列视图(黑名单主程序本来就依赖它)
+    import numpy as _np
+except Exception:                       # pragma: no cover - 无 numpy 时退回 array 列
+    _np = None
+
 log = logging.getLogger("session_store")
 
 SUFFIX = ".wts"
@@ -134,7 +139,14 @@ def pack_points(points, *, fmt: int) -> bytes:
 
     用 `array("f", map(attrgetter(...), points))` 而不是逐点 `append`: `array` 吃可迭代
     对象时是 **C 级迭代**, 80 万点实测比 Python for 循环快 2~3 倍。
+
+    **列存储的点**(`LazyPoints.columns()`)直接拼字节 —— 不用先物化 44 万个对象。
     """
+    cols_of = getattr(points, "columns", None)
+    if callable(cols_of):
+        got = cols_of()
+        if got is not None and int(got[0]) == int(fmt):
+            return _cols_bytes(got[1])
     n = len(points)
     if not n:
         return b""
@@ -148,6 +160,36 @@ def pack_points(points, *, fmt: int) -> bytes:
     if fmt & FMT_HOLD:
         cols.append(array("f", map(_AG_HOLD, points)))
     return b"".join(col.tobytes() for col in cols)
+
+
+def _cols_bytes(cols) -> bytes:
+    """二维 `(列, n)` 列数组 → 按列拼好的字节(numpy 时是纯 C 的 `tobytes`)。"""
+    if _np is not None and isinstance(cols, _np.ndarray):
+        return _np.ascontiguousarray(cols).tobytes()
+    return b"".join(bytes(c) for c in cols)          # array 列
+
+
+def col_count(fmt: int) -> int:
+    """这个 `fmt` 有几列(见模块说明里的点编码)。"""
+    return 4 + (2 if fmt & FMT_DIR else 0) + (1 if fmt & FMT_HOLD else 0)
+
+
+def unpack_columns(raw: bytes, *, fmt: int):
+    """列式字节 → `(n, 二维 float32 数组 (列, n))`, **不造任何点对象**。
+
+    实测(44 万点一局): 旧的 `unpack_points` 逐点造 `TrackPoint` 要 **223 ms**,
+    而 `frombuffer` + reshape 只要 **0.2 ms** —— 差三个数量级, 因为前者是
+    44 万次 Python 函数调用。所以点平时就以**列数组**躺着, 真要看某一个点
+    (悬停/回放光标)时才现造一个(见 `route_store._Cols.at`)。
+    """
+    n = _point_count(len(raw), fmt)
+    if n <= 0:
+        return 0, None
+    ncol = col_count(fmt)
+    if _np is not None:
+        return n, _np.frombuffer(raw, dtype=_np.float32, count=n * ncol).reshape(ncol, n)
+    step = 4 * n                                 # 无 numpy: 每列一个 array
+    return n, [array("f", raw[i * step:(i + 1) * step]) for i in range(ncol)]
 
 
 def unpack_points(raw: bytes, *, fmt: int, factory) -> list:
