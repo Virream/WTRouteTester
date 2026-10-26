@@ -2199,6 +2199,114 @@ def test_lod_decimation(tmpdir: str):
     results.append("性能: LOD 抽稀只动绘制几何(首末点与速度桶边界保留 / 悬浮仍命中原始点) OK")
 
 
+def test_hover_wheel_step(tmpdir: str):
+    """Shift+滚轮: 在悬停的那条线上**逐点**跳跃(用户 2026-10-26)。
+
+    动机: 想精确读某个点的数据时, 用鼠标挪反而更难控制 —— 相邻两个采样点在屏上
+    常常只差一两个像素。滚轮一格走一个点正好。
+
+    ⚠ 回放中只能读到**已经画出来的**点(已播放前缀): 否则滚轮能“偷看”到
+      玩家还没走到的位置。
+    """
+    from PyQt6.QtCore import QPoint
+
+    from wt81111g import route_map_view as rmv
+
+    class _FakeWheel:
+        """只实现 `wheelEvent` 用到的那几个方法(不需要真 QWheelEvent)。"""
+
+        def __init__(self, dy: int, shift: bool = True):
+            self._dy = dy
+            self._shift = shift
+            self.accepted = False
+
+        def angleDelta(self):                      # noqa: N802 - Qt 命名
+            return QPoint(0, self._dy)
+
+        def modifiers(self):
+            return (Qt.KeyboardModifier.ShiftModifier if self._shift
+                    else Qt.KeyboardModifier.NoModifier)
+
+        def position(self):
+            from PyQt6.QtCore import QPointF
+            return QPointF(400.0, 300.0)
+
+        def accept(self):
+            self.accepted = True
+
+    app = QApplication.instance()
+    path = os.path.join(tmpdir, "wheel.json")
+    store = RouteStore(path)
+    rec = store.new_route("AAA", "地图 A", "T", 0.1, 0.1)
+    n = 200
+    rec.points = [RoutePoint(0.1 + 0.6 * i / (n - 1), 0.1 + 0.3 * i / (n - 1),
+                             i * 0.5, 20.0 + i) for i in range(n)]
+    rec.duration = n * 0.5
+    store.add(rec)
+    store.save_now()
+
+    view = rmv.RouteMapView()
+    view.resize(800, 600)
+    view._pixmap = QPixmap(2048, 2048)
+    view._pixmap.fill()
+    view._map_digest = "wheel-probe"
+    got = RouteStore(path).routes[0]
+    view._visible = [got]
+    w, h = view._map_size()
+    r = view._map_rect()
+
+    # 把鼠标放到第 50 个点上 → 命中它
+    pt0 = got.points[50]
+    hit = view._hit_test(pt0.x * w + r.left(), pt0.y * h + r.top())
+    assert hit is not None and hit[2] == 50, (hit[2] if hit else None)
+    view._set_hover(*hit)
+    app.processEvents()
+    assert "第 51/200 点" in view._hover_text, view._hover_text
+
+    # 下滚 = 后一个点, 上滚 = 前一个点
+    view.wheelEvent(_FakeWheel(-120))
+    assert view._hover_idx == 51, view._hover_idx
+    assert "第 52/200 点" in view._hover_text, view._hover_text
+    view.wheelEvent(_FakeWheel(120))
+    view.wheelEvent(_FakeWheel(120))
+    assert view._hover_idx == 49, view._hover_idx
+    # 真的换成了那个点的数据(时间/速度都跟着变)
+    assert abs(view._hover_pt.t - got.points[49].t) < 1e-9
+    assert abs(view._hover_pt.speed - got.points[49].speed) < 1e-6
+
+    # 滚到两端就停住(不越界、不报错)
+    for _ in range(80):
+        view.wheelEvent(_FakeWheel(120))
+    assert view._hover_idx == 0, view._hover_idx
+    for _ in range(300):
+        view.wheelEvent(_FakeWheel(-120))
+    assert view._hover_idx == n - 1, view._hover_idx
+
+    # **没画出来的点不给读**: 回放进行到第 61 个点时, 滚轮最多到第 60 点
+    view._playback_recs = [got]
+    view._playhead = got.points[60].t
+    view._set_hover(got, got.points[60], 60)
+    for _ in range(50):
+        view.wheelEvent(_FakeWheel(-120))
+    assert view._hover_idx == 60, view._hover_idx
+    assert "第 61/200 点" in view._hover_text, view._hover_text
+    view._playback_recs = []
+    view._playhead = 0.0
+
+    # 没有悬停目标时, Shift+滚轮仍然是**缩放**(不抢原来的手势)
+    view._reset_hover()
+    z0 = view._zoom
+    view.wheelEvent(_FakeWheel(120))
+    assert view._zoom > z0, (z0, view._zoom)
+
+    # 鼠标离开 → 悬停状态下标一起清掉
+    view._set_hover(got, got.points[10], 10)
+    view.leaveEvent(None)
+    assert view._hover_idx is None and view._hover_rec is None
+
+    results.append("悬停: Shift+滚轮逐点跳跃(含回放只能读到已播放处 / 无悬停时仍是缩放) OK")
+
+
 def test_playback_lock(tmpdir: str):
     """回放期间锁定其余功能, 必须点「■ 结束播放」才恢复。
 
@@ -4295,6 +4403,7 @@ def main() -> int:
     test_import_wiring(tmpdir)
     test_column_points(tmpdir)
     test_lod_decimation(tmpdir)
+    test_hover_wheel_step(tmpdir)
     test_recorder(tmpdir)
     test_recorder_placeholder()
     test_start_on_move(tmpdir)

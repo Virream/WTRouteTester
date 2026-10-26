@@ -473,6 +473,9 @@ class RouteMapView(QWidget):
         self._hover_text: str | None = None
         self._hover_rec: RouteRecord | None = None
         self._hover_pt: RoutePoint | None = None
+        # 命中点在**这条线里的下标** —— Shift+滚轮逐点跳跃要用(见 `_step_hover`)。
+        # 没有它就只能拿坐标反查, 而相邻两个点的坐标可能只差 0.5 个像素。
+        self._hover_idx: int | None = None
         self._status = "等待 8111 地图数据…"
         # 视图变换: zoom 相对“适配窗口”, pan 为相对视图中心的像素偏移
         self._zoom = 1.0
@@ -2489,11 +2492,22 @@ class RouteMapView(QWidget):
 
     # ------------------------------------------------------------------ 交互
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        """滚轮缩放: 以鼠标位置为锚点(该点的地图坐标保持不动)。"""
+        """滚轮缩放: 以鼠标位置为锚点(该点的地图坐标保持不动)。
+
+        **按住 Shift**: 不缩放, 而是在悬停的那条线上**逐点跳跃**(见 `_step_hover`)。
+        用户 2026-10-26: 想精确读某个点的数据时, 用鼠标挪反而更难控制(两个采样点
+        在屏上常常只差一两个像素)。
+        """
         if self._pixmap is None:
             return
         delta = event.angleDelta().y()
         if delta == 0:
+            return
+        if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+                and self._hover_rec is not None):
+            # 上滚 = 前一个点, 下滚 = 后一个点
+            self._step_hover(-1 if delta > 0 else 1)
+            event.accept()
             return
         factor = WHEEL_STEP if delta > 0 else 1.0 / WHEEL_STEP
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * factor))
@@ -2552,7 +2566,7 @@ class RouteMapView(QWidget):
             self._set_hover(None, None)
             return
         hit = self._hit_test(event.position().x(), event.position().y())
-        self._set_hover(*(hit or (None, None)))
+        self._set_hover(*(hit or (None, None, None)))
 
     # ------------------------------------------------------------------ 悬停
     def _drawn_records(self) -> list[RouteRecord]:
@@ -2589,7 +2603,7 @@ class RouteMapView(QWidget):
         return out
 
     def _hit_test(self, mx: float, my: float
-                  ) -> tuple[RouteRecord, RoutePoint] | None:
+                  ) -> tuple[RouteRecord, RoutePoint, int] | None:
         """在**所有显示中的轨迹**里找离鼠标最近的采样点(半径见 HOVER_RADIUS)。
 
         以前只看实时轨迹 / 第一条可见轨迹 —— 于是只剩“刚录完那条”有提示,
@@ -2610,7 +2624,7 @@ class RouteMapView(QWidget):
         if w <= 0 or h <= 0:
             return None
         mx, my = mx - r.left(), my - r.top()
-        best: tuple[RouteRecord, RoutePoint] | None = None
+        best: tuple[RouteRecord, RoutePoint, int] | None = None
         best_d2 = HOVER_RADIUS ** 2
         for rec in self._hover_candidates():
             pts = rec.points
@@ -2633,7 +2647,7 @@ class RouteMapView(QWidget):
                 k = int(d2.argmin())
                 k_d2 = float(d2[k])
                 if k_d2 < best_d2:
-                    best_d2, best = k_d2, (rec, pts[k])
+                    best_d2, best = k_d2, (rec, pts[k], k)
                 continue
             step = 1 if n <= 400 else n // 400
             # 粗扫(step == 1 时就是全量)
@@ -2653,7 +2667,7 @@ class RouteMapView(QWidget):
                     if d2 < k_d2:
                         k_d2, k = d2, i
             if k_d2 < best_d2:
-                best_d2, best = k_d2, (rec, pts[k])
+                best_d2, best = k_d2, (rec, pts[k], k)
         return best
 
     def _radius_at(self, pts: list[RoutePoint], idx: int,
@@ -2763,7 +2777,8 @@ class RouteMapView(QWidget):
             text += f" ±{min(spread, 999.0):.0f}%"
         return text
 
-    def _hover_text_for(self, rec: RouteRecord, pt: RoutePoint) -> str:
+    def _hover_text_for(self, rec: RouteRecord, pt: RoutePoint,
+                        idx: int | None = None) -> str:
         """悬停浮层文本。
 
         2026-10-22 用户要求: 不再显示路线**创建时刻**(第一条信息没意义),
@@ -2772,6 +2787,10 @@ class RouteMapView(QWidget):
         1. 车型(录制中的那条额外标注“录制中”);
         2. 鼠标所在位置的用时与速度(毫秒精度, 便于对比微小时差);
         3. 整条路线的用时 + 该处的转弯半径(由朝向变化率反算, 见 `_turn_radius_text`)。
+           用 Shift+滚轮逐点跳跃时, 这行末尾再补上「第 N/M 点」(用户 2026-10-26)——
+           光标不动就换点, 不报个序号会不知道跳到哪了。
+           **M 是整条线的总点数**(不是“现在能读到的点数”): 回放时才播到一半时,
+           用户要能看出“后面还有没走的”。
         """
         short = str(getattr(rec, "short_id", "") or "")
         vehicle = f"车型 {getattr(rec, 'vehicle', '?')}"
@@ -2784,24 +2803,73 @@ class RouteMapView(QWidget):
         turn = self._turn_radius_text(rec, pt)
         if turn:
             tail.append(turn)
+        if idx is not None:
+            tail.append(f"第 {idx + 1}/{len(rec.points)} 点")
         lines.append(" | ".join(tail))
         return "\n".join(lines)
 
-    def _set_hover(self, rec: RouteRecord | None, pt: RoutePoint | None) -> None:
-        """更新悬停状态(文本 + 命中点), 有变化才重画。"""
-        text = None if rec is None or pt is None else self._hover_text_for(rec, pt)
+    def _hover_point_limit(self, rec: RouteRecord) -> int:
+        """此刻**允许读到**的点数: 回放中只到已播放处, 免得读到还没走到的数据。"""
+        n = len(rec.points)
+        if self._playback_recs:
+            n = min(n, self._played_prefix(rec, self._playhead)[0])
+        return max(0, n)
+
+    def _index_of_point(self, rec: RouteRecord, pt: RoutePoint) -> int | None:
+        """点 → 在序列里的下标(时间单调, 二分即可)。"""
+        times = self._times(rec)
+        if not times:
+            return None
+        k = bisect_right(times, pt.t) - 1
+        return max(0, min(len(times) - 1, k))
+
+    def _step_hover(self, step: int) -> bool:
+        """把悬停点前后移 `step` 个**采样点**(Shift+滚轮调)。
+
+        用户 2026-10-26: “有时候想精确读取某一个点的数据, 鼠标指针要动得很细微,
+        有点难控制” —— 相邻两个采样点在屏上常常只差一两个像素, 滚轮一格走一个点
+        正好替代那种微操。
+
+        ⚠ **还没画出来的点不给读**: 回放时上限是已播放前缀(`_hover_point_limit`),
+          与 `_hit_test` 的判据一致 —— 否则滚轮能“偷看”到玩家还没走到的位置。
+        返回是否真的动了(到两端时不动)。
+        """
+        rec, pt = self._hover_rec, self._hover_pt
+        if rec is None or pt is None:
+            return False
+        limit = self._hover_point_limit(rec)
+        if limit <= 0:
+            return False
+        idx = self._hover_idx
+        if idx is None or idx >= limit:
+            idx = self._index_of_point(rec, pt)
+            if idx is None:
+                return False
+        new = min(limit - 1, max(0, idx + step))
+        if new == idx:
+            return False
+        self._set_hover(rec, rec.points[new], new)
+        return True
+
+    def _set_hover(self, rec: RouteRecord | None, pt: RoutePoint | None,
+                   idx: int | None = None) -> None:
+        """更新悬停状态(文本 + 命中点 + 下标), 有变化才重画。"""
+        text = (None if rec is None or pt is None
+                else self._hover_text_for(rec, pt, idx))
         if (text == self._hover_text and rec is self._hover_rec
-                and pt is self._hover_pt):
+                and pt is self._hover_pt and idx == self._hover_idx):
             return
         self._hover_text = text
         self._hover_rec = rec
         self._hover_pt = pt
+        self._hover_idx = idx
         self.update()
 
     def _reset_hover(self) -> None:
         self._hover_text = None
         self._hover_rec = None
         self._hover_pt = None
+        self._hover_idx = None
 
     def _drop_hover_if_gone(self) -> None:
         """命中的那条线被隐藏/换掉、或回放头回退到命中点之前时, 悬停提示不该还留着。
