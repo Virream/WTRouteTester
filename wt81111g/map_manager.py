@@ -53,6 +53,11 @@ COL_KEY, COL_NAME, COL_LEVEL = range(3)
 
 PREVIEW_MIN = (380, 380)
 
+# 「名字」列至少露出这么多个字(用户 2026-10-26: 以前太窄, 「阿拉斯加」被裁成「立斯加」)
+NAME_MIN_CHARS = 5
+# QLineEdit 自身的开销: 边框 + 内边距 + 右侧的清除按钮
+_LINEEDIT_PAD = 46
+
 
 class MapManagerDialog(QDialog):
     """地图身份表: 命名 + 关联回放关卡代号 + 底图预览 + 校准。"""
@@ -88,14 +93,25 @@ class MapManagerDialog(QDialog):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        # 列宽全部按**当前字体**算出来, 换字号/DPI 缩放也不会再把字裁掉:
+        # 键 = 「地图 12_哈希」整串, 关卡代号 = 最长代号 + 下拉箭头;
+        # 名字列是 Stretch, 它的下限靠 `minimumSectionSize` + 表格最小宽度兜住。
+        fm = self.fontMetrics()
+        key_w = fm.horizontalAdvance("地图 12_5f471a16ed6e") + 14
+        level_w = fm.horizontalAdvance("avg_netherlands") + 30
+        self._name_min = fm.horizontalAdvance("测" * NAME_MIN_CHARS) + _LINEEDIT_PAD
         head = self.table.horizontalHeader()
         head.setStretchLastSection(False)
-        head.setSectionResizeMode(COL_KEY, QHeaderView.ResizeMode.Fixed)
+        head.setMinimumSectionSize(self._name_min)     # 拖也拖不到 5 个字以下
+        head.setSectionResizeMode(COL_KEY, QHeaderView.ResizeMode.Interactive)
         head.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
-        head.setSectionResizeMode(COL_LEVEL, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(COL_KEY, 200)
-        self.table.setColumnWidth(COL_LEVEL, 190)
-        body.addWidget(self.table, 3)
+        head.setSectionResizeMode(COL_LEVEL, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(COL_KEY, key_w)
+        self.table.setColumnWidth(COL_LEVEL, level_w)
+        # 表格整体也要够宽, 否则窗口一缩窄, Stretch 的名字列先被挤没
+        self.table.setMinimumWidth(key_w + level_w + self._name_min + 4)
+        self.table.setToolTip("键/关卡代号两列的表头可以拖动调宽; 名字列自动占满剩下的宽度")
+        body.addWidget(self.table, 5)      # 表格 : 预览 = 5 : 3 (以前 3 : 4, 名字列被挤窄)
 
         # ---------------------------------------------------------- 右: 图片预览
         right = QVBoxLayout()

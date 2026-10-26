@@ -2842,6 +2842,21 @@ def test_map_manager(tmpdir: str):
     # ---- 右: 预览跟着选中走 ----
     assert dlg._preview_pm is not None, "选中一条有底图的, 右边就该有预览"
 
+    # ---- 列宽: 名字列至少能露出 5 个字(用户 2026-10-26: 以前「阿拉斯加」被裁成「立斯加」) ----
+    from PyQt6.QtWidgets import QHeaderView
+
+    import wt81111g.map_manager as _mm
+    need = (dlg.fontMetrics().horizontalAdvance("测" * _mm.NAME_MIN_CHARS)
+            + _mm._LINEEDIT_PAD)
+    head = dlg.table.horizontalHeader()
+    assert head.sectionResizeMode(COL_NAME) == QHeaderView.ResizeMode.Stretch, \
+        "名字列要自动占满剩下的宽度"
+    assert head.minimumSectionSize() >= need, \
+        f"名字列最小宽度 {head.minimumSectionSize()} < 5 个字 {need}"
+    assert dlg.table.minimumWidth() >= need
+    # 键与关卡代号两列按内容算, 至少放得下完整的「地图 N_哈希」
+    assert dlg.table.columnWidth(COL_KEY) >= dlg.fontMetrics().horizontalAdvance(key)
+
     # ---- 底部「校准地图位置」: 没选中 → 灰; 选中但**没关联回放关卡** → 也灰 ----
     dlg.table.clearSelection()
     dlg._on_selection_changed()
