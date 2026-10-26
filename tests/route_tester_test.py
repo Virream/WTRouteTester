@@ -2525,6 +2525,92 @@ def test_selection_group_mix(tmpdir: str):
     results.append("多选基准: 同图同模式的轨迹+全局线路可一起选, 跨图会被拦下 OK")
 
 
+def test_implied_selection_marks(tmpdir: str):
+    """Shift 框选把「全局条目」整行框进来时, 它下面的线路行也要看得出“会被回放”。
+
+    用户 2026-10-26 反馈: 按住 Shift 选 4 条, 结果回放播了整局 100 条 —— 因为
+    范围选择顺带选中了「全局 10-26 13:07」那一行(选中全局条目本来就该播整局),
+    而 Qt 只高亮**真正在 selectionModel 里**的条目, 那 100 行一点变化都没有,
+    用户完全看不出自己把整局选进去了。
+
+    现在这些"被动选中"的行手动刷 `palette().highlight()` 背景 + `highlightedText`
+    前景, 视觉上与真选中一致; 不再被动时还原。
+    """
+    from wt81111g.map_cache import map_key as mk
+    from wt81111g.route_store import TrackPoint, UnitLife
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "implied.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.show()
+    app.processEvents()
+
+    key = mk(png_solid("#2a4a3a"))
+    g = win.store.new_global(key, "地图", zone_count=3, mode_name="战区控制")
+    for i, side in enumerate(("A", "B")):
+        for j in range(2):
+            life = UnitLife(life_id=f"L{side}{j}", icon="T", obj_type="ground_model",
+                            map_key=key, side=side)
+            life.points = [TrackPoint(0.2, 0.2, 0.0, 10.0),
+                           TrackPoint(0.3, 0.3, 1.0, 10.0)]
+            g.sides[side].append(life)
+    win.store.add_global(g)
+    win._reload_tree()
+    win.tree.expandAll()
+    app.processEvents()
+
+    def find(kind: str, ident: str):
+        for it in win._iter_all_items():
+            if it.data(0, rw._ROLE_KIND) == kind and it.data(0, rw._ROLE_ID) == ident:
+                return it
+        raise AssertionError(f"侧栏里没找到 {kind} {ident}")
+
+    def marked() -> list:
+        role = Qt.ItemDataRole.BackgroundRole
+        return [it for it in win._iter_life_items()
+                if it.data(rw._COL_NAME, role) is not None]
+
+    lifes = list(win._iter_life_items())
+    assert len(lifes) == 4, len(lifes)
+    assert marked() == [], "一开始没选中任何东西, 不该有标记"
+
+    # ① 选中「全局条目」行 → 它下面 4 条线路全部被标记, 但它们自己**没**被真选中
+    gitem = find("global", g.route_id)
+    gitem.setSelected(True)
+    app.processEvents()
+    assert [it.data(0, rw._ROLE_ID) for it in marked()] == \
+        [it.data(0, rw._ROLE_ID) for it in lifes], \
+        [it.data(0, rw._ROLE_ID) for it in marked()]
+    # 两个「A 队 / B 队」行 + 四条线路行 —— 它们都被 global 行带进了回放范围
+    assert len(win._implied_items) == 6, len(win._implied_items)
+    assert {id(it) for it in lifes} <= {id(it) for it in win._implied_items}
+    assert all(not win._is_item_selected(it) for it in lifes), "被动标记 ≠ 真选中"
+    assert len(win._selection_lives()) == 4, "仍然按“整局 4 条”回放"
+
+    # ② 只选一条线路 → 它自己由 Qt 高亮, 不再算“被动”; 其余三条不该有标记
+    win.tree.clearSelection()
+    app.processEvents()
+    assert marked() == [], "清空选中后标记要跟着清掉"
+    one = lifes[1]
+    one.setSelected(True)
+    app.processEvents()
+    assert win._implied_items == [], win._implied_items
+    assert marked() == [], "单条选中由 Qt 自己高亮, 不该再刷一层"
+
+    # ③ 分组行(地图 / 模式 / A·B 队)本来就不允许选中 —— 只有「全局条目」行和线路行
+    #    可以被框选, 所以“被动选中”只可能来自那一个全局条目行(这也解释了用户的现象)。
+    for it in win._iter_all_items():
+        if it.data(0, rw._ROLE_KIND) in ("map", "mode", "gside"):
+            assert not (it.flags() & Qt.ItemFlag.ItemIsSelectable), \
+                it.text(rw._COL_NAME)
+    assert find("global", g.route_id).flags() & Qt.ItemFlag.ItemIsSelectable, \
+        "全局条目行本身是可选的"
+
+    win.close()
+    results.append("侧栏: 被动选中的全局线路行也显示选中高亮 OK")
+
+
 def test_map_manager(tmpdir: str):
     """地图管理: 左边键值对(哈希→名字, 可选=回放关卡代号) + 右边底图预览。
 
@@ -3604,6 +3690,7 @@ def main() -> int:
     test_map_merge_old_duplicates(tmpdir)
     test_map_duplicate_strict(tmpdir)
     test_selection_group_mix(tmpdir)
+    test_implied_selection_marks(tmpdir)
     test_map_smooth_zoom(tmpdir)
     test_zoom_reuses_layer(tmpdir)
     test_zoom_scaled_blit_offset(tmpdir)

@@ -162,6 +162,9 @@ class RouteTesterWindow(QMainWindow):
         # 选中集合(决定回放播哪几条; 用于判断“本次新加进来的是哪张地图”)
         self._sel_ids: set[str] = set()
         self._sel_groups: set[tuple[str, str]] = set()
+        # “被父项带进选中范围”的条目(全局条目/A·B 队行被选中时的子行):
+        # 它们会被回放, 但 Qt 不会给它们高亮 → 手动刷选中色(见 _refresh_implied_marks)
+        self._implied_items: list[QTreeWidgetItem] = []
         # “基准模式”: 双击某条轨迹后, 它的(地图键, 模式名)被锁为基准 ——
         # 之后多选/回放只能在同一地图同一模式内进行
         # (见 _group_of / _playable_group / _on_tree_selection_changed)
@@ -1115,6 +1118,7 @@ class RouteTesterWindow(QMainWindow):
         # 之后都会走这里重建侧栏, 否则用户刚折起来的分组会被全部重新展开。
         folded = self._folded_keys()
         first_build = not getattr(self, "_tree_built", False)   # 刚启动的那一次
+        self._implied_items = []        # 旧条目马上要被 tree.clear() 删掉
         self.tree.blockSignals(True)
         self.tree.clear()
         alive: set[str] = set()          # 仍存在于侧栏的轨迹 id(用于修剪显示集合)
@@ -1575,6 +1579,52 @@ class RouteTesterWindow(QMainWindow):
                         return life
         return None
 
+    def _implied_by_ancestor(self, item: QTreeWidgetItem) -> bool:
+        """该条目**自己没被选中**, 但祖先(全局条目 / A·B 队行)在选中范围里。
+
+        `_selection_lives()` 与 `_refresh_implied_marks()` 共用这一条判据 ——
+        “会被算进待回放”与“要画成选中”必须是同一套逻辑, 否则界面又会骗人。
+        """
+        node: QTreeWidgetItem | None = item.parent()
+        while node is not None:
+            if (self._is_item_selected(node)
+                    and node.data(0, _ROLE_KIND) in ("glife", "gside", "global")):
+                return True
+            node = node.parent()
+        return False
+
+    def _refresh_implied_marks(self) -> None:
+        """把“被父项带进选中范围”的条目也画成选中高亮(用户 2026-10-26)。
+
+        **问题**: Shift 框选很容易把「全局 10-26 13:07」整行框进来 —— 于是回放播的
+        是整局 100 条, 而用户以为只选了 4 条。这本身不是 bug(选中全局条目就该播整局),
+        真正的问题是 Qt 只高亮**真正在 selectionModel 里**的条目: 父项被选中时,
+        下面几十行“也会被回放”的线路一点变化都没有。
+
+        **做法**: 这些行手动刷 `palette().highlight()` 背景 + `highlightedText` 前景,
+        与真选中视觉上一致; 不再是“被动选中”时把这两个 role 清掉(还原默认)。
+        用 `_implied_items` 记住上一批, 只清那一批 —— 不必每次重刷整棵树。
+        """
+        for it in self._implied_items:          # 先还原上一批
+            try:
+                for col in (_COL_NAME, _COL_INFO):
+                    it.setData(col, Qt.ItemDataRole.BackgroundRole, None)
+                    it.setData(col, Qt.ItemDataRole.ForegroundRole, None)
+            except RuntimeError:
+                pass        # 树已经重建/条目被删 → 旧的 C++ 对象不存在了
+        self._implied_items = []
+        pal = self.palette()
+        bg, fg = QBrush(pal.highlight()), QBrush(pal.highlightedText())
+        for it in self._iter_all_items():
+            if it.data(0, _ROLE_KIND) not in ("global", "gside", "glife"):
+                continue
+            if self._is_item_selected(it) or not self._implied_by_ancestor(it):
+                continue        # 自己选中的本来就有高亮; 没有被祖先带进来的不用管
+            for col in (_COL_NAME, _COL_INFO):
+                it.setData(col, Qt.ItemDataRole.BackgroundRole, bg)
+                it.setData(col, Qt.ItemDataRole.ForegroundRole, fg)
+            self._implied_items.append(it)
+
     def _selection_lives(self) -> list:
         """侧栏中选中的**全局线路**(按侧栏顺序)。
 
@@ -1587,13 +1637,7 @@ class RouteTesterWindow(QMainWindow):
         于是明明取消掉的其它地图的线路还在选中集合里。
         """
         def hit(item: QTreeWidgetItem) -> bool:
-            node: QTreeWidgetItem | None = item
-            while node is not None:
-                if (self._is_item_selected(node)
-                        and node.data(0, _ROLE_KIND) in ("glife", "gside", "global")):
-                    return True
-                node = node.parent()
-            return False
+            return self._is_item_selected(item) or self._implied_by_ancestor(item)
 
         out: list = []
         for it in self._iter_life_items():
@@ -1689,6 +1733,7 @@ class RouteTesterWindow(QMainWindow):
             self._sel_ids = set()
             self._sel_groups = set()
             self._update_play_label()
+            self._refresh_implied_marks()   # 清空选中时把“被动选中”的底色也清掉
             self._refresh_map_tracks()   # 选中全局线路时也要把高亮刷出来
             return                       # 清空选中时保留基准(图钉不消失)
         groups = {self._playable_group(r) for r in playables}
@@ -1733,6 +1778,7 @@ class RouteTesterWindow(QMainWindow):
             self._anchor = grp          # 基准跟着当前选中走
             self._refresh_anchor_icon()
         self._update_play_label()
+        self._refresh_implied_marks()   # 父项选中 → 子行也要看得出“会被回放”
         self._refresh_map_tracks()      # 高亮层 = 选中的那几条 → 选中变了要重画
 
     def _on_tree_double_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
@@ -1763,6 +1809,7 @@ class RouteTesterWindow(QMainWindow):
         finally:
             self._reselecting = False
         self._sel_ids = {rec.route_id}
+        self._refresh_implied_marks()   # 双击把选中收缩到一条 → 旧的全选高亮要清掉
         self._refresh_anchor_icon()
         self._update_play_label()
         # 双击同时就把它显示出来(自动隐掉其它版本), 并把底图切到它的地图
