@@ -961,10 +961,11 @@ class RouteMapView(QWidget):
             # 其余内容都画在“地图本地坐标”里(见 _to_px) → 平移只动画笔, 不改几何缓存
             self._paint_dpr = p.device().devicePixelRatio() or 1.0
             p.translate(r.left(), r.top())
-            # 层次(底 → 顶): 底图 → 轨迹/回放 → 标记与光标 → **机场跑道 → 重生方块
-            # → 战区** → 玩家位置 → 悬浮信息。
-            # 战区和重生方块都是“地图标记”, 必须压在线路之上 —— 以前它们画在轨迹
-            # **之下**, 线路密的地方菱形直接被盖住看不见(用户 2026-10-26)。
+            # 层次(底 → 顶): 底图 → **机场跑道 → 重生方块 → 轨迹/回放** → 标记与光标
+            # → **战区** → 玩家位置 → 悬浮信息。
+            # 只有**战区**在轨迹之上(用户 2026-10-26): 菱形 + A/B/C 字母被线路压住就
+            # 没用了。机场跑道与重生方块属于“地形”(淡填充 / 空心框, 本来就不挡线路),
+            # 压在线上反而碍事 —— 它们跟轨迹一起进缓存层(见 `_draw_tracks`)。
             if self._playback_recs:
                 # 回放: 未播放底衬 + 已播放着色段都在**累加层**里, 每帧只补新段;
                 # 标记与光标每帧现画(几个圈, 便宜)
@@ -997,12 +998,8 @@ class RouteMapView(QWidget):
                     layer_live, live_scale = got
                     self._blit_layer(p, layer_live, self._live_anchor, live_scale,
                                      self._live_margin)
-            # 地图标记压在线路之上: 战区几个菱形 + 重生方块(已按归属色合成路径并缓存),
-            # 每帧现画不到 0.1ms; 战区还要闪烁, 本来也进不了缓存层。
-            # 先方块后菱形: 菱形带字母、信息量大, 重叠时让它在上。
-            self._draw_airfields(p)
-            if self._show_spawns:
-                self._draw_spawns(p)
+            # 战区画在轨迹之上: 几个菱形, 每帧现画不到 0.05ms(它还要闪烁, 本来也
+            # 进不了缓存层)。重生方块与机场跑道不在这里 —— 它们在轨迹层里(见下面)。
             self._draw_zones(p)
 
             self._draw_player(p)
@@ -1071,10 +1068,15 @@ class RouteMapView(QWidget):
         p.drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5))
 
     def _draw_tracks(self, p: QPainter) -> None:
-        """轨迹层内容: 轨迹(含时间标签)。
+        """轨迹层内容: 机场跑道 + 重生位置 + 轨迹(含时间标签)。
 
-        重生位置与战区**不在这里**画 —— 它们要压在轨迹之上, 见 `_paint()`。
+        **只有战区**不在这一层 —— 它要压在轨迹之上, 见 `_paint()`。
+        机场跑道与重生方块放在最前面(先画 = 在下面): 它们是地形信息, 不该盖住线路。
         """
+        if self._show_airfields:
+            self._draw_airfields(p)
+        if self._show_spawns:
+            self._draw_spawns(p)
         # 显示中的轨迹: 灰色普通层 + 高亮层(选中的/正在录的)
         hi = list(self._highlight)
         if self._live is not None and all(r is not self._live for r in hi):
@@ -1405,7 +1407,7 @@ class RouteMapView(QWidget):
         return (abs(r.left() - anchor[0]) > mx or abs(r.top() - anchor[1]) > my)
 
     def _tracks_key(self) -> tuple:
-        """轨迹层的内容指纹(点数/标记数/回放进度/重生方块都在内)。
+        """轨迹层的内容指纹(点数/标记数/回放进度/机场跑道/重生方块都在内)。
 
         **不含几何**(缩放/窗口尺寸)与平移 —— 几何变化走“先缩放贴旧层”那条路
         (见 `_layer_tracks`), 只有内容真的变了才值得在 Python 里重画一遍。
@@ -1418,7 +1420,9 @@ class RouteMapView(QWidget):
         return (sig(self._visible), sig(self._highlight),
                 (live.route_id, len(live.points), len(live.marks)) if live else None,
                 sig(self._playback_recs),
-                round(self._playhead, 3) if self._playback_recs else None)
+                round(self._playhead, 3) if self._playback_recs else None,
+                self._show_spawns, self._spawns_ver,
+                self._show_airfields, self._airfield_ver)
 
     def _build_track_layer(self) -> None:
         """(重)建轨迹层, 并记下建层时的几何/尺寸(之后缩放要按比例贴)。"""
@@ -1553,13 +1557,15 @@ class RouteMapView(QWidget):
         阵亡那一刻触发一次重建(与回拖重建同量级)。
         """
         return (tuple(r0.route_id for r0 in self._playback_recs),
+                self._show_spawns, self._spawns_ver,
+                self._show_airfields, self._airfield_ver,
                 tuple(r.route_id for r in self._playback_recs
                       if self._dead_now(r, self._playhead)))
 
     def _draw_play_static(self, p: QPainter) -> None:
-        """回放累加层的初始内容: 已播放前缀(+ 阵亡后要变暗的整条灰)。
+        """回放累加层的初始内容: 机场跑道 + 重生位置 + 已播放前缀(+ 阵亡后的整条灰)。
 
-        重生位置不在这里 —— 它要压在轨迹之上, 见 `_paint()`。
+        战区不在这里 —— 它要压在轨迹之上, 见 `_paint()`。
 
         2026-10-22 改动(用户要求): 回放**不再画未播放的全长底衬** —— 以前一按播放
         就看得到所有线路的整条灰影。现在:
