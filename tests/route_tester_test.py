@@ -1996,6 +1996,56 @@ def test_adopt_and_import_pool(tmpdir: str):
     results.append("导入: 接管子进程写好的会话文件 + 并行度/发号/校准表 OK")
 
 
+def test_import_wiring(tmpdir: str):
+    """两局以上导入必须真的走**并行分支**(那段代码平时没机会被执行到)。
+
+    这里把 `import_pool.import_many` 换成假的(真并行要几局真实回放, 而读游戏文件
+    是禁止的), 只验证接线: 局数、`expect_server` 有没有传对、进度框会不会卡住、
+    结果有没有交给汇总弹框。真正的解析/提速用 `tools\\probe_import_parallel.py`。
+    """
+    import PyQt6.QtWidgets as qw
+
+    from wt81111g import import_pool
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "par.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.sys_hotkeys.stop()
+    app.processEvents()
+
+    seen: dict = {}
+    real_many = import_pool.import_many
+
+    def fake_many(paths, store, *, expect_server, progress, log_path=""):
+        seen["n"] = len(paths)
+        seen["api"] = expect_server
+        seen["store"] = store
+        assert log_path.endswith(".log") or log_path == "", log_path
+        return [], [("假的.wrpl", "故意失败")], False
+
+    real_info = qw.QMessageBox.information
+    import_pool.import_many = fake_many
+    qw.QMessageBox.information = staticmethod(
+        lambda *a, **k: qw.QMessageBox.StandardButton.Ok)
+    try:
+        win._import_replay_many(["甲.wrpl", "乙.wrpl"], expect_server=False)
+        assert seen.get("n") == 2, f"两局该走并行分支, 实际 {seen}"
+        assert seen.get("api") is False, "expect_server 要透传(本地回放)"
+        assert seen.get("store") is win.store, "结果要落进同一个 store"
+        assert "失败 1" in win.lbl_status.text(), win.lbl_status.text()
+
+        # 单局仍然走串行路径(它能报“分片 3/24”这种细进度), 不该进并行分支
+        seen.clear()
+        win._import_replay_many(["丙.wrpl"], expect_server=False)
+        assert not seen, "单局不该走并行分支"
+    finally:
+        import_pool.import_many = real_many
+        qw.QMessageBox.information = real_info
+
+    results.append("导入: 多局走并行分支 / 单局走串行 / 失败照常汇报 OK")
+
+
 def test_playback_lock(tmpdir: str):
     """回放期间锁定其余功能, 必须点「■ 结束播放」才恢复。
 
@@ -4089,6 +4139,7 @@ def main() -> int:
     test_store(tmpdir)
     test_store_bom(tmpdir)
     test_adopt_and_import_pool(tmpdir)
+    test_import_wiring(tmpdir)
     test_recorder(tmpdir)
     test_recorder_placeholder()
     test_start_on_move(tmpdir)
