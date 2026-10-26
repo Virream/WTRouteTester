@@ -225,6 +225,53 @@ def main() -> int:
           replay.norm_rect == [0.0, 2048.0, 0.0, 2048.0], f"={replay.norm_rect}")
     dlg2.close()
 
+    print("\n--- 9) 一个关卡代号只能归一张图(被占用的变灰, 不是消失) ---")
+    other = "0fc34e933121"
+    cache.put(other, make_png("#884455"))
+    store.remember_map(other)
+    store.rename_map(other, "荷兰")
+    store.set_map_level(HASH_KEY, LEVEL)        # 芬兰那张占着 avg_finland
+
+    dlg3 = MapManagerDialog(store, cache)
+
+    def combo_of(k: str):
+        r = next(rr for rr in range(dlg3.table.rowCount())
+                 if dlg3.table.item(rr, COL_KEY).data(Qt.ItemDataRole.UserRole) == k)
+        return dlg3.table.cellWidget(r, COL_LEVEL)
+
+    def items(k: str) -> list[str]:
+        c = combo_of(k)
+        return [c.itemData(i) for i in range(c.count())]
+
+    def enabled_of(k: str, level: str) -> bool:
+        c = combo_of(k)
+        return c.model().item(c.findData(level)).isEnabled()
+
+    check("两行都在列表里", dlg3.table.rowCount() == 2, f"rows={dlg3.table.rowCount()}")
+    check("自己占的代号可用", enabled_of(HASH_KEY, LEVEL))
+    check("别人占的代号**仍然列出来**(不藏)", LEVEL in items(other), f"={items(other)}")
+    check("但它是灰的、点不了", not enabled_of(other, LEVEL))
+    tip = combo_of(other).model().item(combo_of(other).findData(LEVEL)).toolTip()
+    check("提示里写明被谁用了", "芬兰" in tip, f"={tip!r}")
+    check("没人占的代号两边都能选",
+          enabled_of(HASH_KEY, WRONG_LEVEL) and enabled_of(other, WRONG_LEVEL))
+
+    # 在另一行把它选走 → 本行那个项要立刻变灰
+    cb = combo_of(other)
+    cb.setCurrentIndex(cb.findData(WRONG_LEVEL))
+    app.processEvents()
+    check("另一行选走后, 本行里它变灰了", not enabled_of(HASH_KEY, WRONG_LEVEL))
+    check("两行各占一个, 互不干扰",
+          store.level_of_hash(HASH_KEY) == LEVEL
+          and store.level_of_hash(other) == WRONG_LEVEL,
+          f"={store.level_of_hash(HASH_KEY)!r},{store.level_of_hash(other)!r}")
+
+    # 释放回来 → 本行又能选
+    cb.setCurrentIndex(cb.findData(""))
+    app.processEvents()
+    check("解除后本行又能选了", enabled_of(HASH_KEY, WRONG_LEVEL))
+    dlg3.close()
+
     print("\n" + ("全部通过" if not fails else f"失败 {len(fails)} 项: {fails}"))
     return 0 if not fails else 1
 

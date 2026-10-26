@@ -23,7 +23,7 @@ import logging
 from functools import partial
 
 from PyQt6.QtCore import QSize, Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QPixmap, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
@@ -153,9 +153,8 @@ class MapManagerDialog(QDialog):
         self._loading = True
         try:
             self.table.setRowCount(0)
-            levels = self.store.level_choices()
             for key in self._row_keys():
-                self._add_row(key, levels)
+                self._add_row(key)
         finally:
             self._loading = False
         row = self._row_of_key(keep) if keep else -1
@@ -175,7 +174,7 @@ class MapManagerDialog(QDialog):
                 return r
         return -1
 
-    def _add_row(self, key: str, levels: list[str]) -> None:
+    def _add_row(self, key: str) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.table.setRowHeight(row, 34)
@@ -198,20 +197,81 @@ class MapManagerDialog(QDialog):
 
         # ---- 可选: 回放关卡代号(下拉框, 随时可改 = 可逆) ----
         combo = QComboBox()
-        combo.addItem("未选择", "")
-        for lv in levels:
-            combo.addItem(lv, lv)
+        model = QStandardItemModel(combo)
         cur = self.store.level_of_hash(key)
-        if cur and cur not in levels:            # 关联的代号已经不在库里了
-            combo.addItem(f"{cur}(已无记录)", cur)
-        idx = combo.findData(cur)
-        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        for label, data, enabled, tip in self._level_rows(key):
+            it = QStandardItem(label)
+            it.setData(data, Qt.ItemDataRole.UserRole)
+            it.setEnabled(enabled)
+            if tip:
+                it.setToolTip(tip)
+            model.appendRow(it)
+        combo.setModel(model)
+        combo.setCurrentIndex(max(0, combo.findData(cur)))
         combo.setToolTip(
             "这张图对应回放文件里的哪个关卡代号?\n"
             "选中之后, 那个关卡的线路就会挂到这张图下面, 用这张图的底图与校准。\n"
+            "一个关卡代号只能给一张图用 —— 已经被别的地图选走的会变灰, 点不了。\n"
             "选错了直接改 —— 数据不会丢。")
         combo.currentIndexChanged.connect(partial(self._apply_level, key, combo))
         self.table.setCellWidget(row, COL_LEVEL, combo)
+
+    def _level_rows(self, key: str) -> list[tuple[str, str, bool, str]]:
+        """这一行下拉框该有哪些项 —— `[(显示文字, 存的值, 能不能选, 提示)]`。
+
+        一个关卡代号只能归一张图: 已经被**别的**地图选走的仍然列出来, 但**变灰点不
+        了**并注明被谁用了。不直接藏掉的原因(用户 2026-10-26): 突然少一项会让人
+        以为软件坏了 / 自己看错了。
+        本行自己当前选着的那个当然可用(否则就没法改成别的了)。
+        """
+        cur = self.store.level_of_hash(key)
+        taken: dict[str, str] = {}
+        for hk, lv in self.store.map_levels.items():
+            if hk != key and lv:
+                taken.setdefault(lv, hk)
+        rows: list[tuple[str, str, bool, str]] = [("未选择", "", True, "")]
+        for lv in self.store.level_choices():
+            if lv in taken:
+                owner = self.store.display_name(taken[lv])
+                rows.append((lv, lv, False,
+                             f"已经被「{owner}」用了 —— 一个关卡代号只能归一张图"))
+            else:
+                rows.append((lv, lv, True, ""))
+        # 极端情况: 自己选着的那个已经不在库里了(记录被删?) —— 也要能显示出来
+        if cur and all(data != cur for _label, data, _ok, _t in rows):
+            rows.append((cur, cur, True, "这个关卡代号已经没有对应的回放记录了"))
+        return rows
+
+    def _refresh_level_choices(self) -> None:
+        """关联变了 → 把**其它行**的下拉列表里的可用性重算一遍(被占走的变灰)。
+
+        只改 `enabled` / tooltip, 不重建 model: 不抢焦点、不丢当前选中、
+        也不会把底部的提示文字盖掉。
+        """
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, COL_KEY)
+            combo = self.table.cellWidget(r, COL_LEVEL)
+            if it is None or not isinstance(combo, QComboBox):
+                continue
+            key = it.data(Qt.ItemDataRole.UserRole)
+            if not key:
+                continue
+            model = combo.model()
+            if not isinstance(model, QStandardItemModel):
+                continue
+            blocked = combo.blockSignals(True)
+            try:
+                for _label, data, enabled, tip in self._level_rows(key):
+                    idx = combo.findData(data)
+                    row = model.item(idx) if idx >= 0 else None
+                    if row is None:
+                        continue
+                    if row.isEnabled() != enabled:
+                        row.setEnabled(enabled)
+                    if row.toolTip() != tip:
+                        row.setToolTip(tip)
+            finally:
+                combo.blockSignals(blocked)
 
     def _update_summary(self) -> None:
         n = self.table.rowCount()
@@ -337,6 +397,8 @@ class MapManagerDialog(QDialog):
                 f"已解除关联: {shown} 不再对应回放关卡 {old}")
         log.info("地图管理: %s 的关卡代号 %r -> %r (重算 %d 条)",
                  key, old, level, renum)
+        # 其它行的下拉列表跟着变: 被本行拿走的代号不该再出现在别处
+        self._refresh_level_choices()
         self._update_preview()
         self._update_summary()
 
