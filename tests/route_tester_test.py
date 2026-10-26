@@ -2225,6 +2225,68 @@ def test_map_merge_old_duplicates(tmpdir: str):
     results.append("地图缓存: 启动时合并历史重复条目 OK")
 
 
+def test_map_duplicate_strict(tmpdir: str):
+    """启动时的合并判定要比运行时**更严**: 双向 + 全员 + 带最近邻余量。
+
+    用户 2026-10-26 要求收紧。启动时的合并会改 `routes.json`(有 .bak)、还会**删掉**
+    多余的图片文件, 所以宁可少合也不能错合。
+
+    `group_same` 是纯函数, 用实测数字直接钉住语义(不用造图):
+    * 同图: 灰度 ≤0.60 / 汉明 ≤372; 不同图: 灰度 ≥11.97; 同一张图的不同区域: 2.91 / 1776
+    * 余量闸: 次近的那张必须 ≥ `SAME_IMAGE_TOL × SAME_IMAGE_MARGIN` = 2.4
+    """
+    from wt81111g.map_cache import (
+        SAME_IMAGE_HAMMING, SAME_IMAGE_MARGIN, SAME_IMAGE_TOL,
+        group_same, looks_same, map_key,
+    )
+
+    margin = SAME_IMAGE_TOL * SAME_IMAGE_MARGIN
+    assert abs(margin - 2.4) < 1e-9, margin
+
+    # ① 缓存里只有这两张(两边都没有"次近") → 认
+    assert group_same(0.4, 241, None, None) is True
+    # ② A 这边没有更像的, B 那边另有一张更近的 → **B 不认 A**, 一律不合并
+    assert looks_same(0.4, 241, None) is True, "单看 A 侧会误合(这正是要堵的)"
+    assert group_same(0.4, 241, None, 1.0) is False
+    assert group_same(0.4, 241, 1.0, None) is False, "双向, 反过来也一样"
+    # ③ 两边都有明确的次近(都过了余量) → 认
+    assert group_same(0.4, 241, margin, 3.1) is True
+    assert group_same(0.4, 241, margin, margin) is True
+    # ④ 两道硬闸对两侧同时生效
+    assert group_same(SAME_IMAGE_TOL + 0.1, 10, None, None) is False
+    assert group_same(0.4, SAME_IMAGE_HAMMING + 1, None, None) is False
+    # ⑤ 最危险的一档: 同一张大地图的两个不同区域(灰度像、纹理不像)
+    assert group_same(0.8, 1700, None, None) is False
+    assert group_same(2.91, 1776, None, None) is False
+
+    # ---- 分组是"全员"而不是"和第一个像就行": 链式 A~B、B~C 不能把 A、C 并进来。
+    # 造三张图: base(256) 与它的 128 版是真的同一张; shift 版只改颜色, 换 `size`
+    # 会改内容 → 用两张 shift 相同、size 不同的图当"同图", 再用 shift 不同的当"另一张"。
+    from wt81111g.map_cache import MapCache
+
+    cache = MapCache(os.path.join(tmpdir, "strict"))
+    same_a, same_b = png_pattern(256), png_pattern(128)
+    other = png_pattern(256, shift=4)
+    # 直接写文件绕过 save() 的归并, 模拟"老版本留下的两个键"
+    for blob in (same_a, same_b, other):
+        with open(os.path.join(cache.dir, f"{map_key(blob)}.png"), "wb") as fh:
+            fh.write(blob)
+    cache.refresh_index()
+    groups = cache.duplicate_groups()
+    assert len(groups) == 1, groups
+    assert set(groups[0]) == {map_key(same_a), map_key(same_b)}, groups
+    assert map_key(other) not in groups[0], "颜色不同的那张不能并进来"
+
+    # 只有一张图时没有组可言(不抛异常)
+    lonely = MapCache(os.path.join(tmpdir, "strict1"))
+    with open(os.path.join(lonely.dir, f"{map_key(same_a)}.png"), "wb") as fh:
+        fh.write(same_a)
+    lonely.refresh_index()
+    assert lonely.duplicate_groups() == []
+
+    results.append("地图缓存: 启动时合并按双向+全员+余量判定 OK")
+
+
 def test_map_smooth_zoom(tmpdir: str):
     """滚轮放大用的是**平滑(双线性)**缩放; 关掉它画面应明显不同(台阶/马赛克)。
 
@@ -3451,6 +3513,7 @@ def main() -> int:
     test_map_cache(tmpdir)
     test_map_resolution_alias(tmpdir)
     test_map_merge_old_duplicates(tmpdir)
+    test_map_duplicate_strict(tmpdir)
     test_map_smooth_zoom(tmpdir)
     test_zoom_reuses_layer(tmpdir)
     test_zoom_scaled_blit_offset(tmpdir)

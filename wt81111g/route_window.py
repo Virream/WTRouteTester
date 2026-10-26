@@ -1342,8 +1342,12 @@ class RouteTesterWindow(QMainWindow):
 
         8111 同一张地图会以 1024²/2048²/4096² 不同分辨率发出(实测), 老版本按字节
         哈希当地图身份 → 同一张图被当成两张(2026-10-09 用户反馈)。
-        `MapCache.merge_duplicates` 会按“缩到 64×64 灰度后的平均差”认出来,
-        并把轨迹/名字/战区布局并到保留的那个键上(会先备份 routes.json)。
+        `MapCache.merge_duplicates` 会按“缩到 64×64 灰度 + 结构哈希”认出来,
+        并把轨迹/名字/战区布局/校准并到保留的那个键上(会先备份 routes.json)。
+
+        ⚠ 判定比运行时写盘那套(`similar_key`)**更严**(用户 2026-10-26 要求):
+        双向 + 与组内**所有**成员都比 + 带最近邻余量 —— 因为这里会删掉多余的图片
+        文件、还会改 `routes.json`, 宁可少合也不能错合。
         """
         try:
             merged = self.map_cache.merge_duplicates(self.store)

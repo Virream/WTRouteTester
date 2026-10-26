@@ -147,6 +147,19 @@ def looks_same(distance: float, ham: int, second: float | None = None) -> bool:
     return second is None or second >= SAME_IMAGE_TOL * SAME_IMAGE_MARGIN
 
 
+def group_same(distance: float, ham: int,
+               second_a: float | None, second_b: float | None) -> bool:
+    """**批量/启动时**分组用的同图判定 —— 比 `looks_same` 更严: **双向**都要认。
+
+    为什么要双向(用户 2026-10-26 要求收紧): `second` 是“自己做主角时次近的那张”,
+    所以 A 侧和 B 侧看到的余量可能是不同的 —— A 只有 B 这一张像它(second=None, 直接
+    放行), 而 B 那边另有一张更像的(second 很小, 不认)。单看 A 就会误合。
+    两侧都过 `looks_same` 才认, 这样“有一边觉得模棱两可”就一律不合并。
+    """
+    return (looks_same(distance, ham, second_a)
+            and looks_same(distance, ham, second_b))
+
+
 # 认为“是地图图片”的扩展名(遍历缓存目录时用)
 _EXTS = ("jpg", "png", "webp", "gif", "img")
 
@@ -514,33 +527,68 @@ class MapCache:
                  info.width, info.height)
 
     # ------------------------------------------------------------------ 归并
+    def _fingerprints(self) -> dict[str, tuple[bytes, int]]:
+        """{地图键: (64×64 灰度, 结构哈希)} —— 批量两两比较前只算一次。"""
+        out: dict[str, tuple[bytes, int]] = {}
+        with self._lock:
+            items = list(self._index.items())
+        for key, entry in items:
+            if self.path_of(key) is None:
+                continue
+            gray = self._gray_of(entry)
+            if not gray:
+                continue
+            out[key] = (gray, phash(gray))
+        return out
+
     def duplicate_groups(self) -> list[list[str]]:
         """分组: 内容相同(只是分辨率/编码不同)的地图键归一到一个组里。
 
-        用的是与 `similar_key` 同一套闸(灰度 + 结构哈希), 只是不做最近邻余量 ——
-        组内成对比较, 两两都说“像”才归到一起。
+        与 `similar_key`(运行时写盘用)**同一套闸, 而且同样带最近邻余量** ——
+        `second` 取“该键与**全局第二近**那张”的灰度差, 于是“两张都模棱两可”时
+        两边都不认。(2026-10-26 收紧: 原先这里 `second=None`, 少了余量这一道。)
+
+        组内判定是**全员 + 双向**: 加入一个组要求与组内**每一个**成员互相都认
+        (`group_same`), 不是“和第一个像就行” —— 否则 A~B、B~C 但 A≁C 时会
+        链式误合并(启动时的合并会改 routes.json、还会删掉多余的图片文件)。
         """
         self.refresh_index()
-        with self._lock:
-            keys = [k for k in self._index if self.path_of(k) is not None]
+        fps = self._fingerprints()
+        keys = list(fps)
+        if len(keys) < 2:
+            return []
+        pair: dict[frozenset, tuple[float, int]] = {}
+        second: dict[str, float | None] = {}
+        for a in keys:
+            ga, pa = fps[a]
+            row: list[tuple[float, str]] = []
+            for b in keys:
+                if b == a:
+                    continue
+                gb, pb = fps[b]
+                if len(ga) != len(gb):
+                    continue
+                d = gray_distance(ga, gb)
+                pair[frozenset((a, b))] = (d, hamming(pa, pb))
+                row.append((d, b))
+            row.sort()
+            second[a] = row[1][0] if len(row) > 1 else None
+
+        def _same(a: str, b: str) -> bool:
+            rec = pair.get(frozenset((a, b)))
+            if rec is None:
+                return False
+            return group_same(rec[0], rec[1], second[a], second[b])
+
         groups: list[list[str]] = []
         for key in keys:
             for group in groups:
-                if self._pair_same(key, group[0]):
+                if all(_same(key, other) for other in group):
                     group.append(key)
                     break
             else:
                 groups.append([key])
         return [g for g in groups if len(g) > 1]
-
-    def _pair_same(self, a: str, b: str) -> bool:
-        """两张已缓存地图算不算同一张(灰度 + 结构哈希两道闸)。"""
-        ea = self._index.get(a) or {}
-        eb = self._index.get(b) or {}
-        ga, gb = self._gray_of(ea), self._gray_of(eb)
-        if not ga or len(ga) != len(gb):
-            return False
-        return looks_same(gray_distance(ga, gb), hamming(phash(ga), phash(gb)))
 
     def merge_duplicates(self, store) -> list[tuple[str, str]]:
         """把“同一张地图的不同分辨率”合并成一张地图(启动时跑一次)。
