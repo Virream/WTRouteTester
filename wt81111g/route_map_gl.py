@@ -1504,13 +1504,6 @@ class RouteMapGlView(RouteMapView):
         if not labels or not dw or not dh:
             return
         layout = self._label_layout()
-        # `_label_layout()` 给的是**控件像素**(含缩放与平移), 这里换成归一化世界坐标
-        r = self._map_rect()
-        ox, oy = r.left(), r.top()
-
-        def to_world(px: float, py: float) -> tuple[float, float]:
-            return ((px - ox) / dw, 1.0 - (py - oy) / dh)
-
         z = Z_PLAYER + 0.001
         far = -1.0e6
         lead = getattr(self, "_gl_cursor_leaders", None)
@@ -1534,25 +1527,24 @@ class RouteMapGlView(RouteMapView):
                 # 文字只在这一刻改: `set_text` 0.16 ms, 而新建 Text 要 1.14 ms(实测)
                 lab["text"].set_text(text)
                 self._resize_label_geom(lab, dw)
+            w, h = lab["w"], lab["h"]
             # 像素布局(y 向下) → 归一化世界坐标(y 向上)
-            cx, cy = to_world(lx + pw / 2.0, ly + ph / 2.0)
+            cx = (lx + pw / 2.0) / dw
+            cy = 1.0 - (ly + ph / 2.0) / dh
             for key in ("box", "edge", "text"):
                 lab[key].visible = True
             lab["box"].local.position = (cx, cy, z)
             lab["edge"].local.position = (cx, cy, z)
-            tx, ty = to_world(lx + rmv.CURSOR_LABEL_PAD,
-                              ly + rmv.CURSOR_LABEL_PAD / 2.0)
-            lab["text"].local.position = (tx, ty, z)
+            lab["text"].local.position = (lx / dw, 1.0 - (ly + rmv.CURSOR_LABEL_PAD / 2.0) / dh,
+                                          z)
             if larr is not None:
-                dot = self.map_pos(cur.x, cur.y)
-                seg = rmv.cursor_label_leader(dot.x(), dot.y(), lx, ly, pw, ph)
+                cxp, cyp = float(cur.x) * dw, (1.0 - float(cur.y)) * dh
+                seg = rmv.cursor_label_leader(cxp, cyp, lx, ly, pw, ph)
                 if seg is None:
                     larr[2 * i] = larr[2 * i + 1] = (far, far, 0.0)
                 else:
-                    ax, ay = to_world(seg[0], seg[1])
-                    bx, by = to_world(seg[2], seg[3])
-                    larr[2 * i] = (ax, ay, z)
-                    larr[2 * i + 1] = (bx, by, z)
+                    larr[2 * i] = (seg[0] / dw, 1.0 - seg[1] / dh, z)
+                    larr[2 * i + 1] = (seg[2] / dw, 1.0 - seg[3] / dh, z)
         if lead is not None:
             lead.visible = larr is not None and bool(np.any(larr[:, 0] > -1e5))
             lead.geometry.positions.update_full()

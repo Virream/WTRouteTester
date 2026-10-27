@@ -67,7 +67,6 @@ COLOR_CURSOR_LABEL_FG = QColor("#f8fafc")
 # 引导线: 标签被挤到离点较远时, 用一根细线把点和它的标签连起来(否则看不出是谁的)
 CURSOR_LABEL_LEADER_MIN = 10.0   # 点和标签已经这么近就不画线(px)
 CURSOR_LABEL_LEADER_PEN = 1.2    # 引导线粗细(px)
-CURSOR_LABEL_OFFSCREEN_MARGIN = 48.0  # 点出画面这么远就不再画它的标签
 COLOR_CURSOR_LABEL_LEADER = QColor(226, 232, 240, 215)
 COLOR_DIR_LINE = QColor("#f8fafc")   # 回放朝向线颜色(白, 与回放光标同色)
 # 选中的历史轨迹: **不透明**(便于多条叠在一起对比)
@@ -363,120 +362,103 @@ def cursor_label_size(text: str, font: QFont) -> tuple[float, float]:
             float(fm.height()) + CURSOR_LABEL_PAD)
 
 
-# 标签候选方位(单位向量, **屏幕坐标 y 向下**), 16 个 = 每 22.5° 一个。
-# 顺序有意义: 从“正右”开始向两侧交替铺开, 代价相同时优先选靠前的
-# —— 这样单条回放仍然是“贴在点的右边”, 与最初的行为一致。
-def _ring_dirs(count: int) -> tuple[tuple[float, float], ...]:
-    out = []
-    for k in range(count // 2 + 1):
-        ang = math.radians(360.0 * k / count)
-        dx, dy = math.cos(ang), -math.sin(ang)
-        out.append((dx, dy))                       # 上半侧(屏幕上为负 y)
-        if 0 < k < count // 2:
-            out.append((dx, -dy))                  # 下半侧
-    return tuple(out[:count])
-
-
-CURSOR_LABEL_DIRS = _ring_dirs(16)
-# 候选**圈数**: 用户 2026-10-27 的方案 —— “以点为圆心画个圆, 标签就在圆的范围内,
-# 一根线连着”。所以半径从“刚好贴住点”(= 框半对角线 + 缝)起步, 各方位先近后远;
-# 只在同一个圆里换方位躲重叠, 不再让标签为了避让跑到天边去。
-CURSOR_LABEL_RINGS = 6
-# 每圈往外多走的像素(相对标签高度): 必须 ≥ 1, 否则同一方位的两圈会纵向叠住
-# (0.6 时实测“24 条靠窗口左边”重叠 92%, 全挤在 x=0 那条竖线上)
-CURSOR_LABEL_RING_STEP = 1.05
+# 标签相对锚点的候选方位(单位向量, **屏幕坐标 y 向下**)。
+# 顺序有意义: 前 4 个是最自然的方向(右/右上/上/左上), 代价相同时优先选靠前的,
+# 这样单条回放仍然是“贴在点的右边”, 与以前一致。
+CURSOR_LABEL_DIRS = (
+    (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1),
+)
+# 候选**圈数**: 只有一圈时, 20 多台车挤在一起的标签必然全叠在一起(实测重叠 91%)。
+# 允许往外再多放几圈, 由引导线保证“还看得出是哪个点的标签”。
+CURSOR_LABEL_RINGS = 5
+# 每圈往外多走的像素(相对标签高度): 0.9 ≈ 一行半, 圈与圈之间刚好留一点缝
+CURSOR_LABEL_RING_STEP = 0.9
 # 代价里的“整块重叠”折合多少像素的距离 —— 越大越优先消除重叠(实测 250 比较合适:
 # 100% 重叠 ≈ 250 px 的引导线, 也就是“宁可拉一根 2 cm 的线, 也别压着别人”)
 CURSOR_LABEL_OVERLAP_COST = 250.0
-# 被窗口边界夹回来的代价 —— 比 100% 重叠还高一点: 贴墙那一片会挤成一条竖线,
-# 既重叠又离自己的点很远, 不如老老实实压着别人(至少还贴着点、还认得出)
-CURSOR_LABEL_CLIP_COST = 300.0
 
 
-def _ring_candidate(ax: float, ay: float, w: float, h: float,
-                    dx: float, dy: float, radius: float) -> tuple[float, float]:
-    """把盒子**中心**摆到“点 + 半径 × 方位”处, 返回盒子左上角(屏幕像素)。"""
-    return (ax + dx * radius - w / 2.0, ay + dy * radius - h / 2.0)
+def _label_candidate(ax: float, ay: float, w: float, h: float,
+                     sx: int, sy: int, gap: float) -> tuple[float, float]:
+    """某个方位/距离上的候选位置(盒子左上角, 屏幕像素)。
 
-
-def _tight_radius(w: float, h: float, dx: float, dy: float, gap: float) -> float:
-    """沿这个方位把盒子摆到“框边离点正好 `gap`”时, 盒子中心到点的距离。
-
-    ⚠ 不能统一用“框半对角线”(`hypot(w/2, h/2)`): 那是**最短**方向上刚好贴住的
-    半径, 换到别的大方向就会离得很远 —— 251×21 的标签半对角线 126px,
-    往正上方摆时框底边就离点 123px, 看着像飘走了。这里按射线与框边的交点算,
-    任何方位都是“紧贴”。
+    `sx/sy` 是该方向“盒子朝哪边伸出”: 1 = 向 +x 伸出, -1 = 向 -x; y 同理。
+    盒子离锚点的**最近边**保持 `gap` 的距离。
     """
-    ax, ay = abs(dx), abs(dy)
-    tx = (w / 2.0) / ax if ax > 1e-9 else float("inf")
-    ty = (h / 2.0) / ay if ay > 1e-9 else float("inf")
-    return min(tx, ty) + gap
+    if sx > 0:
+        lx = ax + gap
+    elif sx < 0:
+        lx = ax - gap - w
+    else:
+        lx = ax - w / 2.0
+    if sy > 0:
+        ly = ay + gap
+    elif sy < 0:
+        ly = ay - gap - h
+    else:
+        ly = ay - h / 2.0
+    return lx, ly
 
 
 def layout_cursor_labels(anchors, width: float, height: float,
                          gap: float = CURSOR_LABEL_GAP) -> list[tuple[float, float]]:
-    """给一堆标签找位置: **每个标签只在自己那颗点的圆环范围内**, 尽量少重叠。
+    """给一堆标签找位置: **尽量贴着各自的点, 尽量少重叠**(允许重叠, 不追求零重叠)。
 
     `anchors` 是 `[(ax, ay, w, h)]`(点的像素坐标 + 盒子的像素尺寸),
     返回同样长度的 `[(lx, ly)]`(盒子左上角)。
 
-    做法(用户 2026-10-27 指定的思路): **贪心 + 16 方位 × 6 圈候选**:
+    做法: **贪心 + 8 个方位 × 5 圈候选**, 依次给每个标签挑代价最小的位置:
 
-    * 最内圈 = 沿该方位“框边离点正好 `gap`”的位置(`_tight_radius`), 也就是
-      **贴着点但不盖住点**; 每往外一圈加 `1.05 × 标签高`(刚好不互相压住), 最多 5 圈。
-      标签永远待在自己那颗点的圆里, 由 `cursor_label_leader` 拉一根线连回去,
-      所以“哪个标签是哪台车的”一眼就能看出来;
-    * 代价 = 重叠比例 × 250px + 第几圈 × 圈距 + 被窗口夹住的 300 + 盖住自己的点(禁止);
+        代价 = 重叠比例 × 250px + **点到框边**的最近距离(px) + 方位序号 × 0.5
+
     * 重叠用**比例**而不是面积, 免得“长标签天然吃亏”;
-    * 12 台车挤在同一个点上是没法全部不重叠的(允许重叠, 只求尽量少) ——
-      此时它们会在各个方位上摊开, 而不是在同一个方向上叠成一条。
-    * 16 方位 × 6 圈 是实测扫参出来的: 24 台挤在一处重叠 3.1%(4 圈时 24.4%),
-      24 台分散时 0.8%, 24 台贴着窗口左边 30%(4 圈时 57.5%)。
+    * 距离用**点到框边**而不是到框中心: 长标签的中心天然远, 用中心会让所有长标签
+      都判定为“贴不近”, 反而去抢上下方位(实测单条回放会跑到点正上方);
+      用框边距离时“贴右边”和“贴上方”都是 gap, 由方位序号决定 → 单条回放与以前完全一致;
+    * 距离用像素而不是平方 —— 平方会把远处的候选罚得过狠, 于是所有标签又挤回点上;
+    * 候选圈由近到远, 近处放得下就绝不会凭空跑远。
 
-    O(n² × 96), n = 正在回放的线路数(实测 24 条约 6.6 ms, 只在 4 Hz 上重算)。
+    引导线(`cursor_label_leader`)负责把被挤远的标签和它的点连起来 ——
+    用户 2026-10-27 的方案: “允许重叠, 尽量少重叠 + 一根线”。
+
+    O(n²/2 × 40), n = 正在回放的线路数(实测 24 条约 2.9 ms, 只在 4 Hz 上重算)。
     """
     placed: list[tuple[float, float, float, float]] = []      # x0,y0,x1,y1
     out: list[tuple[float, float]] = []
     max_x = max(0.0, width)
     max_y = max(0.0, height)
-    dirs = CURSOR_LABEL_DIRS
     for ax, ay, w, h in anchors:
-        step = max(4.0, h * CURSOR_LABEL_RING_STEP)
+        step = max(6.0, h * CURSOR_LABEL_RING_STEP)
         best = None
-        for (dx, dy) in dirs:
-            tight = _tight_radius(w, h, dx, dy, gap)
-            for ring in range(CURSOR_LABEL_RINGS):
-                radius = tight + ring * step
-                lx, ly = _ring_candidate(ax, ay, w, h, dx, dy, radius)
+        for ring in range(CURSOR_LABEL_RINGS):
+            d = gap + ring * step
+            for rank, (sx, sy) in enumerate(CURSOR_LABEL_DIRS):
+                lx, ly = _label_candidate(ax, ay, w, h, sx, sy, d)
                 # 夹进窗口(夹完可能又压到别人身上, 所以重叠要**用夹完的位置**算)
-                cx0 = min(max(0.0, lx), max(0.0, max_x - w))
-                cy0 = min(max(0.0, ly), max(0.0, max_y - h))
-                clipped = abs(cx0 - lx) > 0.01 or abs(cy0 - ly) > 0.01
-                lx, ly = cx0, cy0
+                lx = min(max(0.0, lx), max(0.0, max_x - w))
+                ly = min(max(0.0, ly), max(0.0, max_y - h))
                 x1, y1 = lx + w, ly + h
                 ov = 0.0
                 for (px0, py0, px1, py1) in placed:
-                    dxo = min(x1, px1) - max(lx, px0)
-                    if dxo <= 0.0:
+                    dx = min(x1, px1) - max(lx, px0)
+                    if dx <= 0.0:
                         continue
-                    dyo = min(y1, py1) - max(ly, py0)
-                    if dyo <= 0.0:
+                    dy = min(y1, py1) - max(ly, py0)
+                    if dy <= 0.0:
                         continue
-                    ov += dxo * dyo
-                cost = (ov / (w * h) if w > 0 and h > 0 else 0.0) * CURSOR_LABEL_OVERLAP_COST
-                cost += ring * step
-                if clipped:
-                    # 贴墙那一溜会被十几个标签抢成一叠竖线(实测“24 条靠边”重叠 92%),
-                    # 所以夹边要罚得比“整块重叠”还狠 —— 宁可就地压着别人
-                    cost += CURSOR_LABEL_CLIP_COST
+                    ov += dx * dy
+                # 距离用**点到框边的最近距离** —— 与引导线同一口径(见 docstring)
+                dcx = min(max(ax, lx), x1) - ax
+                dcy = min(max(ay, ly), y1) - ay
+                dist = math.hypot(dcx, dcy)
+                cost = (ov / (w * h) if w > 0 and h > 0 else 0.0)
+                cost = cost * CURSOR_LABEL_OVERLAP_COST + dist + rank * 0.5
                 # 绝不能把自己的点盖住: 贴边被夹进窗口后, 长标签可能正好罩住那个点,
                 # 于是“距离 0”成了最优解(实测单条回放会把标签甩到点左边并盖住它)。
                 if lx <= ax <= x1 and ly <= ay <= y1:
                     cost += 1.0e5
                 if best is None or cost < best[0]:
                     best = (cost, lx, ly)
-            if best is not None and best[0] < 1.0:
-                break                      # 已经“贴着点且不压别人”, 不用再看别的方位
         _, lx, ly = best
         placed.append((lx, ly, lx + w, ly + h))
         out.append((lx, ly))
@@ -2343,12 +2325,7 @@ class RouteMapView(QWidget):
         got = self._label_layout().get(id(rec))
         if got is None:
             return
-        # 布局在控件坐标里算(`_label_layout()`), 而这里的画笔已经平移过 —— 减回左上角
-        r = self._map_rect()
-        ox, oy = r.left(), r.top()
         (lx, ly), (w, h) = got
-        lx -= ox
-        ly -= oy
         font = QFont(CURSOR_LABEL_FAMILY, CURSOR_LABEL_FONT_PX)
         p.setFont(font)
         box = QRectF(lx, ly, w, h)
@@ -2372,15 +2349,6 @@ class RouteMapView(QWidget):
     def _label_layout(self) -> dict[int, tuple[tuple[float, float], tuple[float, float]]]:
         """给本次回放的所有光标标签排一次位置(`id(rec) -> ((lx,ly),(w,h))`)。
 
-        ⚠ **坐标空间是「控件像素」**(`map_pos()`, 含缩放与平移) —— 不是 `_to_px()`
-        那种地图本地像素。原因: 夹边界用的是**窗口**宽高, 而地图本地像素在放大时
-        会远大于窗口(实测 3.3 倍缩放下点在地图本地就是 (2566,1955)), 混用会让所有
-        候选都被夹到同一个角上 —— 用户 2026-10-27 截图里的“标签全叠成一条横杠”。
-        绘制时代价一次平移(软件路径减 `_map_rect()` 左上角, GPU 路径按它换归一化)。
-
-        点跑到窗口外时**不画这个标签**(否则十几个不可见的点会把标签全堆在边框上);
-        允许一点点余量, 免得点刚出边界时标签闪一下。
-
         只在“换了一批回放对象 / 播放头每走 0.25 s / 窗口尺寸变了”时重算 ——
         贪心布局是 O(n²), 没必要每帧都跑; 而**引导线每帧都跟着点画**,
         所以肉眼看不出标签是分档移动的。
@@ -2395,23 +2363,18 @@ class RouteMapView(QWidget):
         if key == self._label_key:
             return self._label_cache
         font = QFont(CURSOR_LABEL_FAMILY, CURSOR_LABEL_FONT_PX)
-        margin = CURSOR_LABEL_OFFSCREEN_MARGIN
-        ww, wh = float(self.width()), float(self.height())
         anchors: list[tuple[float, float, float, float]] = []
         meta: list[tuple[int, str, float, float]] = []
         for rec in recs:
             cur = point_at(rec.points, self._playhead) if rec.points else None
             if cur is None or self._dead_now(rec, self._playhead):
                 continue
-            c = self.map_pos(cur.x, cur.y)
-            if not (-margin <= c.x() <= ww + margin
-                    and -margin <= c.y() <= wh + margin):
-                continue                       # 点不在画面里 → 它的标签也不画
+            c = self._to_px(cur.x, cur.y)
             text = cursor_label_text(rec, cur)
             w, h = cursor_label_size(text, font)
             anchors.append((c.x(), c.y(), w, h))
             meta.append((id(rec), text, w, h))
-        spots = layout_cursor_labels(anchors, ww, wh)
+        spots = layout_cursor_labels(anchors, float(self.width()), float(self.height()))
         self._label_cache = {m[0]: (spots[i], (m[2], m[3])) for i, m in enumerate(meta)}
         self._label_key = key
         self._log_label_layout(anchors, spots)
