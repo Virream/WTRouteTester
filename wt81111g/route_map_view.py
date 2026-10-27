@@ -2377,41 +2377,7 @@ class RouteMapView(QWidget):
         spots = layout_cursor_labels(anchors, float(self.width()), float(self.height()))
         self._label_cache = {m[0]: (spots[i], (m[2], m[3])) for i, m in enumerate(meta)}
         self._label_key = key
-        self._log_label_layout(anchors, spots)
         return self._label_cache
-
-    def _log_label_layout(self, anchors, spots) -> None:
-        """每次重算布局写一条日志(节流 2 s) —— 用户报"没效果"时靠它分辨。
-
-        三个数字就够定位问题: 排了几个、**不同横坐标有几个**(=1 就是还在一列里排)、
-        重叠占了多少、以及标签中心到点的中位距离。
-        """
-        now = time.monotonic()
-        if now - getattr(self, "_label_log_at", 0.0) < 2.0:
-            return
-        self._label_log_at = now
-        n = len(spots)
-        if not n:
-            return
-        xs = {round(s[0]) for s in spots}
-        area = ov = 0.0
-        dists = []
-        for i, (lx, ly) in enumerate(spots):
-            w, h = anchors[i][2], anchors[i][3]
-            area += w * h
-            for j in range(i + 1, n):
-                ox, oy = spots[j]
-                w2, h2 = anchors[j][2], anchors[j][3]
-                dx = min(lx + w, ox + w2) - max(lx, ox)
-                dy = min(ly + h, oy + h2) - max(ly, oy)
-                if dx > 0 and dy > 0:
-                    ov += dx * dy
-            cx = lx + w / 2.0 - anchors[i][0]
-            cy = ly + h / 2.0 - anchors[i][1]
-            dists.append(math.hypot(cx, cy))
-        dists.sort()
-        log.info("回放标签布局: %d 个 / 不同横坐标 %d / 重叠 %.1f%% / 距点中位 %.0fpx",
-                 n, len(xs), ov / max(area, 1.0) * 100.0, dists[len(dists) // 2])
 
     def _draw_playback(self, p: QPainter, rec: RouteRecord, head: float,
                        labels: bool = True) -> None:
