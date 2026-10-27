@@ -2296,7 +2296,10 @@ class RouteTesterWindow(QMainWindow):
             menu.addAction(act_hide)
             menu.addSeparator()
             act_del = QAction("删除该记录", self)
-            act_del.triggered.connect(lambda: self._delete_route(item))
+            # 延迟一拍再弹确认框: 不能开在 menu.exec() 的嵌套事件循环里(见 `_ask_yes_no`)
+            _rid = item.data(0, _ROLE_ID)
+            act_del.triggered.connect(
+                lambda: QTimer.singleShot(0, lambda: self._delete_route(_rid)))
             menu.addAction(act_del)
         else:
             if kind == "mode":     # 模式(战区控制 / 战区攻陷 / 战区争夺)
@@ -2311,7 +2314,9 @@ class RouteTesterWindow(QMainWindow):
                 menu.addSeparator()
             else:
                 act_rename = QAction("重命名地图", self)
-                act_rename.triggered.connect(lambda: self._rename_map(item.data(0, _ROLE_ID)))
+                _mk = item.data(0, _ROLE_ID)
+                act_rename.triggered.connect(
+                    lambda: QTimer.singleShot(0, lambda: self._rename_map(_mk)))
                 menu.addAction(act_rename)
                 menu.addSeparator()
                 act_show_all = QAction("显示本图全部轨迹", self)
@@ -2370,8 +2375,10 @@ class RouteTesterWindow(QMainWindow):
         if kind == "global":
             menu.addSeparator()
             act_del = QAction("删除该全局录制…", self)
+            # 延迟一拍再弹确认框 —— 直接开在 menu.exec() 的嵌套事件循环里会卡死(见 `_ask_yes_no`)
+            _gid = item.data(0, _ROLE_ID)
             act_del.triggered.connect(
-                lambda: self._delete_global(item.data(0, _ROLE_ID)))
+                lambda: QTimer.singleShot(0, lambda: self._delete_global(_gid)))
             menu.addAction(act_del)
 
     def _toggle_mark(self, gid: str, side: str, on: bool) -> None:
@@ -2400,19 +2407,42 @@ class RouteTesterWindow(QMainWindow):
         g = self.store.get_global(gid)
         if g is None:
             return
-        ok = QMessageBox.question(
-            self, "删除全局录制",
-            f"确定删除这条全局录制吗?\n\n"
-            f"{g.label} · {g.map_name} · {g.mode_label}\n"
-            f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条线路\n\n"
-            f"删除后无法恢复(单条线路录制的轨迹不受影响)。")
-        if ok != QMessageBox.StandardButton.Yes:
+        # ⚠ 这里**不要**为了写“A 队 X 条 / B 队 Y 条”去调 `g.lives()`:
+        #   那是惰性加载的入口(第一次调会把整局的线路清单读进来)。清单没读过时
+        #   用会话头里的总数就够了 —— 详情等展开时再说。
+        if g.sides_loaded():
+            brief = (f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条线路")
+        else:
+            brief = f"共 {g.count()} 条线路"
+        if not self._ask_yes_no(
+                "删除全局录制",
+                f"确定删除这条全局录制吗?\n\n"
+                f"{g.label} · {g.map_name} · {g.mode_label}\n"
+                f"{brief}\n\n"
+                f"删除后无法恢复(单条线路录制的轨迹不受影响)。"):
             return
         self.store.remove_global(gid)
         if self._last_global is not None and self._last_global.route_id == gid:
             self._last_global = None
         self._reload_tree()
         self._set_status("已删除全局录制条目", sticky=3.0)
+
+    def _ask_yes_no(self, title: str, text: str) -> bool:
+        """确认框。**必须从菜单动作里延迟一拍再调用**(见 `_on_tree_menu`)。
+
+        直接把模态框开在 `QMenu.exec()` 的嵌套事件循环里, Windows 上会出现
+        “框弹出来了但点不动 / 整窗卡死” —— 那一刻键盘鼠标还被菜单抓着,
+        对话框建出来却拿不到激活。所以菜单里的删除/重命名统一走
+        `QTimer.singleShot(0, …)`, 等 `menu.exec()` 退出、菜单销毁之后再弹。
+        """
+        box = QMessageBox(
+            QMessageBox.Icon.Question, title, text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        box.setWindowModality(Qt.WindowModality.ApplicationModal)
+        box.raise_()
+        box.activateWindow()
+        return box.exec() == QMessageBox.StandardButton.Yes
 
     def _mode_tip(self, map_key: str, mode_label: str) -> str:
         """模式行的提示: 这个模式见过的作战范围(大图/小图)与战区位置。
@@ -2554,16 +2584,13 @@ class RouteTesterWindow(QMainWindow):
         for i in range(root.childCount()):
             walk(root.child(i))
 
-    def _delete_route(self, item: QTreeWidgetItem) -> None:
-        route_id = item.data(0, _ROLE_ID)
+    def _delete_route(self, route_id: str) -> None:
         rec = self.store.get(route_id)
         if rec is None:
             return
-        ok = QMessageBox.question(
-            self, "删除线路记录",
-            f"确定删除该记录吗?\n\n{rec.map_name} | {rec.vehicle} | 用时 {fmt_time(rec.duration)}",
-        )
-        if ok != QMessageBox.StandardButton.Yes:
+        if not self._ask_yes_no(
+                "删除线路记录",
+                f"确定删除该记录吗?\n\n{rec.map_name} | {rec.vehicle} | 用时 {fmt_time(rec.duration)}"):
             return
         self.store.remove(route_id)
         if self._last_record is not None and self._last_record.route_id == route_id:
