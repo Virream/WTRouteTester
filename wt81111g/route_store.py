@@ -828,6 +828,12 @@ class GlobalRecord:
     #    "x": 东, "z": 北, "dx": 朝向东分量, "dz": 朝向北分量,
     #    "length": 米, "width": 米, "est": True}
     airfields: list[dict] = field(default_factory=list)
+    # 结算表摘要(回放导入时从文件尾部的结果 BLK 解出, 见 `wrpl_results.py`):
+    #   {"status": "success", "time_played": 429.8,
+    #    "players": [{"name", "clanTag", "team", "kills", "deaths", "score"…}]}
+    # 用途: 侧栏的“结算表”折叠面板 —— 这一局到底有谁、哪队、战绩多少。
+    # 本地录制的条目没有这个字段(空 dict), 面板就不显示那一块。
+    results: dict = field(default_factory=dict)
     # ---- 磁盘元数据(从会话文件加载时才有)--------------------------------
     # 线路数存在**会话头部**里: 侧栏“N 条”不用为了计数去读线路清单。
     n_lives: int = 0
@@ -982,6 +988,7 @@ class GlobalRecord:
             "kills": self.kills,
             "norm_rect": list(self.norm_rect or []),
             "airfields": list(self.airfields or []),
+            "results": dict(self.results or {}),
             "sides": {side: [life.to_json() for life in self.lives(side)]
                       for side in GLOBAL_SIDES},
         }
@@ -1043,6 +1050,12 @@ def _fill_global_meta(rec: GlobalRecord, data: dict) -> None:
             })
         except (KeyError, TypeError, ValueError):
             continue
+    res = data.get("results")
+    if isinstance(res, dict):
+        rows = [p for p in (res.get("players") or []) if isinstance(p, dict)]
+        rec.results = {"status": str(res.get("status") or ""),
+                       "time_played": float(res.get("time_played") or 0.0),
+                       "players": rows}
     for row in data.get("zone_states") or []:
         if not isinstance(row, dict):
             continue
@@ -1258,6 +1271,7 @@ def _pack_global(rec: GlobalRecord) -> tuple[dict, list[bytes], list[dict]]:
         "nl": rec.count(),             # 线路数(侧栏报数用, 不必读清单)
         "norm_rect": list(rec.norm_rect or []),
         "airfields": list(rec.airfields or []),
+        "results": dict(rec.results or {}),
         "zone_states": rec.zone_states,
         "kills": rec.kills,
     }

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from .map_calib import MAP_KEY_PREFIX, MapCalib, level_of, load_bundled
 from .route_store import GlobalRecord, TrackPoint, UnitLife
 from .wrpl_reader import EXT_MASK_UID, ReplayData, load_replay
+from .wrpl_results import load_results
 from .zones import mode_name as zone_mode_name
 
 log = logging.getLogger("replay_import")
@@ -33,6 +34,11 @@ log = logging.getLogger("replay_import")
 GAP_SPLIT_SEC = 45.0        # 相邻采样超过这么久 → 认为是两段（死了/长时间无上报）
 JUMP_MIN_M = 200.0          # 一步至少跳这么远
 JUMP_MAX_MPS = 60.0         # 且折算速度超过这个（216 km/h）→ 判定为换了实体
+# **静态地图道具**(火车车厢/工事/集装箱): 位置流里有它, 但 ECS 里**没有**它的创建包,
+# 而且整局位移 < 这个值。实测一局 225 个位置 uid 中有 133 个是孤儿, 其中 128 个
+# 整局不动 —— 它们会变成一条条“冻结的线”, 占掉 65% 的线数(2026-10-27 基线)。
+# 过滤开关由界面上的「过滤静态道具」勾选框控制(默认开)。
+STATIC_PROP_M = 5.0
 # 实测依据（2026-10-25，avg_finland 服务器回放）: uid=142 在 t=404.6s 一步跳了
 # 370.9 m / 3.52 s = 105 m/s(380 km/h) —— 地面车最快也就 150 km/h(42 m/s)，
 # 那就是“玩家在车里操作微型侦察无人机 / 死后重生”造成的 uid 复用。阈值取
@@ -53,6 +59,7 @@ class ImportStats:
     lives: int = 0
     duration: float = 0.0
     dropped: int = 0           # 太短的线路（< 3 个点）丢弃数
+    props_dropped: int = 0     # 被当成静态道具丢掉的 uid 数（车厢/工事…）
     players: int = 0           # 解出的玩家数（Slot 包）
     kills: int = 0             # 击杀事件数（Kill 包）
     mapped: int = 0            # 能对应到玩家的载具数
@@ -201,7 +208,8 @@ def _airfields_from_ecs(data: ReplayData) -> list[dict]:
 
 
 def build_record(data: ReplayData, source_path: str = "",
-                 calib=None) -> tuple[GlobalRecord, ImportStats]:
+                 calib=None, drop_static_props: bool = True
+                 ) -> tuple[GlobalRecord, ImportStats]:
     """`ReplayData` → `GlobalRecord`。
 
     `calib` 是这张图的地图校准(`MapCalib`, 见 `map_calib.py`)。回放里的坐标是
@@ -272,6 +280,13 @@ def build_record(data: ReplayData, source_path: str = "",
     # 两队机场跑道(示意用, 见 `_airfields_from_ecs`)。存世界米, 绘制时才归一化 ——
     # 这样换校准时它跟着线路一起重算。
     rec.airfields = _airfields_from_ecs(data)
+    # ---- 结算表（文件尾的结果 BLK）--------------------------------------
+    # 只读最后一个分片的尾部, 不碰包流(几十毫秒)。本地录像没有结果段 → None。
+    # 里面的 `team` / `name` / `deaths` 是**服务端权威值**, 面板与后面的校验都用它。
+    if src:
+        _res = load_results(src)
+        if _res is not None:
+            rec.results = _res.as_dict()
 
     t0 = data.t_first
     # ---- 玩家身份与真实分队 ------------------------------------------------
@@ -377,7 +392,30 @@ def build_record(data: ReplayData, source_path: str = "",
 
     g_ends = _veh_ends(vans)
 
+    # ---- 静态地图道具过滤 ------------------------------------------------
+    # 判据(三条同时满足才算道具, 避免误杀蹲坑的玩家):
+    #   ① **没有主**（ECS 档案里所有车都没有 `player`）—— 孤儿 uid 也算;
+    #   ② 整局位移 < STATIC_PROP_M（火车车厢/工事/机场防空都是钉死的）;
+    #   ③ 开关打开（界面默认勾选）。
+    # 这类 uid 本来也绑不到玩家, 画出来就是一条条"冻结的空名线":
+    # 实测一局 237 条线里 155 条(65%)是它们（2026-10-27 基线）。
+    # ⚠ "有玩家" 的车一律不按静态丢 —— 蹲坑一局也是真实的一条线。
+    static_uids: set[int] = set()
+    if drop_static_props:
+        for _u, _rows in data.units.items():
+            if len(_rows) < 2:
+                continue
+            if any(v.player for v in (vans.get(_u) or ())):
+                continue
+            _xs = [r[1] for r in _rows]
+            _zs = [r[3] for r in _rows]
+            if max(max(_xs) - min(_xs), max(_zs) - min(_zs)) < STATIC_PROP_M:
+                static_uids.add(_u)
+        stats.props_dropped = len(static_uids)
+
     for uid, rows in sorted(data.units.items()):
+        if uid in static_uids:
+            continue
         # 车被击毁后位置流**还会继续上报残骸**(实测某 uid 击毁于 147.7s, 之后
         # 12,641 个点全在同一个坐标, 一直报到 1012s), 而残骸本身仍可以被撞得
         # 滑动几米 —— 所以**不能用“有没有位移”去猜**, 而是按存活窗口裁:
@@ -482,6 +520,13 @@ def build_record(data: ReplayData, source_path: str = "",
                         max(q[3] for q in seg) - min(q[3] for q in seg))
             if _dur < 3.0 and _span < 50.0:
                 stats.dropped += 1
+                continue
+            # 残骸尾巴: **没有 ECS 档案 + 整段不动** → 是被打死后继续上报的残骸,
+            # 不是一条"命"。有档案的车不走这条(蹲坑一整局也是真线)。
+            # 这类段主要来自"uid 没有创建包、但有击杀记录"的车 —— 击杀时刻把
+            # 位置流切开后, 后半段就成了冻在半空的碎屑(实测冻结 349 s)。
+            if drop_static_props and _span < STATIC_PROP_M and seg_src[si - 1] is None:
+                stats.props_dropped += 1
                 continue
             # 死亡时刻没落在切段点上（例如它比最后一个采样点晚了 1~2 秒）
             # 也算击毁 —— 但时间差要短，否则可能只是“没被看见”。
