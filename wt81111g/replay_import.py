@@ -429,7 +429,13 @@ def build_record(data: ReplayData, source_path: str = "",
                 #    时间上却是连续的 → 不切开就会在图上拉出一条瞬移直线
                 #    (2026-10-25 用户反馈 A67)。地面车跑不到 720 km/h，所以
                 #    “一步 > 200 m 且 > 200 m/s” 一定是换了实体。
-                if dt > GAP_SPLIT_SEC or (d > JUMP_MIN_M and dt > 0 and d / dt > JUMP_MAX_MPS):
+                #
+                # ⚠ **只在没有 ECS 档案时才用启发式**(2026-10-27): 档案已经给了精确的
+                #   出生/结束时刻, 窗口内再按间隔/速度硬切, 只会把**一辆车**劈成两条线
+                #   (`A12_1` / `A12_2`)。有档案就完全听档案的。
+                if not _win and (dt > GAP_SPLIT_SEC
+                                 or (d > JUMP_MIN_M and dt > 0
+                                     and d / dt > JUMP_MAX_MPS)):
                     segs.append((cur, 0.0))
                     cur = []
             cur.append(item)
@@ -444,14 +450,20 @@ def build_record(data: ReplayData, source_path: str = "",
         #     被合并成"1 台"，用户从界面上完全看不出是两辆；
         #   * 更不能按"段"分配 -> 一辆车被切成多段就变成 A25_1/A26_2/A27_3。
         seg_src: list = []
+        _cands = vans.get(uid, ())
         for seg, _dth in segs:
             _ts = seg[0][0]
             _veh = None
-            for _cand in vans.get(uid, ()):
-                if _cand.born_t - 1.0 <= _ts <= (
-                        (_cand.died_t + 1.0) if _cand.died_t is not None else 1e9):
-                    _veh = _cand
-                    break
+            # ⚠ 用**有效终点** `_end_of`(已含击杀/下一台车兑底), 不是原始的 `died_t`。
+            #   以前用 `died_t`: 它为 None 时条件是 `ts <= 1e9`, 于是**后面所有段都被
+            #   第一台车吞掉** —— 同一 uid 的第二条命会挂到前一台车名下(型号/玩家都错),
+            #   而且两台车只拿一个基号。
+            #   同一时刻落进多个窗口时取**最晚出生**那台(越兑越近)。
+            for _cand in _cands:
+                _end = _end_of.get(id(_cand), 1e9)
+                if _cand.born_t - 1.0 <= _ts <= _end + 1.0:
+                    if _veh is None or _cand.born_t > _veh.born_t:
+                        _veh = _cand
             seg_src.append(_veh)
         seg_total: dict[int, int] = {}
         for _v in seg_src:
@@ -610,7 +622,7 @@ def build_record(data: ReplayData, source_path: str = "",
                     segs.append(cur)
                     cur = []
                 di += 1
-            if cur and item[0] - cur[-1][0] > GAP_SPLIT_SEC:
+            if cur and not _win and item[0] - cur[-1][0] > GAP_SPLIT_SEC:
                 segs.append(cur)
                 cur = []
             cur.append(item)
