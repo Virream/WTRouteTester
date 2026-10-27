@@ -276,6 +276,12 @@ class RouteTesterWindow(QMainWindow):
             self._saved_dead_mark = int(self._settings.value("dead_mark", 1)) != 0
         except (TypeError, ValueError):
             self._saved_dead_mark = True
+        # 回放时在光标旁显示「型号 + 速度」—— **默认开**(用户 2026-10-27 要求),
+        # 关掉后只剩那个圆点(和原来一样)
+        try:
+            self._play_label = int(self._settings.value("play_label", 1)) != 0
+        except (TypeError, ValueError):
+            self._play_label = True
         # 「显示战区」(小菱形 + A/B/C 字母)开关: 菜单「设置」里勾选, 记住设置
         try:
             self._show_zones = int(self._settings.value("show_zones", 1)) != 0
@@ -368,6 +374,7 @@ class RouteTesterWindow(QMainWindow):
         self.map_view.set_show_spawns(self._show_spawns)
         self.map_view.set_show_airfields(self._show_airfields)
         self.map_view.set_dead_style(dim=self._saved_dead_dim, mark=self._saved_dead_mark)
+        self.map_view.set_play_label(self._play_label)
         self._reload_tree()
         if self._merged_maps:
             names = []
@@ -478,6 +485,17 @@ class RouteTesterWindow(QMainWindow):
             "机场常在底图图框**外面**, 缩小(滚轮)就能看到。")
         self.act_airfields.toggled.connect(self._on_show_airfields)
         setting.addAction(self.act_airfields)
+
+        self.act_play_label = QAction("回放时显示型号与速度(跟随光标)", self)
+        self.act_play_label.setCheckable(True)
+        self.act_play_label.setChecked(self._play_label)
+        self.act_play_label.setToolTip(
+            "播放线路时, 在表示载具位置的圆点旁边显示**型号 + 当时速度**,\n"
+            "标签跟着那个点一起移动; 靠近右边界时自动翻到点的左侧。\n"
+            "多条线路一起回放时每条各带一个标签。\
+关掉后只剩圆点(与以前一样)。")
+        self.act_play_label.toggled.connect(self._on_play_label_toggled)
+        setting.addAction(self.act_play_label)
 
         # ---- 图形(显卡): 用户 2026-10-27 要求"默认自动, 用户觉得有必要就自己指定"。
         # 适配器列表只在本进程**真的加载过** GPU 模块时才枚举 ——
@@ -911,6 +929,14 @@ class RouteTesterWindow(QMainWindow):
         self.map_view.set_show_airfields(self._show_airfields)
         self._set_status("已显示机场跑道(示意, 长度是估的)" if checked
                          else "已隐藏机场跑道", sticky=2.0)
+
+    def _on_play_label_toggled(self, checked: bool) -> None:
+        """菜单开关: 回放时是否在光标旁显示「型号 + 速度」(默认开)。"""
+        self._play_label = bool(checked)
+        self._settings.setValue("play_label", 1 if checked else 0)
+        self.map_view.set_play_label(self._play_label)
+        self._set_status("回放时在光标旁显示型号与速度" if checked
+                         else "已关闭光标旁的型号/速度标签", sticky=2.0)
 
     def _open_sound_settings(self) -> None:
         """菜单「音效 → 音效设置」: 音量 / 自定义音效文件(改动立即生效)。"""

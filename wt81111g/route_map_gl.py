@@ -274,6 +274,11 @@ O_LABEL_TEXT = 34     # 时间标签文字
 O_DEAD = 40           # 阵亡叉
 O_CURSOR_DOT = 50     # 回放光标白点
 O_CURSOR_DIR = 51     # 光标朝向线
+# 光标旁「型号 + 速度」标签(2026-10-27 用户要求): 必须**在点之上**, 且低于玩家点。
+# 三条是分开的 order, 底框 → 边框 → 文字(与时间标签同一套叠法)。
+O_CURSOR_LABEL_BOX = 52
+O_CURSOR_LABEL_EDGE = 52.5
+O_CURSOR_LABEL_TEXT = 53
 # **只有战区**压在轨迹之上: 菱形 + A/B/C 字母被线路盖住就没用了(用户 2026-10-26)。
 # 仍低于玩家点与悬浮信息 —— 那两个是“当前焦点”, 永远最上。
 O_ZONE = 54           # 战区填充
@@ -658,7 +663,9 @@ class RouteMapGlView(RouteMapView):
     def _icon_key(self) -> tuple:
         """**图标层**的指纹(重生点/机场/占位文字) —— 变了只换图标, 轨迹不动。"""
         return (self._show_spawns, self._spawns_ver,
-                self._show_airfields, self._airfield_ver, self._status)
+                self._show_airfields, self._airfield_ver, self._status,
+                # 光标旁标签是图标层的一部分(开关它要重建那几条对象)
+                self._play_label)
 
     def _zone_key(self) -> tuple:
         """**战区层**的指纹 —— 回放时它每几十秒就变一次, 所以单独一条最轻的路。"""
@@ -690,6 +697,7 @@ class RouteMapGlView(RouteMapView):
         self._hover_obj = None
         self._gl_hover_box = None
         self._gl_hover_px = None
+        self._gl_cursor_labels = []
 
     def _clear_icons(self) -> None:
         """只删图标类对象(轨迹保留) —— 缩放时走这条路。"""
@@ -1431,6 +1439,112 @@ class RouteMapGlView(RouteMapView):
             gfx.LineSegmentMaterial(thickness=rmv.CURSOR_DIR_PEN,
                                     thickness_space="screen",
                                     color=_rgba(rmv.COLOR_CURSOR_DIR))), O_CURSOR_DIR)
+        self._build_cursor_labels()
+
+    def _build_cursor_labels(self) -> None:
+        """光标旁「型号 + 速度」标签: 每条回放线路一个(用户 2026-10-27, 设置里可关)。
+
+        与软件版 `_draw_cursor_label` 同一套外观(深色底 + 该队颜色细边框 + 白字),
+        但这里必须自己造几何: pygfx 的 Text 没有背景框。
+
+        为什么**不在每帧重建**: 新建一个 `gfx.Text` 要 1.14 ms(实测), 三条约 3.4 ms;
+        而 `set_text` 只要 0.164 ms。所以对象建一次, 每帧只改文字/位置 —— 并且
+        **只有文字真的变了才 `set_text`**(速度四舍五入后一秒才变几次)。
+        """
+        self._gl_cursor_labels = []
+        if not self._play_label:
+            return
+        for rec in self._playback_recs:
+            color = self._side_spawn_color(getattr(rec, "side", ""))
+            color = color if color is not None else QColor("#f8fafc")
+            # 几何先按一个很小的尺寸建出来(形状必须与 `_resize_label_geom` 里
+            # 重写时一致 —— numpy 的 `data[:] = ...` 要求形状完全相同)
+            pos, idx = _rounded_rect_geometry(0.01, 0.01, 0.001)
+            box = self._add(gfx.Mesh(
+                gfx.Geometry(positions=pos, indices=idx),
+                gfx.MeshBasicMaterial(color=_rgba(rmv.COLOR_CURSOR_LABEL_BG),
+                                      side="both", depth_write=False)),
+                O_CURSOR_LABEL_BOX)
+            edge = self._add(gfx.Line(
+                gfx.Geometry(positions=np.zeros((8, 3), dtype=np.float32)),
+                gfx.LineSegmentMaterial(thickness=1.0, thickness_space="screen",
+                                        color=_rgba(color), alpha_mode="blend")),
+                O_CURSOR_LABEL_EDGE)
+            txt = self._add(gfx.Text(
+                text="", font_size=11, screen_space=True, family=_CJK_FAMILY,
+                anchor="top-left",
+                material=gfx.TextMaterial(color=_rgba(rmv.COLOR_CURSOR_LABEL_FG))),
+                O_CURSOR_LABEL_TEXT)
+            for o in (box, edge, txt):
+                o.visible = False
+            self._gl_cursor_labels.append({
+                "rec": rec, "box": box, "edge": edge, "text": txt,
+                "str": None, "w": 0.0, "h": 0.0, "dy": 0.0,
+                "font": QFont(rmv.CURSOR_LABEL_FAMILY, rmv.CURSOR_LABEL_FONT_PX),
+            })
+
+    def _sync_cursor_labels(self, dw: float, dh: float) -> None:
+        """把标签贴到各自的光标旁(每帧一次, 只动 position / 必要时改字)。"""
+        labels = getattr(self, "_gl_cursor_labels", None)
+        if not labels or not dw or not dh:
+            return
+        z = Z_PLAYER + 0.001
+        total = len(labels)
+        for i, lab in enumerate(labels):
+            rec = lab["rec"]
+            cur = rmv.point_at(rec.points, self._playhead) if rec.points else None
+            if cur is None or self._dead_now(rec, self._playhead):
+                for key in ("box", "edge", "text"):
+                    lab[key].visible = False
+                continue
+            x, y = float(cur.x), 1.0 - float(cur.y)
+            text = rmv.cursor_label_text(rec, cur)
+            if text != lab["str"]:
+                lab["str"] = text
+                fm = QFontMetrics(lab["font"])
+                lab["w"] = (float(fm.horizontalAdvance(text))
+                            + 2 * rmv.CURSOR_LABEL_PAD) / dw
+                lab["h"] = (float(fm.height()) + rmv.CURSOR_LABEL_PAD) / dh
+                lab["dy"] = (rmv.cursor_label_stagger(i, total, lab["font"]) / dh)
+                # 文字只在这一刻改: `set_text` 0.16 ms, 而新建 Text 要 1.14 ms(实测)
+                lab["text"].set_text(text)
+                self._resize_label_geom(lab, dw)
+            w, h = lab["w"], lab["h"]
+            gap = rmv.CURSOR_LABEL_GAP / dw
+            # 默认贴点**右侧**; 超出右边界就翻到左侧(与软件版 `cursor_label_box` 一致)
+            left = x + gap if x + gap + w <= 1.0 else x - gap - w
+            # 注意 y 轴朝上(1-y 已翻过), 所以像素上的“向下错开”要减
+            cy = y - lab["dy"]
+            for key in ("box", "edge", "text"):
+                lab[key].visible = True
+            lab["box"].local.position = (left + w / 2.0, cy, z)
+            lab["edge"].local.position = (left + w / 2.0, cy, z)
+            lab["text"].local.position = (left + rmv.CURSOR_LABEL_PAD / dw,
+                                          cy + h / 2.0 - rmv.CURSOR_LABEL_PAD / dh / 2.0,
+                                          z)
+
+    @staticmethod
+    def _resize_label_geom(lab: dict, dw: float) -> None:
+        """标签尺寸变了 → 重算底框与描边的几何(只在文字变长/变短时走)。
+
+        几何**以自身中心为原点**, 位置交给 `local.position` —— 这样每帧移动标签
+        只改矩阵, 不碰顶点缓冲。
+        """
+        w, h = lab["w"], lab["h"]
+        pos, idx = _rounded_rect_geometry(w, h, 3.0 / max(dw, 1e-9))
+        box = lab["box"].geometry
+        box.positions.data[:] = pos
+        box.indices.data[:] = idx
+        box.positions.update_full()
+        box.indices.update_full()
+        corners = ((-w / 2, -h / 2), (w / 2, -h / 2), (w / 2, h / 2),
+                   (-w / 2, h / 2), (-w / 2, -h / 2))
+        segs = np.empty((8, 3), dtype=np.float32)
+        segs[0::2] = [(cx, cy, 0.0) for cx, cy in corners[:-1]]
+        segs[1::2] = [(cx, cy, 0.0) for cx, cy in corners[1:]]
+        edge = lab["edge"].geometry
+        edge.positions.data[:] = segs
+        edge.positions.update_full()
 
     def _build_border(self) -> None:
         """地图边框(与软件版 `_draw_base` 末尾那条细框一致)。"""
@@ -1704,6 +1818,7 @@ class RouteMapGlView(RouteMapView):
             self._gl_cursor.geometry.positions.update_full()
             if self._gl_cursor_dir is not None:
                 self._gl_cursor_dir.geometry.positions.update_full()
+            self._sync_cursor_labels(dw, dh)
 
         # 悬停浮层的尺寸/内容都随文本变, 而且文本已进 `_content_key`
         # → 由 `_rebuild_objects` 统一重建(这里不再做就地改字的特例)
