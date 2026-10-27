@@ -206,7 +206,10 @@ class EcsCollector:
 
     def __init__(self) -> None:
         self._templates: dict[int, dict] = {}
-        self._compdefs: set[int] = set()
+        # cid -> (DataComponentHash, ComponentHash)。两个 hash 必须留着：
+        # 组件值要怎么读，由 ComponentHash 对应的**类型名**决定（int / bool /
+        # ecs::string / *StorageComponent …），DataComponentHash 只给字段名。
+        self._compdefs: dict[int, tuple[int, int]] = {}
         self._creations: list[Creation] = []
         self._destroys: dict[int, list[int]] = defaultdict(list)   # eid -> [tick, …]
         self.stats: Counter = Counter()
@@ -265,9 +268,7 @@ class EcsCollector:
             for _ in range(ncomp):
                 cid = br.compressed()
                 if cid not in self._compdefs:
-                    self._compdefs.add(cid)
-                    br.u32()            # DataComponentHash
-                    br.u32()            # ComponentHash
+                    self._compdefs[cid] = (br.u32(), br.u32())
                 comps.append(cid)
             t = {"id": tid, "name": name, "comps": comps}
             self._templates[tid] = t
