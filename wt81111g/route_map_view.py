@@ -64,6 +64,10 @@ CURSOR_LABEL_FONT_PX = 10       # 字号(pt)
 CURSOR_LABEL_FAMILY = "Microsoft YaHei"
 COLOR_CURSOR_LABEL_BG = QColor(15, 23, 42, 205)
 COLOR_CURSOR_LABEL_FG = QColor("#f8fafc")
+# 引导线: 标签被挤到离点较远时, 用一根细线把点和它的标签连起来(否则看不出是谁的)
+CURSOR_LABEL_LEADER_MIN = 10.0   # 点和标签已经这么近就不画线(px)
+CURSOR_LABEL_LEADER_PEN = 1.2    # 引导线粗细(px)
+COLOR_CURSOR_LABEL_LEADER = QColor(226, 232, 240, 215)
 COLOR_DIR_LINE = QColor("#f8fafc")   # 回放朝向线颜色(白, 与回放光标同色)
 # 选中的历史轨迹: **不透明**(便于多条叠在一起对比)
 COLOR_HISTORY = QColor("#8fa6c8")
@@ -351,29 +355,125 @@ def cursor_label_text(rec, cur) -> str:
     return f"{name}  {speed} km/h" if name else f"{speed} km/h"
 
 
-def cursor_label_box(center: QPointF, text: str, width: float,
-                     font: QFont, dy: float = 0.0) -> QRectF:
-    """标签框(控件像素坐标)。默认贴光标**右侧**; 超出右边就翻到左侧。
-
-    `dy` 是多条回放时的**垂直错开量**: 两台车在同一高度时标签会叠在一起,
-    错开半个标签高就都读得清(见 `_cursor_label_stagger`)。
-    """
+def cursor_label_size(text: str, font: QFont) -> tuple[float, float]:
+    """标签框的像素尺寸(与 `_draw_cursor_label` 画的框完全一致)。"""
     fm = QFontMetrics(font)
-    tw, th = float(fm.horizontalAdvance(text)), float(fm.height())
-    box_w = tw + 2 * CURSOR_LABEL_PAD
-    x = center.x() + CURSOR_LABEL_GAP
-    if x + box_w > width - 2.0:
-        x = center.x() - CURSOR_LABEL_GAP - box_w
-    return QRectF(x, center.y() - th / 2.0 - CURSOR_LABEL_PAD / 2.0 + dy, box_w,
-                  th + CURSOR_LABEL_PAD)
+    return (float(fm.horizontalAdvance(text)) + 2 * CURSOR_LABEL_PAD,
+            float(fm.height()) + CURSOR_LABEL_PAD)
 
 
-def cursor_label_stagger(index: int, total: int, font: QFont) -> float:
-    """多条回放时每个标签的垂直错开量(单条时恒为 0, 与以前完全一样)。"""
-    if total <= 1:
-        return 0.0
-    step = float(QFontMetrics(font).height()) + CURSOR_LABEL_PAD * 2 + 2.0
-    return (index - (total - 1) / 2.0) * step
+# 标签相对锚点的候选方位(单位向量, **屏幕坐标 y 向下**)。
+# 顺序有意义: 前 4 个是最自然的方向(右/右上/上/左上), 代价相同时优先选靠前的,
+# 这样单条回放仍然是“贴在点的右边”, 与以前一致。
+CURSOR_LABEL_DIRS = (
+    (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1),
+)
+# 候选**圈数**: 只有一圈时, 20 多台车挤在一起的标签必然全叠在一起(实测重叠 91%)。
+# 允许往外再多放几圈, 由引导线保证“还看得出是哪个点的标签”。
+CURSOR_LABEL_RINGS = 5
+# 每圈往外多走的像素(相对标签高度): 0.9 ≈ 一行半, 圈与圈之间刚好留一点缝
+CURSOR_LABEL_RING_STEP = 0.9
+# 代价里的“整块重叠”折合多少像素的距离 —— 越大越优先消除重叠(实测 250 比较合适:
+# 100% 重叠 ≈ 250 px 的引导线, 也就是“宁可拉一根 2 cm 的线, 也别压着别人”)
+CURSOR_LABEL_OVERLAP_COST = 250.0
+
+
+def _label_candidate(ax: float, ay: float, w: float, h: float,
+                     sx: int, sy: int, gap: float) -> tuple[float, float]:
+    """某个方位/距离上的候选位置(盒子左上角, 屏幕像素)。
+
+    `sx/sy` 是该方向“盒子朝哪边伸出”: 1 = 向 +x 伸出, -1 = 向 -x; y 同理。
+    盒子离锚点的**最近边**保持 `gap` 的距离。
+    """
+    if sx > 0:
+        lx = ax + gap
+    elif sx < 0:
+        lx = ax - gap - w
+    else:
+        lx = ax - w / 2.0
+    if sy > 0:
+        ly = ay + gap
+    elif sy < 0:
+        ly = ay - gap - h
+    else:
+        ly = ay - h / 2.0
+    return lx, ly
+
+
+def layout_cursor_labels(anchors, width: float, height: float,
+                         gap: float = CURSOR_LABEL_GAP) -> list[tuple[float, float]]:
+    """给一堆标签找位置: **尽量贴着各自的点, 尽量少重叠**(允许重叠, 不追求零重叠)。
+
+    `anchors` 是 `[(ax, ay, w, h)]`(点的像素坐标 + 盒子的像素尺寸),
+    返回同样长度的 `[(lx, ly)]`(盒子左上角)。
+
+    做法: **贪心 + 8 个方位 × 5 圈候选**, 依次给每个标签挑代价最小的位置:
+
+        代价 = 重叠比例 × 250px + **点到框边**的最近距离(px) + 方位序号 × 0.5
+
+    * 重叠用**比例**而不是面积, 免得“长标签天然吃亏”;
+    * 距离用**点到框边**而不是到框中心: 长标签的中心天然远, 用中心会让所有长标签
+      都判定为“贴不近”, 反而去抢上下方位(实测单条回放会跑到点正上方);
+      用框边距离时“贴右边”和“贴上方”都是 gap, 由方位序号决定 → 单条回放与以前完全一致;
+    * 距离用像素而不是平方 —— 平方会把远处的候选罚得过狠, 于是所有标签又挤回点上;
+    * 候选圈由近到远, 近处放得下就绝不会凭空跑远。
+
+    引导线(`cursor_label_leader`)负责把被挤远的标签和它的点连起来 ——
+    用户 2026-10-27 的方案: “允许重叠, 尽量少重叠 + 一根线”。
+
+    O(n²/2 × 40), n = 正在回放的线路数(实测 24 条约 2.9 ms, 只在 4 Hz 上重算)。
+    """
+    placed: list[tuple[float, float, float, float]] = []      # x0,y0,x1,y1
+    out: list[tuple[float, float]] = []
+    max_x = max(0.0, width)
+    max_y = max(0.0, height)
+    for ax, ay, w, h in anchors:
+        step = max(6.0, h * CURSOR_LABEL_RING_STEP)
+        best = None
+        for ring in range(CURSOR_LABEL_RINGS):
+            d = gap + ring * step
+            for rank, (sx, sy) in enumerate(CURSOR_LABEL_DIRS):
+                lx, ly = _label_candidate(ax, ay, w, h, sx, sy, d)
+                # 夹进窗口(夹完可能又压到别人身上, 所以重叠要**用夹完的位置**算)
+                lx = min(max(0.0, lx), max(0.0, max_x - w))
+                ly = min(max(0.0, ly), max(0.0, max_y - h))
+                x1, y1 = lx + w, ly + h
+                ov = 0.0
+                for (px0, py0, px1, py1) in placed:
+                    dx = min(x1, px1) - max(lx, px0)
+                    if dx <= 0.0:
+                        continue
+                    dy = min(y1, py1) - max(ly, py0)
+                    if dy <= 0.0:
+                        continue
+                    ov += dx * dy
+                # 距离用**点到框边的最近距离** —— 与引导线同一口径(见 docstring)
+                dcx = min(max(ax, lx), x1) - ax
+                dcy = min(max(ay, ly), y1) - ay
+                dist = math.hypot(dcx, dcy)
+                cost = (ov / (w * h) if w > 0 and h > 0 else 0.0)
+                cost = cost * CURSOR_LABEL_OVERLAP_COST + dist + rank * 0.5
+                # 绝不能把自己的点盖住: 贴边被夹进窗口后, 长标签可能正好罩住那个点,
+                # 于是“距离 0”成了最优解(实测单条回放会把标签甩到点左边并盖住它)。
+                if lx <= ax <= x1 and ly <= ay <= y1:
+                    cost += 1.0e5
+                if best is None or cost < best[0]:
+                    best = (cost, lx, ly)
+        _, lx, ly = best
+        placed.append((lx, ly, lx + w, ly + h))
+        out.append((lx, ly))
+    return out
+
+
+def cursor_label_leader(ax: float, ay: float, lx: float, ly: float,
+                        w: float, h: float) -> tuple[float, float, float, float] | None:
+    """引导线: 从点连到盒子**最近的边**上; 盒子里点已经很近时返回 None(不必画)。"""
+    cx = min(max(ax, lx), lx + w)
+    cy = min(max(ay, ly), ly + h)
+    dx, dy = cx - ax, cy - ay
+    if dx * dx + dy * dy <= CURSOR_LABEL_LEADER_MIN ** 2:
+        return None
+    return (ax, ay, cx, cy)
 
 
 def _columns_of(points):
@@ -541,6 +641,9 @@ class RouteMapView(QWidget):
         self._dead_mark = True
         # 回放时在光标旁显示「型号 + 速度」(用户 2026-10-27 要求; 设置里可关, 默认开)
         self._play_label = True
+        # 标签位置缓存(id(rec) -> ((lx,ly),(w,h))) 与它的指纹, 见 `_label_layout`
+        self._label_cache: dict = {}
+        self._label_key: tuple | None = None
         # 战区(A/B/C): [{"label": "A", "x": .., "y": .., "side": .., "blink": 0/1/2}]
         self._zones: list[dict] = []
         self._show_zones = True
@@ -2215,16 +2318,24 @@ class RouteMapView(QWidget):
 
     def _draw_cursor_label(self, p: QPainter, rec, cur, c: QPointF,
                            color: QColor | None) -> None:
-        """光标旁那行「型号 + 速度」—— 跟着点走, 每帧现画(两行字, 很便宜)。"""
+        """光标旁那行「型号 + 速度」—— 位置由 `_label_layout()` 统一排好。"""
         text = cursor_label_text(rec, cur)
         if not text:
             return
+        got = self._label_layout().get(id(rec))
+        if got is None:
+            return
+        (lx, ly), (w, h) = got
         font = QFont(CURSOR_LABEL_FAMILY, CURSOR_LABEL_FONT_PX)
         p.setFont(font)
-        recs = self._playback_recs
-        idx = next((i for i, r in enumerate(recs) if r is rec), 0)
-        box = cursor_label_box(c, text, float(self.width()), font,
-                               cursor_label_stagger(idx, len(recs), font))
+        box = QRectF(lx, ly, w, h)
+        # 引导线先画(在框下面, 不会被框遮住一截)
+        lead = cursor_label_leader(c.x(), c.y(), lx, ly, w, h)
+        if lead is not None:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(COLOR_CURSOR_LABEL_LEADER, CURSOR_LABEL_LEADER_PEN,
+                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawLine(QPointF(lead[0], lead[1]), QPointF(lead[2], lead[3]))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(COLOR_CURSOR_LABEL_BG)
         p.drawRoundedRect(box, 3.0, 3.0)
@@ -2234,6 +2345,39 @@ class RouteMapView(QWidget):
         p.setPen(QPen(COLOR_CURSOR_LABEL_FG))
         p.drawText(box.adjusted(CURSOR_LABEL_PAD, 0, -CURSOR_LABEL_PAD, 0),
                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
+
+    def _label_layout(self) -> dict[int, tuple[tuple[float, float], tuple[float, float]]]:
+        """给本次回放的所有光标标签排一次位置(`id(rec) -> ((lx,ly),(w,h))`)。
+
+        只在“换了一批回放对象 / 播放头每走 0.25 s / 窗口尺寸变了”时重算 ——
+        贪心布局是 O(n²), 没必要每帧都跑; 而**引导线每帧都跟着点画**,
+        所以肉眼看不出标签是分档移动的。
+        """
+        recs = self._playback_recs
+        if not recs or not self._play_label:
+            self._label_cache = {}
+            self._label_key = None
+            return {}
+        key = (tuple(id(r) for r in recs), round(self._playhead * 4),
+               self.width(), self.height())
+        if key == self._label_key:
+            return self._label_cache
+        font = QFont(CURSOR_LABEL_FAMILY, CURSOR_LABEL_FONT_PX)
+        anchors: list[tuple[float, float, float, float]] = []
+        meta: list[tuple[int, str, float, float]] = []
+        for rec in recs:
+            cur = point_at(rec.points, self._playhead) if rec.points else None
+            if cur is None or self._dead_now(rec, self._playhead):
+                continue
+            c = self._to_px(cur.x, cur.y)
+            text = cursor_label_text(rec, cur)
+            w, h = cursor_label_size(text, font)
+            anchors.append((c.x(), c.y(), w, h))
+            meta.append((id(rec), text, w, h))
+        spots = layout_cursor_labels(anchors, float(self.width()), float(self.height()))
+        self._label_cache = {m[0]: (spots[i], (m[2], m[3])) for i, m in enumerate(meta)}
+        self._label_key = key
+        return self._label_cache
 
     def _draw_playback(self, p: QPainter, rec: RouteRecord, head: float,
                        labels: bool = True) -> None:
