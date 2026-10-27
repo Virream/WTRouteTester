@@ -53,17 +53,6 @@ CURSOR_DIR_BACK = 1.2         # 朝向短线起点到圆心的距离(点内部)
 CURSOR_DIR_LEN = 2.6          # 短线长度 → 终点距圆心 3.8px(仍在 4px 半径内)
 CURSOR_DIR_PEN = 1.8          # 短线粗细(1.5px 时经抗锯齿后几乎没有实黑像素)
 COLOR_CURSOR_DIR = QColor("#0ea5e9")    # 短线颜色: sky-500(用户 2026-10-22 选定)
-# 回放光标旁的「型号 + 速度」标签(2026-10-27 用户要求, 可在设置里关掉)。
-# 贴着光标画、跟着它走; 用**深色底 + 细边框**保证在明暗底图上都读得清
-# (与 `_draw_time_label` 同一套做法)。
-CURSOR_LABEL_GAP = 8.0          # 标签左边缘到光标中心的距离
-CURSOR_LABEL_PAD = 4.0          # 文字到框边的内边距
-CURSOR_LABEL_FONT_PX = 10       # 字号(pt)
-# 型号是英文标识符(`us_m1a2_sep3_abrams`), Consolas 等宽更好读; 但 8111 录制的
-# `vehicle` 可能是中文, 所以用雅黑 —— 两条路径(GPU/软件)共用这一个名字。
-CURSOR_LABEL_FAMILY = "Microsoft YaHei"
-COLOR_CURSOR_LABEL_BG = QColor(15, 23, 42, 205)
-COLOR_CURSOR_LABEL_FG = QColor("#f8fafc")
 COLOR_DIR_LINE = QColor("#f8fafc")   # 回放朝向线颜色(白, 与回放光标同色)
 # 选中的历史轨迹: **不透明**(便于多条叠在一起对比)
 COLOR_HISTORY = QColor("#8fa6c8")
@@ -339,43 +328,6 @@ def cursor_dir_points(center: QPointF, ang: float, back: float = CURSOR_DIR_BACK
     return (pt(back), pt(back + length))
 
 
-def cursor_label_text(rec, cur) -> str:
-    """回放光标旁边那行字: **型号 + 当前速度**。
-
-    `rec.vehicle` 在回放导入的条目里是「玩家 · 型号」(`[^PPPA^] 白玉楼的大小姐 · us_t58`),
-    太长且名字已经在侧栏里, 所以优先用 `vehicle_cls`(纯型号); 8111 录制的条目没有
-    `vehicle_cls`, 退回 `vehicle`。两样都没有就只显示速度 —— 不要显示 uid。
-    """
-    name = (getattr(rec, "vehicle_cls", "") or getattr(rec, "vehicle", "") or "").strip()
-    speed = fmt_speed(getattr(cur, "speed", 0.0) or 0.0)
-    return f"{name}  {speed} km/h" if name else f"{speed} km/h"
-
-
-def cursor_label_box(center: QPointF, text: str, width: float,
-                     font: QFont, dy: float = 0.0) -> QRectF:
-    """标签框(控件像素坐标)。默认贴光标**右侧**; 超出右边就翻到左侧。
-
-    `dy` 是多条回放时的**垂直错开量**: 两台车在同一高度时标签会叠在一起,
-    错开半个标签高就都读得清(见 `_cursor_label_stagger`)。
-    """
-    fm = QFontMetrics(font)
-    tw, th = float(fm.horizontalAdvance(text)), float(fm.height())
-    box_w = tw + 2 * CURSOR_LABEL_PAD
-    x = center.x() + CURSOR_LABEL_GAP
-    if x + box_w > width - 2.0:
-        x = center.x() - CURSOR_LABEL_GAP - box_w
-    return QRectF(x, center.y() - th / 2.0 - CURSOR_LABEL_PAD / 2.0 + dy, box_w,
-                  th + CURSOR_LABEL_PAD)
-
-
-def cursor_label_stagger(index: int, total: int, font: QFont) -> float:
-    """多条回放时每个标签的垂直错开量(单条时恒为 0, 与以前完全一样)。"""
-    if total <= 1:
-        return 0.0
-    step = float(QFontMetrics(font).height()) + CURSOR_LABEL_PAD * 2 + 2.0
-    return (index - (total - 1) / 2.0) * step
-
-
 def _columns_of(points):
     """`(fmt, 列数组)` 或 None —— 这个点序列是不是**列存储**(见 `route_store._Cols`)。"""
     cols_of = getattr(points, "columns", None)
@@ -539,8 +491,6 @@ class RouteMapView(QWidget):
         # 回放选项(侧栏两个勾选框, 默认都开): 阵亡后线路变半透明纯灰 / 阵亡处画红叉
         self._dead_dim = True
         self._dead_mark = True
-        # 回放时在光标旁显示「型号 + 速度」(用户 2026-10-27 要求; 设置里可关, 默认开)
-        self._play_label = True
         # 战区(A/B/C): [{"label": "A", "x": .., "y": .., "side": .., "blink": 0/1/2}]
         self._zones: list[dict] = []
         self._show_zones = True
@@ -2127,21 +2077,6 @@ class RouteMapView(QWidget):
     def dead_mark(self) -> bool:
         return self._dead_mark
 
-    def set_play_label(self, shown: bool) -> None:
-        """回放时是否在光标旁显示「型号 + 速度」(用户 2026-10-27, 默认开)。
-
-        只是每帧现画的两行字, 不进任何缓存层 —— 开关它**不**需要重建轨迹,
-        所以这里连 `update()` 之外什么都不用做(与 `set_dead_style` 不同)。
-        """
-        shown = bool(shown)
-        if shown != self._play_label:
-            self._play_label = shown
-            self.update()
-
-    @property
-    def play_label(self) -> bool:
-        return self._play_label
-
     def _dead_mark_color(self, rec) -> QColor:
         """阵亡标记的颜色: 跟**该队重生点在画面上显示的颜色**一致。
 
@@ -2210,30 +2145,6 @@ class RouteMapView(QWidget):
         p.drawEllipse(c, PLAY_CURSOR_R, PLAY_CURSOR_R)
         # 录制时存过朝向就一起画出来(旧轨迹的点没有朝向 → 只画那个点)
         self._draw_cursor_dir(p, c, cur.dx, cur.dy)
-        if self._play_label:
-            self._draw_cursor_label(p, rec, cur, c, color)
-
-    def _draw_cursor_label(self, p: QPainter, rec, cur, c: QPointF,
-                           color: QColor | None) -> None:
-        """光标旁那行「型号 + 速度」—— 跟着点走, 每帧现画(两行字, 很便宜)。"""
-        text = cursor_label_text(rec, cur)
-        if not text:
-            return
-        font = QFont(CURSOR_LABEL_FAMILY, CURSOR_LABEL_FONT_PX)
-        p.setFont(font)
-        recs = self._playback_recs
-        idx = next((i for i, r in enumerate(recs) if r is rec), 0)
-        box = cursor_label_box(c, text, float(self.width()), font,
-                               cursor_label_stagger(idx, len(recs), font))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(COLOR_CURSOR_LABEL_BG)
-        p.drawRoundedRect(box, 3.0, 3.0)
-        p.setPen(QPen(color if color is not None else COLOR_CURSOR_LABEL_FG, 1.0))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(box, 3.0, 3.0)
-        p.setPen(QPen(COLOR_CURSOR_LABEL_FG))
-        p.drawText(box.adjusted(CURSOR_LABEL_PAD, 0, -CURSOR_LABEL_PAD, 0),
-                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
 
     def _draw_playback(self, p: QPainter, rec: RouteRecord, head: float,
                        labels: bool = True) -> None:
