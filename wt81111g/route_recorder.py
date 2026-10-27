@@ -1089,7 +1089,8 @@ class RouteRecorder(QObject):
                      new, len(rec.kills))
         else:
             log.info("全局录制: hudmsg 没有新阵亡消息(累计 %d 条)", len(rec.kills))
-        sides_done = [s for s in GLOBAL_SIDES if rec.lives(s)]
+        # AI 组是回放导入算出来的, 8111 录制不会有它 —— 这里只认 A / B
+        sides_done = [s for s in ("A", "B") if rec.lives(s)]
         if len(sides_done) < 2:
             log.info("全局录制: 只录了 %s 队, 等另一队也录完后再做死亡时刻对齐",
                      "/".join(sides_done) or "?")

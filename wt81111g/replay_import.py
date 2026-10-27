@@ -23,12 +23,15 @@ import time
 from dataclasses import dataclass
 
 from .map_calib import MAP_KEY_PREFIX, MapCalib, level_of, load_bundled
-from .route_store import GlobalRecord, TrackPoint, UnitLife
+from .route_store import (GLOBAL_SIDE_COLORS, GLOBAL_SIDES, GlobalRecord,
+                          TrackPoint, UnitLife)
 from .wrpl_reader import EXT_MASK_UID, ReplayData, load_replay
 from .wrpl_results import load_results
 from .zones import mode_name as zone_mode_name
 
 log = logging.getLogger("replay_import")
+
+SIDE_AI = "AI"              # 无玩家身份的单位(会动的 AI 车/工事)归到这一组
 
 # 归一化后仍超出 [0,1] 的点按边界截断（远处 AI 会落在框外）
 GAP_SPLIT_SEC = 45.0        # 相邻采样超过这么久 → 认为是两段（死了/长时间无上报）
@@ -571,6 +574,13 @@ def build_record(data: ReplayData, source_path: str = "",
             veh = seg_src[si - 1]           # 上面已按段首时刻解析好
             if veh is not None and veh.team:
                 side = "B" if veh.team == 2 else "A"
+            # **AI 分组**: 既没有出生组名(玩家载具的身份来源)、也没有击杀记录的 uid,
+            # 是地图上的 AI 车/工事。以前 `_side()` 一律回落成 "A", 于是它们混进
+            # A 队(实测 4 条会动的 AI 线, 地图上看着像玩家)。现在单独归到 AI 灰。
+            _has_player = ((veh is not None and (veh.player or veh.spawn))
+                           or data.uid_pid.get(uid) is not None)
+            if not _has_player:
+                side = SIDE_AI
             if veh is not None and veh.player:
                 stats.mapped += 1
             elif data.uid_pid.get(uid) is not None:
@@ -593,7 +603,7 @@ def build_record(data: ReplayData, source_path: str = "",
                 vehicle_cls=(veh.short_cls if veh is not None
                              else (vehicle_of.get(uid) or "")),
                 obj_type="ground_model",
-                color="#174DFF" if side == "A" else "#FF4D4D",
+                color=GLOBAL_SIDE_COLORS.get(side, GLOBAL_SIDE_COLORS["B"]),
                 map_key=rec.map_key,
                 points=pts,
                 side=side,
@@ -734,7 +744,7 @@ def build_record(data: ReplayData, source_path: str = "",
                 player=_who,
                 vehicle_cls=_cls,
                 obj_type="air_model",
-                color="#174DFF" if side == "A" else "#FF4D4D",
+                color=GLOBAL_SIDE_COLORS.get(side, GLOBAL_SIDE_COLORS["B"]),
                 map_key=rec.map_key,
                 points=pts,
                 side=side,
@@ -790,7 +800,7 @@ def renormalize_map_records(store, map_key: str, calib) -> int:
         # 80 万点时要跑几十万次内层循环: 把属性/索引都提到循环外(实测快约 30%)
         ox, otop, sx, sz = old[0], old[3], spanx, spanz
         nx0, ntop, nsx, nsz = new_rect[0], new_rect[3], nspanx, nspanz
-        for side in ("A", "B"):
+        for side in GLOBAL_SIDES:
             for life in rec.lives(side):
                 for pt in life.points:
                     pt.x = (ox + pt.x * sx - nx0) / nsx

@@ -68,6 +68,7 @@ COLOR_DEAD_ROUTE = QColor(122, 128, 144, 215)
 COLOR_DEAD_MARK = QColor("#ff3b30")       # 默认/B 队: 红
 COLOR_DEAD_MARK_A = QColor("#174DFF")     # A 队: 蓝
 COLOR_DEAD_MARK_B = COLOR_DEAD_MARK       # B 队: 红(不变)
+COLOR_DEAD_MARK_AI = QColor("#8A8A8A")    # AI 组: 灰(与线条颜色一致)
 DEAD_MARK_HALF = 2.6          # X 的半臂长(px, 不随缩放变)
 DEAD_MARK_PEN = 1.2           # X 的线宽(px)
 COLOR_PLAYER = QColor("#38bdf8")
@@ -2084,6 +2085,8 @@ class RouteMapView(QWidget):
         算不出重生点颜色时才退回旧口径。
         """
         side = getattr(rec, "side", "")
+        if side == "AI":
+            return COLOR_DEAD_MARK_AI
         got = self._side_spawn_color(side)
         if got is not None:
             return got

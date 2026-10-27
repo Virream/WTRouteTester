@@ -1335,9 +1335,13 @@ class RouteMapGlView(RouteMapView):
             if not getattr(rec, "dead", False) or not rec.points:
                 continue
             side = getattr(rec, "side", "")
-            col = _rgba(self._side_spawn_color(side)
-                        or (rmv.COLOR_DEAD_MARK_A if side == "A"
-                            else rmv.COLOR_DEAD_MARK_B))
+            if side == "AI":
+                base = rmv.COLOR_DEAD_MARK_AI
+            elif side == "A":
+                base = rmv.COLOR_DEAD_MARK_A
+            else:
+                base = rmv.COLOR_DEAD_MARK_B
+            col = _rgba(self._side_spawn_color(side) or base)
             x, y = rec.points[-1].x, 1.0 - rec.points[-1].y
             v0 = len(cols)
             for a, b in (((x - sx, y - sy), (x + sx, y + sy)),

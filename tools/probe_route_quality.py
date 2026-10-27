@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wt81111g import wrpl_reader as RD                       # noqa: E402
 from wt81111g.replay_import import build_record              # noqa: E402
+from wt81111g.route_store import GLOBAL_SIDES as RD_SIDES    # noqa: E402
 from probe_results_blk import Blk                            # noqa: E402
 
 JUMP_M = 200.0          # 与 replay_import 的判据保持一致
@@ -137,9 +138,10 @@ def measure(path: str) -> None:
     name = os.path.basename(os.path.normpath(path)) or path
     data = RD.load_replay(path)
     rec, st = build_record(data)
-    lives = list(rec.sides.get("A", ())) + list(rec.sides.get("B", ()))
+    lives = [x for s in RD_SIDES for x in rec.sides.get(s, ())]
     ground = [x for x in lives if x.obj_type == "ground_model"]
     air = [x for x in lives if x.obj_type != "ground_model"]
+    n_ai = sum(1 for x in lives if getattr(x, "side", "") == "AI")
 
     rect = getattr(rec, "norm_rect", None) or [0.0, 1.0, 0.0, 1.0]
     spanx = max(1e-6, rect[1] - rect[0])
@@ -147,7 +149,7 @@ def measure(path: str) -> None:
 
     print(f"\n=== {name} ===")
     print(f"  日志: 样本 {data.sample_count} / 线 {len(lives)}"
-          f"(地面 {len(ground)} / 空中 {len(air)}) / 丢 {st.dropped} / "
+          f"(地面 {len(ground)} / 空中 {len(air)} / AI {n_ai}) / 丢 {st.dropped} / "
           f"映射 {st.mapped} / ECS 载具 {st.ecs_vehicles}(绑 {st.ecs_bound}) "
           f"K={st.ecs_group} / 击杀 {st.kills}")
     # 覆盖: 位置流里有多少 uid 真的有 ECS 档案? 档案里有多少能绑到玩家?
@@ -274,9 +276,10 @@ def measure(path: str) -> None:
     for fz, who, car, lid in freeze_rows[:5]:
         print(f"         ? 冻结 {fz:>6.0f}s  {who} / {car}  ({lid})")
 
-    # ---- 5. 空名
-    blank = sum(1 for x in lives if not x.player)
-    print(f"  [空名] {blank} 条 (占 {blank / max(1, len(lives)) * 100:.0f}%)")
+    # ---- 5. 空名(不含 AI 组 —— AI 本来就没有玩家名, 归到 AI 组才算对)
+    named_pool = [x for x in lives if getattr(x, "side", "") != "AI"]
+    blank = sum(1 for x in named_pool if not x.player)
+    print(f"  [空名] {blank} 条 (占 {blank / max(1, len(named_pool)) * 100:.0f}%)")
 
 
 def main() -> int:

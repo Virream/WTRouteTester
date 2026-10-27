@@ -494,8 +494,11 @@ class RouteRecord:
 # * 8111 的 `/map_obj.json` **没有 id、没有玩家名**, 所以"同一个单位"是录制器按
 #   "上一帧位置最近的那个同类对象"推测出来的(见 route_recorder 里的匹配逻辑),
 #   同一个人中途上飞机/换车会被拆成两条线 —— 这点与用户确认过, 可以接受。
-GLOBAL_SIDES = ("A", "B")
-GLOBAL_SIDE_LABELS = {"A": "A 队", "B": "B 队"}
+GLOBAL_SIDES = ("A", "B", "AI")
+GLOBAL_SIDE_LABELS = {"A": "A 队", "B": "B 队", "AI": "AI"}
+# 线条颜色(与地图上 A/B 的蓝红一致)。AI 用灰 —— 回放导入时那些**没有玩家身份、
+# 也没有出生组名**的单位(会动的 AI 车/工事)归到这里, 不硬塞进某一队。
+GLOBAL_SIDE_COLORS = {"A": "#174DFF", "B": "#FF4D4D", "AI": "#8A8A8A"}
 
 
 @dataclass(slots=True)
@@ -805,7 +808,8 @@ class GlobalRecord:
     mode_name: str = ""
     duration: float = 0.0
     marks: list[str] = field(default_factory=list)
-    sides: dict[str, list[UnitLife]] = field(default_factory=lambda: {"A": [], "B": []})
+    sides: dict[str, list[UnitLife]] = field(
+        default_factory=lambda: {"A": [], "B": [], "AI": []})
     # 战区状态**时间轴**: [{"t": 秒, "zones": [{label,x,y,side,color,blink}]}]
     # 只在“归属变了或开始/结束被占领”时记一条(见 `RouteRecorder._record_zone_state`),
     # 回放时按时间取最近一条 → 战区能重现当时的蓝/红/占领中, 而不是一张静态快照。

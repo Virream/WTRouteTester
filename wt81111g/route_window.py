@@ -1373,6 +1373,9 @@ class RouteTesterWindow(QMainWindow):
 
         for side in GLOBAL_SIDES:
             lives = g.lives(side)
+            # AI 组没内容就不显示(8111 录制 / 老的回放里永远为空)
+            if not lives and side not in ("A", "B"):
+                continue
             sitem = QTreeWidgetItem(["", GLOBAL_SIDE_LABELS[side], f"{len(lives)} 条"])
             sitem.setData(0, _ROLE_KIND, "gside")
             sitem.setData(0, _ROLE_ID, g.route_id)
@@ -1381,10 +1384,16 @@ class RouteTesterWindow(QMainWindow):
             sitem.setFlags(GROUP_ITEM_FLAGS)
             sitem.setIcon(_COL_EYE, eye_icon(any(l.life_id in self._visible_lives
                                                 for l in lives)))
-            sitem.setToolTip(_COL_EYE, "点击显示 / 隐藏这一队的全部线路")
-            sitem.setToolTip(_COL_NAME,
-                             "回放的 /map_obj.json 只给**观战那一方**的单位,\n"
-                             "所以要分两次录制: 一次观战 A 方, 一次观战 B 方。")
+            sitem.setToolTip(_COL_EYE, "点击显示 / 隐藏这一组的全部线路")
+            if side == "AI":
+                sitem.setToolTip(_COL_NAME,
+                                 "回放里**没有玩家身份**的单位: 会动的 AI 车 / 工事。\n"
+                                 "它们既没有出生组名(玩家载具的身份来源), 也没有击杀记录,\n"
+                                 "所以不能归到 A / B 任何一队。")
+            else:
+                sitem.setToolTip(_COL_NAME,
+                                 "回放的 /map_obj.json 只给**观战那一方**的单位,\n"
+                                 "所以要分两次录制: 一次观战 A 方, 一次观战 B 方。")
             item.addChild(sitem)
             # ---- 按**玩家**分组（回放导入才能拿到玩家名）--------------------------
             # 同一个玩家一局里会死很多次、开过很多台车; 以前全平铺在一层里,
@@ -2336,6 +2345,10 @@ class RouteTesterWindow(QMainWindow):
             g = self.store.get_global(gid)
             menu.addSeparator()
             for side in GLOBAL_SIDES:
+                # 只有 A / B 能当录制目标 —— AI 组是回放导入算出来的, 8111 录制
+                # 没有这个概念(见 `GLOBAL_SIDES` 的说明)。
+                if side not in ("A", "B"):
+                    continue
                 act = QAction(f"标记为 {GLOBAL_SIDE_LABELS[side]}录制目标", self)
                 act.setCheckable(True)
                 act.setChecked(g is not None and side in g.marks)
