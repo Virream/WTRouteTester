@@ -2685,9 +2685,12 @@ class RouteTesterWindow(QMainWindow):
         if done:
             self._reload_tree()
             # 新导入的线路默认点亮(否则侧栏里有、地图上一片空, 会以为没导入成功)
+            # ⚠ 必须遍历**全部**队别(A/B/**AI**) —— 只点亮 A/B 的话, AI 组那几条线
+            #   导入后是隐藏的, 看起来就像"少了几条线"。
             for rec, _st in done:
-                self._visible_lives |= {lf.life_id for lf in rec.sides["A"]}
-                self._visible_lives |= {lf.life_id for lf in rec.sides["B"]}
+                for _side in GLOBAL_SIDES:
+                    self._visible_lives |= {lf.life_id
+                                            for lf in (rec.sides.get(_side) or ())}
             self._refresh_eye_icons()
             first = done[-1][0]
             self._expand_item(f"global|{first.route_id}")
