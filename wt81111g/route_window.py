@@ -25,6 +25,7 @@ import time
 from PyQt6.QtCore import QSettings, QSize, Qt, QTimer
 from PyQt6.QtGui import (
     QAction, QActionGroup, QBrush, QCloseEvent, QColor, QFont, QIcon, QPalette,
+    QGuiApplication,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -224,8 +225,19 @@ class RouteTesterWindow(QMainWindow):
         # 入口在菜单「设置 → 轮询间隔」—— 主界面不再放这个下拉框(见上方常量注释)。
         # 可注入: 测试必须用**临时配置**, 否则会改写用户真实设置
         # (以前就踩过: 测试跑一遍, 用户的轮询间隔/显示开关全被改掉)。
+        _settings_injected = settings is not None
         self._settings = settings if settings is not None else QSettings(
             "WTBlackList", "RouteTester")
+        # 离屏/无头(测试、探针)且**用的是真实配置**时, 绝对不能碰下面那套
+        # 「上次崩了 → 改成强制软件绘制」的判定。
+        # 2026-10-27 实测踩过: 一个 offscreen 探针建了真窗口(没注入临时配置),
+        # 留下 gfx_pending=1; 用户下次启动被判成"上次 GPU 崩了", 于是被永久改成
+        # **软件绘制** —— 拖动卡、播放卡、缩放模糊全来了, 却完全看不出是它干的。
+        # 注入了 settings 的测试不受影响(它们要验崩溃回退本身)。
+        self._gfx_headless = bool(
+            not _settings_injected
+            and (os.environ.get("WTRT_NO_GFX_PENDING") == "1"
+                 or QGuiApplication.platformName().lower() == "offscreen"))
         # 默认值改过(见 SETTINGS_VERSION) → 把老用户存的值清掉, 让新默认生效
         try:
             _ver = int(self._settings.value("settings_version", 1))
@@ -306,7 +318,7 @@ class RouteTesterWindow(QMainWindow):
         self._gpu_notice_shown = False
         self._gpu_adapters: list[AdapterOption] = []
         self._gpu_adapters_error = ""
-        if self._gfx_crashed_before and not self._gfx_software:
+        if self._gfx_crashed_before and not self._gfx_software and not self._gfx_headless:
             log.warning("上次启动时 GPU 画布没能活下来(可能崩在 wgpu 内部) → 本次强制软件渲染")
             self._gfx_software = True
             # **持久化**: 下次也别再试了。用户修好驱动后要自己取消「强制软件绘制」
@@ -326,7 +338,7 @@ class RouteTesterWindow(QMainWindow):
                 )
         else:
             # 留标记: 只有真的走 GPU 才需要(软件渲染不会崩在 wgpu 里)
-            if not self._gfx_software:
+            if not self._gfx_software and not self._gfx_headless:
                 self._settings.setValue("gfx_pending", 1)
                 self._settings.sync()      # 必须**立刻**落盘 —— 崩了就没机会再写了
         # 录制叠加层(独立透明置顶窗, 显示录制进度/实际采集率; 默认关闭)
