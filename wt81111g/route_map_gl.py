@@ -275,8 +275,7 @@ O_DEAD = 40           # 阵亡叉
 O_CURSOR_DOT = 50     # 回放光标白点
 O_CURSOR_DIR = 51     # 光标朝向线
 # 光标旁「型号 + 速度」标签(2026-10-27 用户要求): 必须**在点之上**, 且低于玩家点。
-# 引导线画在底框**之前**(否则线会穿过标签文字)。
-O_CURSOR_LABEL_LEADER = 51.5
+# 三条是分开的 order, 底框 → 边框 → 文字(与时间标签同一套叠法)。
 O_CURSOR_LABEL_BOX = 52
 O_CURSOR_LABEL_EDGE = 52.5
 O_CURSOR_LABEL_TEXT = 53
@@ -699,7 +698,6 @@ class RouteMapGlView(RouteMapView):
         self._gl_hover_box = None
         self._gl_hover_px = None
         self._gl_cursor_labels = []
-        self._gl_cursor_leaders = None
 
     def _clear_icons(self) -> None:
         """只删图标类对象(轨迹保留) —— 缩放时走这条路。"""
@@ -1481,73 +1479,49 @@ class RouteMapGlView(RouteMapView):
                 o.visible = False
             self._gl_cursor_labels.append({
                 "rec": rec, "box": box, "edge": edge, "text": txt,
-                "str": None, "w": 0.0, "h": 0.0,
+                "str": None, "w": 0.0, "h": 0.0, "dy": 0.0,
                 "font": QFont(rmv.CURSOR_LABEL_FAMILY, rmv.CURSOR_LABEL_FONT_PX),
             })
-        # 引导线: 一条 Line 装下所有标签的连线(2n 个顶点), 每帧改坐标
-        n = len(self._gl_cursor_labels)
-        self._gl_cursor_leaders = self._add(gfx.Line(
-            gfx.Geometry(positions=np.zeros((2 * max(n, 1), 3), dtype=np.float32)),
-            gfx.LineSegmentMaterial(thickness=rmv.CURSOR_LABEL_LEADER_PEN,
-                                    thickness_space="screen",
-                                    color=_rgba(rmv.COLOR_CURSOR_LABEL_LEADER),
-                                    alpha_mode="blend")), O_CURSOR_LABEL_LEADER)
-        self._gl_cursor_leaders.visible = False
 
     def _sync_cursor_labels(self, dw: float, dh: float) -> None:
-        """把标签摆到 `_label_layout()` 算好的位置(每帧一次, 只动 position / 改字)。
-
-        布局(贪心 8 方位)每 0.25 s 才重算一次(见基类 `_label_layout`),
-        但**引导线每帧都跟着点画** —— 所以标签看起来一直连着自己的点。
-        """
+        """把标签贴到各自的光标旁(每帧一次, 只动 position / 必要时改字)。"""
         labels = getattr(self, "_gl_cursor_labels", None)
         if not labels or not dw or not dh:
             return
-        layout = self._label_layout()
         z = Z_PLAYER + 0.001
-        far = -1.0e6
-        lead = getattr(self, "_gl_cursor_leaders", None)
-        larr = lead.geometry.positions.data if lead is not None else None
+        total = len(labels)
         for i, lab in enumerate(labels):
             rec = lab["rec"]
             cur = rmv.point_at(rec.points, self._playhead) if rec.points else None
-            got = layout.get(id(rec))
-            if cur is None or got is None or self._dead_now(rec, self._playhead):
+            if cur is None or self._dead_now(rec, self._playhead):
                 for key in ("box", "edge", "text"):
                     lab[key].visible = False
-                if larr is not None:
-                    larr[2 * i] = larr[2 * i + 1] = (far, far, 0.0)
                 continue
-            (lx, ly), (pw, ph) = got
+            x, y = float(cur.x), 1.0 - float(cur.y)
             text = rmv.cursor_label_text(rec, cur)
             if text != lab["str"]:
                 lab["str"] = text
-                lab["w"] = pw / dw
-                lab["h"] = ph / dh
+                fm = QFontMetrics(lab["font"])
+                lab["w"] = (float(fm.horizontalAdvance(text))
+                            + 2 * rmv.CURSOR_LABEL_PAD) / dw
+                lab["h"] = (float(fm.height()) + rmv.CURSOR_LABEL_PAD) / dh
+                lab["dy"] = (rmv.cursor_label_stagger(i, total, lab["font"]) / dh)
                 # 文字只在这一刻改: `set_text` 0.16 ms, 而新建 Text 要 1.14 ms(实测)
                 lab["text"].set_text(text)
                 self._resize_label_geom(lab, dw)
             w, h = lab["w"], lab["h"]
-            # 像素布局(y 向下) → 归一化世界坐标(y 向上)
-            cx = (lx + pw / 2.0) / dw
-            cy = 1.0 - (ly + ph / 2.0) / dh
+            gap = rmv.CURSOR_LABEL_GAP / dw
+            # 默认贴点**右侧**; 超出右边界就翻到左侧(与软件版 `cursor_label_box` 一致)
+            left = x + gap if x + gap + w <= 1.0 else x - gap - w
+            # 注意 y 轴朝上(1-y 已翻过), 所以像素上的“向下错开”要减
+            cy = y - lab["dy"]
             for key in ("box", "edge", "text"):
                 lab[key].visible = True
-            lab["box"].local.position = (cx, cy, z)
-            lab["edge"].local.position = (cx, cy, z)
-            lab["text"].local.position = (lx / dw, 1.0 - (ly + rmv.CURSOR_LABEL_PAD / 2.0) / dh,
+            lab["box"].local.position = (left + w / 2.0, cy, z)
+            lab["edge"].local.position = (left + w / 2.0, cy, z)
+            lab["text"].local.position = (left + rmv.CURSOR_LABEL_PAD / dw,
+                                          cy + h / 2.0 - rmv.CURSOR_LABEL_PAD / dh / 2.0,
                                           z)
-            if larr is not None:
-                cxp, cyp = float(cur.x) * dw, (1.0 - float(cur.y)) * dh
-                seg = rmv.cursor_label_leader(cxp, cyp, lx, ly, pw, ph)
-                if seg is None:
-                    larr[2 * i] = larr[2 * i + 1] = (far, far, 0.0)
-                else:
-                    larr[2 * i] = (seg[0] / dw, 1.0 - seg[1] / dh, z)
-                    larr[2 * i + 1] = (seg[2] / dw, 1.0 - seg[3] / dh, z)
-        if lead is not None:
-            lead.visible = larr is not None and bool(np.any(larr[:, 0] > -1e5))
-            lead.geometry.positions.update_full()
 
     @staticmethod
     def _resize_label_geom(lab: dict, dw: float) -> None:
