@@ -2308,7 +2308,8 @@ class RouteTesterWindow(QMainWindow):
             menu.addAction(act_hide)
             menu.addSeparator()
             act_del = QAction("删除该记录", self)
-            act_del.triggered.connect(lambda: self._delete_route(item))
+            act_del.triggered.connect(
+                lambda: self._defer_modal(lambda: self._delete_route(item)))
             menu.addAction(act_del)
         else:
             if kind == "mode":     # 模式(战区控制 / 战区攻陷 / 战区争夺)
@@ -2323,7 +2324,9 @@ class RouteTesterWindow(QMainWindow):
                 menu.addSeparator()
             else:
                 act_rename = QAction("重命名地图", self)
-                act_rename.triggered.connect(lambda: self._rename_map(item.data(0, _ROLE_ID)))
+                act_rename.triggered.connect(
+                    lambda: self._defer_modal(
+                        lambda: self._rename_map(item.data(0, _ROLE_ID))))
                 menu.addAction(act_rename)
                 menu.addSeparator()
                 act_show_all = QAction("显示本图全部轨迹", self)
@@ -2383,8 +2386,23 @@ class RouteTesterWindow(QMainWindow):
             menu.addSeparator()
             act_del = QAction("删除该全局录制…", self)
             act_del.triggered.connect(
-                lambda: self._delete_global(item.data(0, _ROLE_ID)))
+                lambda: self._defer_modal(
+                    lambda: self._delete_global(item.data(0, _ROLE_ID))))
             menu.addAction(act_del)
+
+    def _defer_modal(self, fn) -> None:
+        """把「会弹模态框」的菜单动作推迟到本次菜单事件处理完之后再执行。
+
+        为什么:**菜单动作的 `triggered` 是在 `QMenu.exec()` 的嵌套事件循环里发出的**,
+        那一刻菜单自己还握着鼠标/键盘 grab。模态框在那里面建出来, Windows 上会出现
+        「框弹出来了但点不动、整窗像卡死」—— 用户 2026-10-27 报的就是这个:
+        不展开全局条目直接右键删除必现, 展开过再删就正常(展开时惰性加载已经做完,
+        弹框那一刻的时序不同)。
+
+        推迟一拍(`singleShot(0)`)之后, 菜单已经隐藏/销毁, 弹框路径与工具栏按钮
+        完全一样 —— 不改变任何文案、数据与后续逻辑, 只改"什么时候弹"。
+        """
+        QTimer.singleShot(0, fn)
 
     def _toggle_mark(self, gid: str, side: str, on: bool) -> None:
         """打/清“下次录到这一条”的标记。"""
@@ -2412,12 +2430,16 @@ class RouteTesterWindow(QMainWindow):
         g = self.store.get_global(gid)
         if g is None:
             return
+        # 留两条日志: 万一以后又出现"确认框卡住", 看这两行的时间差就知道它到底
+        # 卡在**弹出前**(菜单/事件循环)还是**弹出后**(等用户输入)。
+        log.info("删除全局录制 %s: 弹确认框(清单已加载=%s)", gid, g.sides_loaded())
         ok = QMessageBox.question(
             self, "删除全局录制",
             f"确定删除这条全局录制吗?\n\n"
             f"{g.label} · {g.map_name} · {g.mode_label}\n"
             f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条线路\n\n"
             f"删除后无法恢复(单条线路录制的轨迹不受影响)。")
+        log.info("删除全局录制 %s: 确认框返回 %s", gid, int(ok))
         if ok != QMessageBox.StandardButton.Yes:
             return
         self.store.remove_global(gid)
