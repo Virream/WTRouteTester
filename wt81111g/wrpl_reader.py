@@ -888,7 +888,8 @@ def load_replay(path: str, *, progress=None, expect_server: bool | None = None
     try:
         res = ecs.build(known_uids=set(data.units), players=data.players,
                         kills=data.kills, t_end=data.t_last,
-                        include_air=True)
+                        include_air=True,
+                        ground_pts=data.units, air_pts=data.air_units)
     except (ValueError, EOFError, IndexError, KeyError):
         res = None
     if res is not None:

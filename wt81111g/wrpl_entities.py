@@ -51,9 +51,31 @@ MISSION_OBJ_RE = re.compile(r"^t([12])_[a-z0-9][a-z0-9_.\-]{2,48}$")
 UNIT_TEMPLATE_EXACT = ("tank", "aircraft", "fortification")
 UNIT_TEMPLATE_SUFFIX = "+player_unit"
 
+# 开局每个玩家都有一台**占位飞机**(块里有明文 `dummy_plane`, 没有型号也没有 uid,
+# 实测 32 个, 8~10 s 出生)。它不是玩家载具 —— 以前靠「寿命 <5 s」这种阈值筛,
+# 现在按这个明文标记直接跳过。
+PLACEHOLDER_MARK = b"dummy_plane"
+
+# 同一次出生可能被建成好几个实体(实测 `tN_playerMM_0` 下会出现 2~5 条间隔
+# 0.1~2 s、型号乱跳的记录 —— 选车/换车时游戏反复建实体)。**同一个 uid 上**
+# 相邻且时间接得上的记录要合成一条寿命, 否则会凭空多出几条零点几秒的假线。
+# 只合并「同一 uid」, 不同 uid 之间照旧按「下一台车出现 = 上一台结束」切段。
+MERGE_GAP_SEC = 1.0
+
 
 def is_unit_template(name: str) -> bool:
     return name in UNIT_TEMPLATE_EXACT or name.endswith(UNIT_TEMPLATE_SUFFIX)
+
+
+# ---------------------------------------------------------------- 采样校验
+def _count_between(stream: dict, uid: int, lo: float, hi: float | None) -> int:
+    """`stream[uid]` 里时间落在 `[lo, hi]` 的点数(点元组第 0 项是秒)。"""
+    pts = stream.get(uid)
+    if not pts:
+        return 0
+    if hi is None:
+        return sum(1 for p in pts if p[0] >= lo)
+    return sum(1 for p in pts if lo <= p[0] <= hi)
 
 
 def _lenstr(br: BitReader) -> str:
@@ -172,6 +194,9 @@ class Vehicle:
     player: str = ""                    # 玩家名
     team: int | None = None             # 1 / 2
     bind: str = ""                      # 绑定依据: kill / formula / none
+    # 落在 [born, died] 窗口内的位置采样条数。0 = 这条记录可能读错了 uid
+    # (实测同一台车被建成多条时, 只有一条真有采样)。由 `build()` 填。
+    samples: int = 0
     # 消失时刻的来源:
     #   "ecs"  = 0x26 销毁包(最硬的事实)
     #   "next" = 同一玩家的下一台车出现了(玩家同一时刻只能开一台)
@@ -198,6 +223,7 @@ class EcsResult:
     group_size: int = 0                 # 每组人数 K(推断值; 0 = 没能推断)
     uid_offset: int | None = None       # 现场标定出的 uid 相对偏移
     uid_offset2: int | None = None      # 少数布局不同的块用的第二个偏移
+    uid_offset_air: int | None = None   # 飞机块的偏移(组件布局与地面不同)
     stats: Counter = field(default_factory=Counter)
 
 
@@ -365,11 +391,15 @@ class EcsCollector:
 
     # ---- 最终产出 -------------------------------------------------------
     def build(self, *, known_uids: set[int], players: dict, kills: list,
-              include_air: bool = False, t_end: float | None = None) -> EcsResult:
+              include_air: bool = False, t_end: float | None = None,
+              ground_pts: dict | None = None, air_pts: dict | None = None
+              ) -> EcsResult:
         """把收集到的构造记录变成实体档案。
 
         `known_uids` 是 MPI 通道解出的地面 uid 集合 —— 只用来**标定 uid 偏移**;
         `players` 是 slot 包解出的 `{slot: PlayerSlot}`; `kills` 是击杀事件。
+        `ground_pts` / `air_pts` 是位置流(uid -> [(秒, …)]), 用来给每条记录数
+        「窗口内到底有多少个真实采样」—— 那是判断记录真假/合并同一台车的硬事实。
         """
         res = EcsResult(stats=self.stats)
         res.templates = dict(Counter(c.template for c in self._creations))
@@ -389,6 +419,19 @@ class EcsCollector:
             res.stats["uid_offset_failed"] += 1
             return res
         res.uid_offset = rel
+
+        # 飞机块的组件布局与地面不同(`rel` 上常常读出 0/1 这种值)。有空中位置流时
+        # 单独标定一次, 标不出来就沿用 `rel`。
+        air_want = [c for c in want
+                    if "aircraft" in c.template and PLACEHOLDER_MARK not in c.block]
+        rel_air = rel
+        if air_pts and air_want:
+            cand = self._calibrate_uid(air_want, set(air_pts))
+            if cand is not None and cand != rel:
+                rel_air = cand
+                res.uid_offset_air = cand
+                res.stats["uid_offset_air"] = len(air_want)
+
 
         # ⚠ 实测: 75 个 `tank+player_unit` 里总有 18 个在 `rel` 上读出垃圾
         #   (同一值上挤 4~5 台车、且该 uid 在位置流里没有采样)。它们的组件值布局
@@ -411,11 +454,14 @@ class EcsCollector:
 
         for c in want:
             blk, vs = c.block, c.vstart
+            is_air = "aircraft" in c.template
+            if is_air and PLACEHOLDER_MARK in blk:
+                res.stats["air_placeholder"] += 1
+                continue
             # 型号的判定分支必须**按模板**而不是按全局开关：
             # `include_air=True` 时以前的写法会让地面模板(工事/机场防空)也去走
             # “机型词”分支，于是 `t1_airfield_aaa_small_01` 这种任务对象名
             # 被当成型号写了进去。
-            is_air = "aircraft" in c.template
             cls = ""
             spawn = ""
             for _off, s in scanned_strings(blk, 3, 60):
@@ -436,9 +482,9 @@ class EcsCollector:
                     break
             # uid 最后取: 在 `rel` 上不合法就试 `rel2`(只对**玩家载具** ——
             # 工事/AI 本来就不在位置流里, 不要让它们借道子集偏移).
-            uid = self._uid_at(c, rel)
+            uid = self._uid_at(c, rel_air if is_air else rel)
             if (uid is None or uid == EXT_MASK_UID
-                    or (known_uids and uid not in known_uids)):
+                    or (known_uids and uid not in known_uids and not is_air)):
                 if rel2 is not None and spawn:
                     alt = self._uid_at(c, rel2)
                     if alt is not None and alt != EXT_MASK_UID \
@@ -447,13 +493,19 @@ class EcsCollector:
             if uid is None or uid == EXT_MASK_UID:
                 continue
             died = self._died_at(c.eid, c.tick)
+            born_t = c.tick / 1000.0
+            died_t = (died / 1000.0) if died else None
             res.vehicles.append(Vehicle(
-                uid=uid, eid=c.eid, born_t=c.tick / 1000.0,
-                died_t=(died / 1000.0) if died else None,
+                uid=uid, eid=c.eid, born_t=born_t,
+                died_t=died_t,
                 died_by="ecs" if died else "",
-                template=c.template, cls=cls, spawn=spawn))
+                template=c.template, cls=cls, spawn=spawn,
+                samples=_count_between(
+                    (air_pts if is_air else ground_pts) or {}, uid,
+                    born_t, died_t if died_t is not None else t_end)))
 
         self._bind_players(res, players, kills)
+        self._merge_same_uid(res)
         self._fill_end_times(res, t_end)
         return res
 
@@ -577,6 +629,55 @@ class EcsCollector:
             if m:
                 v.team = 3 - int(m.group(1))
                 v.bind = "name-prefix"
+
+    @staticmethod
+    def _merge_same_uid(res: EcsResult) -> None:
+        """同一个 uid 上「接得上」的多条创建记录 = 同一台车, 合成一条寿命。
+
+        实测(`tN_playerMM_0`, Abandoned factory 服务器回放): 换车/选车时游戏会在
+        1~2 s 内反复建实体 —— `uid=306` 有 4 条记录(235.78/236.52/238.93/240.84),
+        型号 `cn_ztz_99a → cn_m1a2t → cn_ztz_99a → cn_vt_4b` 乱跳, 每条寿命 0.7~2 s。
+        以前它们被 `_fill_end_times` 当成「下一台车」逐条截断, 于是凭空多出 3 条
+        零点几秒的假线; 真正的那台(240.84~304.35, 窗口内有 1490 个采样)也被切短。
+
+        合并后取「采样更多」的那条当代表(型号/模板跟它走), 寿命取并集。
+        """
+        groups: dict[tuple, list[Vehicle]] = defaultdict(list)
+        for v in res.vehicles:
+            groups[(v.slot, v.uid) if v.slot is not None else ("?", id(v))].append(v)
+        kept: list[Vehicle] = []
+        merged = 0
+        for lst in groups.values():
+            if len(lst) == 1:
+                kept.append(lst[0])
+                continue
+            lst.sort(key=lambda v: v.born_t)
+            cur = lst[0]
+            for nxt in lst[1:]:
+                # 合并判据: 前一条**窗口内没有任何采样**(说明它只是选车/换车时临时建的
+                # 实体, 从没真正出现在位置流里), 且时间接得上。
+                # ⚠ 光看时间不够: 玩家快速重生时同一 uid 会紧接着再出生一次, 那两条
+                #   都有采样, 必须分开(实测按纯时间合并会让 7 个玩家的线数偏少)。
+                # ⚠ `died_t is None`(没有 0x26 销毁包)时不知道边界, 一律不合并。
+                if (cur.samples or cur.died_t is None
+                        or nxt.born_t - cur.died_t > MERGE_GAP_SEC):
+                    kept.append(cur)
+                    cur = nxt
+                    continue
+                rep = nxt if nxt.samples > cur.samples else cur
+                cur.samples = max(cur.samples, nxt.samples)
+                cur.template = rep.template
+                cur.cls = rep.cls or cur.cls
+                # 终点**无条件**跟最后一条走: 合并发生在这批记录的 `died_t` 还没被
+                # `_fill_end_times` 补全之前, 最后一条常常是 `None`(等下一台车来截)。
+                # 用 max() 会让"临时实体早死"的终点盖住真车的终点, 整条寿命被吞掉。
+                cur.died_t = nxt.died_t
+                cur.died_by = nxt.died_by
+                merged += 1
+            kept.append(cur)
+        if merged:
+            res.stats["merged_same_uid"] = merged
+            res.vehicles = kept
 
     @staticmethod
     def _fill_end_times(res: EcsResult, t_end: float | None) -> None:
