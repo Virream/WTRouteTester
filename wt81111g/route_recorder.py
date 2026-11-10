@@ -94,7 +94,7 @@ DEFAULT_GLOBAL_INTERVAL_MS = 100.0
 DEFAULT_HUD_INTERVAL_MS = 2000.0
 DEFAULT_INTERVAL = DEFAULT_INTERVAL_MS / 1000.0
 DEFAULT_HZ = 1.0 / DEFAULT_INTERVAL
-_MIN_INTERVAL = 0.01          # 最快 100Hz(10ms)
+_MIN_INTERVAL = 0.005         # 最快 200Hz(5ms); 菜单最高档是 120Hz(8.33ms)
 _MAX_INTERVAL = 0.2           # 最慢 5Hz(200ms)
 # 位移阈值: 仅用于滤掉静止时的浮点抖动。
 # 注意: 40Hz 下单帧位移很小(坦克 60km/h 约 0.0002 归一化/帧), 阈值必须远小于它,
@@ -371,7 +371,7 @@ class RouteRecorder(QObject):
         with self._interval_lock:
             self.interval = interval
             self.sample_interval = interval
-        log.info("单条录制轮询间隔已设为 %.0f ms (%.0f Hz)",
+        log.info("单条录制轮询间隔已设为 %.2f ms (%.0f Hz)",
                  interval * 1000, 1.0 / interval)
 
     def set_global_interval_ms(self, ms: float) -> None:

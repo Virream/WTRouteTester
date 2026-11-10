@@ -125,13 +125,18 @@ def _gpu_module_loaded() -> bool:
     return f"{__package__}.route_map_gl" in sys.modules
 
 
-# 采样间隔选项(毫秒):
-# 40ms(≈25Hz)与 8111 陆战数据更新率匹配; 20ms(≈50Hz)接近 8111 请求上限。
+# 采样间隔选项(毫秒, 高频在前):
+#   8.33ms=120Hz / 10ms=100Hz / 12.5ms=80Hz / 16.67ms=60Hz / 20ms=50Hz …
+#
+# 40ms(≈25Hz)与 8111 陆战数据的更新率匹配; 再快只是**重复采到同一帧** ——
+# 8111 刷新率 = 游戏帧率(见 docs/8111使用经验.md §4.1/§7.4),
+# 游戏只有 60 FPS 时选 120Hz 也只能拿到 60 帧的新数据(不会报错, 只是重复)。
 #
 # **这不是一个该让用户随时调的东西**(2026-10-23 用户意见): 调得太小会把 8111
 # 轮询推到上限、调得太大轨迹会变稀疏出怪结果。所以它从信息区下拉框收进了
 # 菜单「设置 → 轮询间隔」, 主界面只留一个很小的只读频率提示。
-INTERVAL_CHOICES_MS = (20, 25, 30, 40, 50, 75, 100)
+INTERVAL_CHOICES_MS = (8.33, 10.0, 12.5, 16.67, 20.0, 25.0, 30.0, 40.0,
+                       50.0, 75.0, 100.0)
 # `/hudmsg` 的轮询选项(毫秒): 1.3.0 改用回放文件后已不再使用。
 # （保留常量只是为了让旧设置项能被认出来删掉，见 `__init__` 里的清理）
 
@@ -141,13 +146,13 @@ INTERVAL_CHOICES_MS = (20, 25, 30, 40, 50, 75, 100)
 SETTINGS_VERSION = 2
 
 
-def rate_choice_ms(ms, choices=INTERVAL_CHOICES_MS) -> int:
+def rate_choice_ms(ms, choices=INTERVAL_CHOICES_MS) -> float:
     """把任意毫秒值归一成选项里的一个(取最接近的), 默认取表里的 40。"""
     try:
         value = float(ms)
     except (TypeError, ValueError):
         value = float(DEFAULT_INTERVAL_MS)
-    return int(min(choices, key=lambda x: abs(x - value)))
+    return float(min(choices, key=lambda x: abs(x - value)))
 
 _ROLE_KIND = Qt.ItemDataRole.UserRole
 _ROLE_ID = Qt.ItemDataRole.UserRole + 1
@@ -396,7 +401,7 @@ class RouteTesterWindow(QMainWindow):
         if start_recorder:
             self.recorder.start()
         self.recorder.set_interval_ms(self._saved_ms)
-        self.lbl_rate.setText(f"轮询 {1000 // int(self._saved_ms)} Hz")
+        self.lbl_rate.setText(f"轮询 {round(1000 / self._saved_ms)} Hz")
 
         # 轨迹回放(按倍速推进 playhead)
         self.player = RoutePlayer(parent=self)
@@ -554,19 +559,21 @@ class RouteTesterWindow(QMainWindow):
         rate_menu = setting.addMenu("轮询间隔(&R)")
         rate_menu.setToolTip(
             "单条线路录制的轮询间隔: 决定主循环频率与单条轨迹的采样密度。\n"
-            "一般不用改: 40 ms(25 Hz)与 8111 陆战数据的更新率一致。")
+            "默认 40 ms(25 Hz) 与 8111 陆战数据的更新率匹配。\n"
+            "更高的档位(60/80/100/120 Hz)能不能生效取决于**游戏帧率** ——\n"
+            "8111 每渲染一帧才吐一次新数据, 帧率不够时只是重复采到同一帧。")
         self._rate_actions = []
         _rate_group = QActionGroup(self)
         _rate_group.setExclusive(True)
         for _ms in INTERVAL_CHOICES_MS:
-            _text = (f"{_ms} ms({1000 // _ms} Hz)" if _ms < 1000
-                     else f"{_ms} ms({_ms / 1000:g} s)")
+            _text = (f"{_ms:g} ms({round(1000 / _ms)} Hz)" if _ms < 1000
+                     else f"{_ms:g} ms({_ms / 1000:g} s)")
             _act = QAction(_text, self)
             _act.setCheckable(True)
-            _act.setChecked(int(_ms) == int(self._saved_ms))
+            _act.setChecked(abs(float(_ms) - float(self._saved_ms)) < 1e-6)
             _act.setToolTip(rate_menu.toolTip())
             _act.triggered.connect(
-                lambda _c=False, v=int(_ms): self._set_record_rate_ms(v))
+                lambda _c=False, v=float(_ms): self._set_record_rate_ms(v))
             _rate_group.addAction(_act)
             rate_menu.addAction(_act)
             self._rate_actions.append(_act)
@@ -3020,23 +3027,24 @@ class RouteTesterWindow(QMainWindow):
         return acts
 
     @staticmethod
-    def _sync_rate_actions(acts, choices, ms: int) -> None:
+    def _sync_rate_actions(acts, choices, ms) -> None:
         """代码路径改值后也要让菜单勾选跟上(`setChecked` 不会触发 `triggered`)。"""
         for act, val in zip(acts or (), choices):
-            act.setChecked(int(val) == int(ms))
+            act.setChecked(abs(float(val) - float(ms)) < 1e-6)
 
-    def _set_record_rate_ms(self, ms: int) -> None:
+    def _set_record_rate_ms(self, ms) -> None:
         """菜单「设置 → 轮询间隔 → 单条录制轮询率」。"""
         ms = rate_choice_ms(ms, INTERVAL_CHOICES_MS)
         rec = getattr(self, "recorder", None)
         if rec is not None:
             rec.set_interval_ms(float(ms))
-        self._settings.setValue("interval_ms", int(ms))
-        self._saved_ms = int(ms)
+        self._settings.setValue("interval_ms", float(ms))
+        self._saved_ms = float(ms)
         self._sync_rate_actions(getattr(self, "_rate_actions", ()),
                                 INTERVAL_CHOICES_MS, ms)
         self._set_status(
-            f"单条录制轮询率已设为 {int(ms)} ms(≈{1000 // int(ms)} Hz)", sticky=2.0)
+            f"单条录制轮询率已设为 {float(ms):g} ms(≈{round(1000 / float(ms))} Hz)",
+            sticky=2.0)
 
     def _set_status(self, text: str, sticky: float = 0.0) -> None:
         """写状态栏。sticky>0 时该文字在这么多秒内不会被刷新的状态覆盖
