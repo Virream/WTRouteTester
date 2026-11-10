@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QLabel, QProgressBar, QVBoxLayout,
 )
 
-from .api8111 import WT8111
+from .api8111 import PRIO_IDLE, WT8111
 from .garage import GARAGE_MAP_SHA1
 from .map_calib import MapCalib, build_from_live
 
@@ -49,7 +49,8 @@ class CalibCaptureDialog(QDialog):
         self.map_key = map_key
         self.calib: MapCalib | None = None
         self.image: bytes | None = None
-        self._api = WT8111()
+        # 优先级最低: 采集要下整张地图, 会让开录制那一帧(见 api8111._Hub)
+        self._api = WT8111(priority=PRIO_IDLE)
         self._t0 = time.monotonic()
         self._stamp = time.strftime("%Y%m%d_%H%M%S")
         self._busy = False

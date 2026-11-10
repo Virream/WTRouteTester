@@ -33,7 +33,7 @@ from dataclasses import replace
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from .api8111 import WT8111
+from .api8111 import PRIO_IDLE, PRIO_KEY, WT8111, hub
 from .config import WT_BASE_URL
 from .global_record import DEFAULT_MAP_SIZE, GlobalTracker, extract_units
 from . import kill_timeline
@@ -162,7 +162,11 @@ class RouteRecorder(QObject):
         self.store = store
         self.map_cache = map_cache if map_cache is not None else MapCache()
         # 超时取 0.5s: 8111 正常 rtt 仅 ~10-20ms, 短超时能让偶发卡顿快速跳过
-        self.client = WT8111(base_url, timeout=timeout)
+        self.client = WT8111(base_url, timeout=timeout, priority=PRIO_KEY)
+        # 地图图片用**另一个客户端**: ① 它优先级最低(会主动避让录制那一帧),
+        # ② 它在自己的线程里跑, 不该和轮询线程共用一个 requests.Session
+        #   (`requests.Session` 不是线程安全的, 是两个线程互相阻塞的隐患)。
+        self._img_client = WT8111(base_url, timeout=timeout, priority=PRIO_IDLE)
         self._interval_lock = threading.Lock()
         self.interval = max(_MIN_INTERVAL, min(_MAX_INTERVAL, float(interval)))
         self.map_interval = max(0.5, float(map_interval))
@@ -193,6 +197,10 @@ class RouteRecorder(QObject):
         self._recent: deque[tuple[float, float, float, float, tuple | None]] = deque(maxlen=400)
         # 当前车头朝向(归一化单位方向向量); None = 本帧没拿到
         self._dir: tuple[float, float] | None = None
+        # 数据更新率(最近 3 秒内“全场对象/玩家坐标变了多少次”的速率)
+        self._upd_times: deque[float] = deque()
+        self._obj_sig: tuple | None = None
+        self._player_sig: tuple | None = None
         # ---- 诊断: 每帧请求数与分段耗时(定位“8111 回报率掉到 15Hz”——
         # 8111 每个请求固定 33.3ms(30Hz 节拍), 一帧 2 个请求就必然是 15Hz。
         # 每 DIAG_SEC 秒汇总一条, **只在频率不达标时**写 INFO, 不刷洗日志。
@@ -288,7 +296,7 @@ class RouteRecorder(QObject):
         这样关掉游戏后依旧能用缓存底图看回放; 同一张图(哈希相同)不会重复保存。
         """
         while not self._stop.is_set():
-            data = self.client.map_image()
+            data = self._img_client.map_image()
             if not data:
                 # 拿不到地图图片: 8111 已退出/断开时 `/map.img` 会直接失败。
                 # 连续多次都拿不到 → 判为“已回车库”(用户 2026-10-23 定的三条之一)。
@@ -485,6 +493,9 @@ class RouteRecorder(QObject):
         now = time.monotonic()
         self._rate_window.append(now)
         self._frame += 1
+        # 告诉闸门“关键轮询正在按这个周期跑”, 低优先级请求(地图图片/校准采集)
+        # 会主动让开这一帧 —— 见 api8111._Hub.yield_slot。
+        hub().mark_key(self._tick_interval())
         # ---- 诊断探针(见 _diag_add) ----
         _t_start = time.perf_counter()
         _rq0 = int(getattr(self.client, "req_count", 0))
@@ -526,6 +537,19 @@ class RouteRecorder(QObject):
         self._dir = direction
         self._update_zones(objects)
         _t_obj = time.perf_counter()
+        # ---- 数据更新率 ------------------------------------------------
+        # 8111 是“游戏每渲染一帧才吐一次新数据”, 所以拿“全场对象或玩家自身
+        # 是否变了”当刷新信号。它明显低于点数率时, 说明是**游戏帧率**在限速,
+        # 不是我们的轮询 —— 这是“点数上不去”最容易被误判的一层。
+        _psig = (None if player is None else
+                 (round(player[0], 6), round(player[1], 6), direction))
+        _osig = self._objects_sig(objects)
+        if _psig != self._player_sig or _osig != self._obj_sig:
+            self._player_sig = _psig
+            self._obj_sig = _osig
+            self._upd_times.append(now)
+            while self._upd_times and self._upd_times[0] < now - 3.0:
+                self._upd_times.popleft()
 
         # 全局录制: 顺手标定“位移推算的速度”和 8111 直报的速度(只写日志)
         if self._global is not None and player is not None:
@@ -582,6 +606,7 @@ class RouteRecorder(QObject):
             "rate": self._current_rate(),
             "points": len(self._rec.points) if self._rec is not None else 0,
             "point_rate": self.point_rate(),
+            "update_rate": self.update_rate(),
             "zones": self._zones,
             "spawns": self._spawns,
             "mode": self.mode_name,
@@ -657,6 +682,35 @@ class RouteRecorder(QObject):
             return 0.0
         span = self._rate_window[-1] - self._rate_window[0]
         return (len(self._rate_window) - 1) / span if span > 0 else 0.0
+
+    @staticmethod
+    def _objects_sig(objects: list) -> tuple:
+        """全场对象的轻量指纹(数量 + 坐标/朝向之和)。
+
+        不用 hash(json): 一局可能有几百个对象, 每帧序列化太贵。
+        坐标有变化 → 和就变; 全部静止时不变 —— 正好对应“8111 这一帧没新数据”。
+        """
+        n = len(objects or ())
+        sx = sy = 0.0
+        for o in objects or ():
+            try:
+                sx += float(o.get("x") or 0.0) + float(o.get("dx") or 0.0)
+                sy += float(o.get("y") or 0.0) + float(o.get("dy") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return (n, round(sx, 5), round(sy, 5))
+
+    def update_rate(self) -> float:
+        """数据真实更新率(Hz) —— 最近 3 秒里“8111 吐了新数据”的次数。
+
+        它 < 点数率时, 说明限速的是**游戏帧率**(8111 跟着帧吐数据),
+        而不是我们的轮询; 两者都低才是真慢了。
+        """
+        t = self._upd_times
+        if len(t) < 2:
+            return 0.0
+        span = t[-1] - t[0]
+        return (len(t) - 1) / span if span > 0 else 0.0
 
     def _find_player_obj(self, objects: list) -> dict | None:
         """map_obj.json 里代表玩家自己的那条对象(坐标不全的不算)。"""

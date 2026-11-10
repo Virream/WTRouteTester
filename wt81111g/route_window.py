@@ -863,7 +863,8 @@ class RouteTesterWindow(QMainWindow):
             lines = [
                 (f"{head}  {fmt_time(elapsed)}", COLOR_TITLE),
                 (f"已录线路 {lives} 条 · 进行中 {active} 辆", COLOR_TEXT),
-                (f"8111 轮询 {rate:.1f} Hz", COLOR_TEXT),
+                (f"8111 轮询 {rate:.1f} Hz · 数据 "
+                 f"{float(info.get('update_rate') or 0.0):.1f} Hz", COLOR_TEXT),
             ]
         else:
             elapsed = float(info.get("elapsed") or 0.0)
@@ -871,7 +872,8 @@ class RouteTesterWindow(QMainWindow):
             lines = [
                 (f"{head}  {fmt_time(elapsed)}", COLOR_TITLE),
                 (f"采集 {float(info.get('point_rate') or 0.0):.1f} 点/秒 · "
-                 f"轮询 {rate:.1f} Hz", COLOR_TEXT),
+                 f"轮询 {rate:.1f} Hz · 数据 "
+                 f"{float(info.get('update_rate') or 0.0):.1f} Hz", COLOR_TEXT),
                 (f"点数 {int(info.get('points') or 0)} · "
                  f"标记 {int(info.get('marks') or 0)} 个", COLOR_TEXT),
                 (f"{fmt_speed(float(info.get('speed') or 0.0))} km/h · "
@@ -3256,7 +3258,15 @@ class RouteTesterWindow(QMainWindow):
 
             rate = float(info.get("rate") or 0.0)
             if rate:
-                self.lbl_rate.setText(f"轮询 {rate:.0f} Hz")
+                upr = float(info.get("update_rate") or 0.0)
+                self.lbl_rate.setText(
+                    f"轮询 {rate:.0f} Hz · 数据 {upr:.0f} Hz" if upr
+                    else f"轮询 {rate:.0f} Hz")
+                self.lbl_rate.setToolTip(
+                    "轮询 = 我们的采样频率(设置里可调)\n"
+                    "数据 = 8111 真正吐新数据的频率(≈ 游戏帧率)\n"
+                    "数据明显更低时, 是游戏帧率在限速(例如挂后台锁 30 帧),"
+                    "调高轮询率也没用。")
 
             ginfo = info.get("global")
             if ginfo:
