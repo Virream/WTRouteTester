@@ -20,9 +20,14 @@ class WT8111:
         self.base = base_url.rstrip("/")
         self.timeout = timeout
         self.session = requests.Session()
+        # 诊断用: 累计经 `get()` 发出的请求数。录制循环取帧内增量, 判断
+        # “一帧到底发了几个请求”—— 8111 每个请求固定 33.3ms(30Hz 节拍),
+        # 一帧 2 个就必然掉到 15Hz(见 route_recorder._diag_add)。
+        self.req_count = 0
 
     def get(self, path: str, params: dict | None = None, timeout: float | None = None):
         url = self.base + path
+        self.req_count += 1                 # 诊断计数(见 __init__)
         try:
             resp = self.session.get(url, params=params, timeout=timeout or self.timeout)
             resp.raise_for_status()

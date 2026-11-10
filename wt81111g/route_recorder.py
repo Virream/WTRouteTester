@@ -193,6 +193,12 @@ class RouteRecorder(QObject):
         self._recent: deque[tuple[float, float, float, float, tuple | None]] = deque(maxlen=400)
         # 当前车头朝向(归一化单位方向向量); None = 本帧没拿到
         self._dir: tuple[float, float] | None = None
+        # ---- 诊断: 每帧请求数与分段耗时(定位“8111 回报率掉到 15Hz”——
+        # 8111 每个请求固定 33.3ms(30Hz 节拍), 一帧 2 个请求就必然是 15Hz。
+        # 每 DIAG_SEC 秒汇总一条, **只在频率不达标时**写 INFO, 不刷洗日志。
+        self._diag = {"at": time.monotonic(), "ticks": 0, "durs": [],
+                      "rest": [], "inds": [], "reqs": {}, "slow": 0,
+                      "slow2": 0, "first": []}
 
         # ---- 全局录制状态(同样只由轮询线程修改)
         self._global: GlobalRecord | None = None   # 正在录的条目
@@ -479,11 +485,16 @@ class RouteRecorder(QObject):
         now = time.monotonic()
         self._rate_window.append(now)
         self._frame += 1
+        # ---- 诊断探针(见 _diag_add) ----
+        _t_start = time.perf_counter()
+        _rq0 = int(getattr(self.client, "req_count", 0))
+        _t_ind = _t_obj = _t_start
         # /indicators 降频(默认每 4 帧): 载具名/速度变化慢, 不必每帧请求;
         # 拿不到数据时(断开)会逐帧重试, 保证能快速恢复
         if self._frame % self.indicators_every == 1 or not self._ind_cache:
             self._ind_cache = self.client.indicators()
         ind = self._ind_cache
+        _t_ind = time.perf_counter()
         connected = bool(ind)
         vehicle = str(ind.get("type") or "") if ind else ""
         speed = _to_float(ind.get("speed")) or 0.0
@@ -514,6 +525,7 @@ class RouteRecorder(QObject):
         direction = _player_dir(player_obj) if player_obj is not None else None
         self._dir = direction
         self._update_zones(objects)
+        _t_obj = time.perf_counter()
 
         # 全局录制: 顺手标定“位移推算的速度”和 8111 直报的速度(只写日志)
         if self._global is not None and player is not None:
@@ -584,6 +596,60 @@ class RouteRecorder(QObject):
             # 实时线路(录制期间给地图“边录边画”用; 列表是快照, 元素引用共享)
             "global_lives": (list(self._tracker.lives) if self._tracker else None),
         })
+        self._diag_add(now, (time.perf_counter() - _t_start) * 1000.0,
+                       (_t_ind - _t_start) * 1000.0,
+                       (_t_obj - _t_ind) * 1000.0,
+                       int(getattr(self.client, "req_count", 0)) - _rq0)
+
+    DIAG_SEC = 10.0          # 诊断汇总间隔(秒)
+
+    def _diag_add(self, now: float, dur_ms: float, ind_ms: float,
+                  obj_ms: float, reqs: int) -> None:
+        """累加一帧的诊断数据, 每 DIAG_SEC 秒判定一次“到底慢在哪”。
+
+        要回答三个问题:
+          1. 这帧发了**几个** HTTP 请求(8111 每请求 33.3ms, 2 个就 15Hz);
+          2. 时间花在哪个阶段(`indicators` / `map_obj`+解析 / 其余);
+          3. 慢帧是不是固定跟“多一个请求”同时出现。
+        """
+        d = self._diag
+        d["ticks"] += 1
+        d["durs"].append(dur_ms)
+        d["rest"].append(max(0.0, dur_ms - ind_ms - obj_ms))
+        d["inds"].append(ind_ms)
+        d["reqs"][reqs] = d["reqs"].get(reqs, 0) + 1
+        if dur_ms > 45.0:
+            d["slow"] += 1
+            if reqs >= 2:
+                d["slow2"] += 1
+            if len(d["first"]) < 5:
+                d["first"].append((round(dur_ms, 1), reqs,
+                                    round(ind_ms, 1), round(obj_ms, 1)))
+        span = now - d["at"]
+        if span < self.DIAG_SEC or not d["durs"]:
+            return
+        durs = sorted(d["durs"])
+        rest = sorted(d["rest"])
+        inds = sorted(d["inds"])
+        n = len(durs)
+        hz = n / span
+        target = 1.0 / self._tick_interval()
+        req_part = " ".join(f"×{k}:{v}({v * 100 // n}%)"
+                            for k, v in sorted(d["reqs"].items()))
+        if hz < target * 0.9:
+            log.info("[rate] %.1fs %d 帧 → %.1fHz(目标 %.1f) | 帧耗时 mean %.1f "
+                     "p50 %.1f p90 %.1f max %.1f ms | 请求 %s | 其余 p50 %.1f ms "
+                     "| >45ms %d 次(其中多请求 %d) | indicators p50 %.1f ms",
+                     span, n, hz, target, sum(durs) / n, durs[n // 2],
+                     durs[int(n * 0.9)], durs[-1], req_part, rest[n // 2],
+                     d["slow"], d["slow2"], inds[n // 2])
+            if d["first"]:
+                log.info("[rate] 前几个慢帧 (帧耗时, 请求数, indicators, map_obj): %s",
+                         d["first"])
+        else:
+            log.debug("[rate] %.1fs %d 帧 → %.1fHz (正常)", span, n, hz)
+        d.update({"at": now, "ticks": 0, "durs": [], "rest": [], "inds": [],
+                  "reqs": {}, "slow": 0, "slow2": 0, "first": []})
 
     def _current_rate(self) -> float:
         """最近窗口内的实际轮询频率(Hz)。"""
