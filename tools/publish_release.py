@@ -6,7 +6,11 @@
 用法:
   .venv\\Scripts\\python.exe tools\\publish_release.py                      # 用 v<版本> 当 tag
   .venv\\Scripts\\python.exe tools\\publish_release.py v1.4.0 notes.md      # 指定 tag / 备注文件
-  .venv\\Scripts\\python.exe tools\\publish_release.py --no-zip             # 复用已存在的 zip
+  .venv\\Scripts\\python.exe tools\\publish_release.py --src ..\\WT81111G\\dist\\WTRouteTester
+
+⚠ **务必确认 `--src` 指向的是刚打出来的那份构建**: 本仓库 `dist\\WTRouteTester\\` 里还留着
+  1.0.0 时代的老包(没装 GPU 依赖的那份), 默认会压它 —— 2026-11-10 就这么把 v1.0.0 的
+  exe 发成了 v1.4.0。现在默认会校验 exe 的 FileVersion 与 `ROUTE_VERSION` 一致, 不一致直接退出。
 
 凭据: `git credential fill`(需先对该仓库 push 过, 让 GitHub 凭据进 Windows 凭据管理器)。
 备注末尾会自动追加「下载」小节(体积 + SHA256), 不用手写。
@@ -36,11 +40,25 @@ def read_version(base: str) -> str:
     return m.group(1) if m else ""
 
 
-def make_zip(base: str, ver: str) -> str:
-    """把 dist\\WTRouteTester\\ 压成 dist\\WTRouteTester_<ver>_win64.zip(跳过 data)。"""
-    src = os.path.join(base, APP_DIR)
+def make_zip(base: str, ver: str, src: str | None = None) -> str:
+    """把 `<src>`(默认 dist\\WTRouteTester\\)压成 dist\\WTRouteTester_<ver>_win64.zip(跳过 data)。"""
+    src = src or os.path.join(base, APP_DIR)
     if not os.path.isdir(src):
         raise SystemExit(f"找不到打包目录: {src}(先跑 build_route_tester.ps1)")
+    # 版本校验: 打包目录里那个 exe 的 FileVersion 必须与 ROUTE_VERSION 一致
+    exe = os.path.join(src, "WTRouteTester.exe")
+    if os.path.isfile(exe):
+        import ctypes  # noqa: F401  (仅 Windows)
+        try:
+            info = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-Item '{exe}').VersionInfo.FileVersion"],
+                capture_output=True, text=True).stdout.strip()
+        except Exception:  # noqa: BLE001
+            info = ""
+        if info and info != ver:
+            raise SystemExit(f"!! {exe} 的 FileVersion 是 {info}, 但 ROUTE_VERSION 是 {ver}"
+                             f" —— 这是旧构建, 换 --src 指向刚打出来的那一份")
     out = os.path.join(base, DIST_DIR, f"WTRouteTester_{ver}_win64.zip")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     n = 0
@@ -117,8 +135,14 @@ def upload(token: str, rid: int, path: str, name: str) -> None:
 
 def main() -> int:
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    argv = [a for a in sys.argv[1:] if not a.startswith("--")]
-    no_zip = "--no-zip" in sys.argv
+    raw_argv = sys.argv[1:]
+    src = ""
+    for i, a in enumerate(raw_argv):
+        if a == "--src" and i + 1 < len(raw_argv):
+            src = raw_argv[i + 1]
+    argv = [a for i, a in enumerate(raw_argv)
+            if not a.startswith("--") and not (i and raw_argv[i - 1] == "--src")]
+    no_zip = "--no-zip" in raw_argv
     ver = read_version(base)
     if not ver:
         raise SystemExit("读不到 ROUTE_VERSION(wt81111g/config.py)")
@@ -130,7 +154,7 @@ def main() -> int:
         if not os.path.isfile(zpath):
             raise SystemExit(f"--no-zip 但找不到 {zpath}")
     else:
-        zpath = make_zip(base, ver)
+        zpath = make_zip(base, ver, src or None)
     size = os.path.getsize(zpath) / 1048576
     digest = sha256_of(zpath)
 
