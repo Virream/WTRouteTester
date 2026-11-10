@@ -1315,7 +1315,14 @@ class RouteRecorder(QObject):
         rec = self._rec
         if rec is None or player is None:
             return
-        if elapsed - self._last_pt_t < self.sample_interval:
+        # ⚠ 门槛必须**明显小于主循环周期**(这里取 0.6 倍)。
+        #   主循环按 40 ms 调度, 但单帧的实际间隔并不均匀: Windows 定时器粒度 +
+        #   8111 的响应节拍(跟随游戏帧率)会让它在 33~47 ms 之间跳。原来门槛写成
+        #   `== sample_interval`(40 ms), 于是**差 0.1 ms 的帧就被判"太近"丢掉**,
+        #   下一帧的间隔变成 80 ms —— 点数率从 25 掉到 15 Hz。
+        #   实测(2026-11-10, 试车场 20.3s/313 点): 间隔 40ms×41% / 70~80ms×59%,
+        #   且与速度、位移都无关(min_move 一次没触发), 就是这道门槛在丢。
+        if elapsed - self._last_pt_t < self.sample_interval * 0.6:
             return
         if self._last_xy is not None:
             dist = math.hypot(player[0] - self._last_xy[0], player[1] - self._last_xy[1])
